@@ -1,4 +1,12 @@
-venv/
+# Ambienti virtuali
 .venv/
+venv/
+env/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Dati (opzionale, ma consigliato per file pesanti)
+*.xlsx
+*.csv

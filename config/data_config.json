@@ -1,0 +1,25 @@
+{
+  "time": {
+    "max_visits": 10,
+    "visit_column": "visit_index",
+    "patient_id": "patient_id"
+  },
+  "baseline": {
+    "continuous": ["age", "weight", "dose"],
+    "categorical": ["sex", "ethnicity"]
+  },
+  "followup": {
+    "continuous": ["ALP", "AST", "ALT", "bilirubin", "albumin"],
+    "categorical": ["complication"]
+  },
+  "outcomes": ["death", "transplant"],
+  
+  "model": {
+    "z_patient": 32,
+    "z_time": 16,
+    "hidden": 64,
+    "epochs": 2000,
+    "batch_size": 64,
+    "lr": 1e-4
+  }
+}
