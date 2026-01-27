@@ -14,6 +14,8 @@ from discriminator import StaticDiscriminator, TemporalDiscriminator
 import logging
 from typing import Callable, Dict, Optional
 
+from opacus import PrivacyEngine
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,9 @@ class DGAN:
             'gp_static': [],
             'gp_temporal': []
         }
+
+        self.use_amp = (self.config.mixed_precision and torch.cuda.is_available())
+
     
     def _build_model(self):
         """Costruisce generator e discriminators."""
@@ -97,8 +102,7 @@ class DGAN:
             lr=self.config.lr_discriminator,
             betas=(self.config.beta1, 0.999)
         )
-        
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.config.mixed_precision)
+
     
     def _combine_features(self, outputs: Dict[str, torch.Tensor]) -> tuple:
         """Combina continuous + categorical."""
@@ -238,7 +242,8 @@ class DGAN:
         for _ in range(self.config.discriminator_rounds):
 
             # -------- Generate fake data --------
-            with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+
                 z_static = torch.randn(
                     batch_size,
                     self.config.z_static_dim,
@@ -279,7 +284,8 @@ class DGAN:
             # --------------------------------------------------------
             self.opt_disc_static.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+
                 d_real_static = self.discriminate_static(real_static)
                 d_fake_static = self.discriminate_static(fake_static)
 
@@ -310,7 +316,8 @@ class DGAN:
             # --------------------------------------------------------
             self.opt_disc_temporal.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+
                 d_real_temporal = self.discriminate_temporal(
                     real_static,
                     real_temporal,
@@ -358,7 +365,8 @@ class DGAN:
         for _ in range(self.config.generator_rounds):
             self.opt_gen.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+
                 z_static = torch.randn(
                     batch_size,
                     self.config.z_static_dim,
@@ -420,7 +428,8 @@ class DGAN:
             validation_data: opzionale per validazione
             progress_callback: callback(epoch, batch, total_batches, losses)
         """
-        
+        privacy_engine = PrivacyEngine()
+
         # Crea dataset
         dataset = TensorDataset(*[x for x in train_data if x is not None])
         dataloader = DataLoader(
@@ -448,6 +457,10 @@ class DGAN:
                 
                 if progress_callback is not None:
                     progress_callback(epoch, batch_idx, len(dataloader), losses)
+
+                # All'interno del loop di training, dopo ogni epoca o step:
+                epsilon = privacy_engine.get_epsilon(delta=self.config.dp_delta) # Il delta di solito è 1/numero_record
+                print(f"Current Privacy Budget: ε = {epsilon:.2f}, δ = {self.config.dp_delta:.2f}")
             
             # Media epoch
             for key in epoch_losses:
@@ -474,7 +487,7 @@ class DGAN:
                     f"Temp: {self.current_temperature:.3f}"
                 )
     
-    def validate(self, val_data: tuple) -> Dict[str, float]:
+    def validate1(self, val_data: tuple) -> Dict[str, float]:
         """Validazione."""
         
         self.generator.eval()
@@ -533,6 +546,63 @@ class DGAN:
         
         return {k: np.mean(v) for k, v in metrics.items()}
     
+    @torch.no_grad()
+    def validate(self, val_batch: tuple) -> Dict[str, float]:
+        self.generator.eval()
+        self.disc_static.eval()
+        self.disc_temporal.eval()
+
+        (
+            static_cont,
+            static_cat,
+            temporal_cont,
+            temporal_cat,
+            temporal_mask,
+            visit_times,
+            initial_states
+        ) = [x.to(self.device) if x is not None else None for x in val_batch]
+
+        B = static_cont.size(0)
+
+        # Generate fake
+        z_static = torch.randn(B, self.config.z_static_dim, device=self.device)
+        z_temporal = torch.randn(
+            B,
+            self.data_config.max_sequence_len,
+            self.config.z_temporal_dim,
+            device=self.device
+        )
+
+        fake = self.generator(
+            z_static,
+            z_temporal,
+            temperature=self.current_temperature,
+            visit_times=visit_times,
+            initial_states=initial_states
+        )
+
+        real_dict = {
+            "static_continuous": static_cont,
+            "static_categorical": static_cat,
+            "temporal_continuous": temporal_cont,
+            "temporal_categorical": temporal_cat,
+            "temporal_mask": temporal_mask,
+        }
+
+        real_static, real_temporal, real_mask = self._combine_features(real_dict)
+        fake_static, fake_temporal, fake_mask = self._combine_features(fake)
+
+        d_real_s = self.disc_static(real_static).mean()
+        d_fake_s = self.disc_static(fake_static).mean()
+
+        d_real_t = self.disc_temporal(real_static, real_temporal, real_mask).mean()
+        d_fake_t = self.disc_temporal(fake_static, fake_temporal, fake_mask).mean()
+
+        return {
+            "val_disc_static_gap": (d_real_s - d_fake_s).item(),
+            "val_disc_temporal_gap": (d_real_t - d_fake_t).item()
+        }
+
     def generate(
         self,
         n_samples: int,

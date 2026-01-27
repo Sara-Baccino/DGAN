@@ -20,6 +20,7 @@
     "hidden": 64,
     "epochs": 2000,
     "batch_size": 64,
-    "lr": 1e-4
+    "lr": 1e-4,
+    "dp_delta": 1e-4
   }
 }

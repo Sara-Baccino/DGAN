@@ -7,6 +7,74 @@ Preprocessing completo con gestione missing values
 import numpy as np
 import torch
 from config.config import DataConfig
+import pandas as pd
+from typing import Dict, List
+
+def long_to_wide(
+    df: pd.DataFrame,
+    id_col: str,
+    time_col: str,
+    temporal_vars: List[str],
+    static_vars: List[str],
+    max_seq_len: int,
+    time_sort: bool = True
+) -> Dict[str, np.ndarray]:
+    """
+    Converte un dataset LONG in formato WIDE compatibile con DGAN.
+
+    Returns:
+        dict: {var_name: np.ndarray}
+    """
+
+    if time_sort:
+        df = df.sort_values([id_col, time_col])
+
+    subjects = df[id_col].unique()
+    n = len(subjects)
+    T = max_seq_len
+
+    # --- static ---
+    static_data = {
+        v: np.full((n,), np.nan)
+        for v in static_vars
+    }
+
+    # --- temporal ---
+    temporal_data = {
+        v: np.full((n, T), np.nan)
+        for v in temporal_vars
+    }
+
+    visit_times = np.full((n, T), np.nan)
+
+    subj_index = {sid: i for i, sid in enumerate(subjects)}
+
+    for sid, g in df.groupby(id_col):
+        i = subj_index[sid]
+        g = g.sort_values(time_col)
+
+        # static (take first non-nan)
+        for v in static_vars:
+            if v in g:
+                vals = g[v].dropna()
+                if len(vals) > 0:
+                    static_data[v][i] = vals.iloc[0]
+
+        # temporal
+        for t, (_, row) in enumerate(g.iterrows()):
+            if t >= T:
+                break
+            visit_times[i, t] = row[time_col]
+            for v in temporal_vars:
+                if v in row:
+                    temporal_data[v][i, t] = row[v]
+
+    output = {}
+    output.update(static_data)
+    output.update(temporal_data)
+    output["visit_times"] = visit_times
+
+    return output
 
 class LongitudinalDataPreprocessor:
     def __init__(self, data_config: DataConfig):

@@ -96,7 +96,7 @@ class DGANConfig:
     # Differential Privacy con Opacus
     use_dp: bool = False
     dp_epsilon: float = 1.0
-    dp_delta: float = 1e-5
+    dp_delta: float = 1e-4
     dp_max_grad_norm: float = 1.0
     dp_noise_multiplier: float = 1.0
     
