@@ -47,12 +47,12 @@
     "continuous": ["ALP", "BIL", "GGT", "ALB", "PLC"],
 
     "categorical": {
-      "EGDS":   {"0": 0, "1": 1},
-      "HEPC":   {"0": 0, "1": 1},
-      "ENCP":   {"0": 0, "1": 1},
-      "ASCT":   {"0": 0, "1": 1},
-      "ESOVAR": {"0": 0, "1": 1},
-      "VARB":   {"0": 0, "1": 1}
+      "EGDS":   { "mapping": {"0": 0, "1": 1}, "irreversible": true},
+      "HEPC":   { "mapping": {"0": 0, "1": 1}, "irreversible": true},
+      "ENCP":   { "mapping": {"0": 0, "1": 1}, "irreversible": true},
+      "ASCT":   { "mapping": {"0": 0, "1": 1}, "irreversible": true},
+      "ESOVAR": { "mapping": {"0": 0, "1": 1}, "irreversible": true},
+      "VARB":   { "mapping": {"0": 0, "1": 1}, "irreversible": true}
     }
   },
 
