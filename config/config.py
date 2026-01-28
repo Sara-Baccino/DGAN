@@ -1,7 +1,4 @@
 # config.py
-from dataclasses import dataclass
-from typing import Optional, List, Any
-import json
 from dataclasses import dataclass, field
 from typing import Optional, List, Any, Dict
 import json
@@ -96,9 +93,10 @@ class DGANConfig:
     # Differential Privacy con Opacus
     use_dp: bool = False
     dp_epsilon: float = 1.0
-    dp_delta: float = 1e-4
+    dp_delta: float = 1e-5
     dp_max_grad_norm: float = 1.0
     dp_noise_multiplier: float = 1.0
     
     cuda: bool = True
     mixed_precision: bool = False  # Disabilitato con DP
+

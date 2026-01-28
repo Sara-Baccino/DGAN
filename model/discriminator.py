@@ -111,4 +111,3 @@ class TemporalDiscriminator(nn.Module):
         combined = torch.cat([last_hidden, static_proj], dim=-1)
         
         return self.final_net(combined)
-

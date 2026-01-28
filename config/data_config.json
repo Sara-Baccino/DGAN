@@ -1,19 +1,63 @@
 {
   "time": {
-    "max_visits": 10,
-    "visit_column": "visit_index",
-    "patient_id": "patient_id"
+    "max_visits": 7,
+    "visit_column": "MONTHS_FROM_BASELINE",
+    "patient_id": "RECORD_ID"
   },
+
   "baseline": {
-    "continuous": ["age", "weight", "dose"],
-    "categorical": ["sex", "ethnicity"]
+    "continuous": [
+      "AGE", "HEIGHT", "WEIGHT", "TAUDCADOSE", "D3_fup", "INRPTVAL",
+      "ALT", "AST", "CRE", "SOD", "TCHVAL", "HDLVAL", "LDLVAL",
+      "TRIGVAL", "GLUCVAL", "WBCVAL", "NEUTVAL", "LINFVAL", "VITDVAL"
+    ],
+
+    "categorical": {
+      "SEX":        {"1": 0, "2": 1},
+      "ETHNICC":    {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4},
+      "CENTRE":     {"PBC0001": 0, "PBC0002": 1, "PBC0003": 2, "PBC0004": 3, "PBC0005": 4, "PBC0006": 5,
+                    "PBC0007": 6, "PBC0008": 7, "PBC0011": 8, "PBC0014": 9, "PBC0015": 10, "PBC0016": 11,
+            "PBC0019": 12, "PBC0022": 13, "PBC0023": 14, "PBC0024": 15, "PBC0025": 16, "PBC0026": 17,
+            "PBC0027": 18, "PBC0029": 19, "PBC0031": 20, "PBC0032": 21, "PBC0033": 22, "PBC0035": 23,
+            "PBC0038": 24, "PBC0039": 25, "PBC0041": 26, "PBC0043": 27, "PBC0044": 28, "PBC0045": 29,
+            "PBC0046": 30, "PBC0047": 31, "PBC0050": 32, "PBC0052": 33, "PBC0053": 34, "PBC0055": 35,
+            "PBC0058": 36, "PBC0062": 37, "PBC0063": 38, "PBC0065": 39, "PBC0067": 40, "PBC0068": 41,
+            "PBC0070": 42, "PBC0071": 43, "PBC0074": 44, "PBC0075": 45, "PBC0084": 46, "PBC0087": 47,
+            "PBC0088": 48},
+      "ALCOHOL":    {"0": 0, "1": 1, "2": 2},
+      "SMOKING":    {"0": 0, "1": 1, "2": 2},
+      "Risk_Level_Label": {"0": 0, "1": 1, "2": 2},
+      "INRPT":      {"2": 1, "1": 0},
+      "DEATH":      {"0": 0, "1": 1},
+      "TRANSP":     {"0": 0, "1": 1},
+      "WDRAWYN":    {"0": 0, "1": 1},
+      "DEATHRYN":   {"0": 0, "1": 1},
+      "CMBND":      {"0": 0, "1": 1},
+      "CMBIND":     {"0": 0, "1": 1},
+      "CMBOS":      {"0": 0, "1": 1},
+      "CMBOD":      {"0": 0, "1": 1},
+      "CMBPD":      {"0": 0, "1": 1},
+      "CMDAI":      {"0": 0, "1": 1},
+      "CMDMET":     {"0": 0, "1": 1},
+      "CMDCV":      {"0": 0, "1": 1}
+    }
   },
+
   "followup": {
-    "continuous": ["ALP", "AST", "ALT", "bilirubin", "albumin"],
-    "categorical": ["complication"]
+    "continuous": ["ALP", "BIL", "GGT", "ALB", "PLC"],
+
+    "categorical": {
+      "EGDS":   {"0": 0, "1": 1},
+      "HEPC":   {"0": 0, "1": 1},
+      "ENCP":   {"0": 0, "1": 1},
+      "ASCT":   {"0": 0, "1": 1},
+      "ESOVAR": {"0": 0, "1": 1},
+      "VARB":   {"0": 0, "1": 1}
+    }
   },
-  "outcomes": ["death", "transplant"],
-  
+
+  "outcomes": ["DEATH", "TRANSP"],
+
   "model": {
     "z_patient": 32,
     "z_time": 16,

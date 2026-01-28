@@ -1,166 +1,184 @@
-"""
-================================================================================
-MODULO 6: MAIN.PY
-Esempio completo di utilizzo
-================================================================================
-"""
+import json
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
 
-from config.config import VariableConfig, DataConfig, DGANConfig
-import numpy as np
-from processing.processor import LongitudinalDataPreprocessor
+from processing.processor import long_to_wide, LongitudinalDataPreprocessor
+from processing.cat_encoding import encode_categoricals
+from config.config import DataConfig, VariableConfig
 from model.dgan import DGAN
-import matplotlib.pyplot as plt
-
-
-def create_example_config():
-    """Crea configurazione di esempio per dataset longitudinale."""
-    
-    variables = [
-        # Static continuous
-        VariableConfig(name='age', type='continuous', is_static=True, min_val=18, max_val=90),
-        VariableConfig(name='bmi', type='continuous', is_static=True, min_val=15, max_val=50),
-        
-        # Static categorical
-        VariableConfig(name='sex', type='categorical', is_static=True, categories=['M', 'F']),
-        VariableConfig(name='ethnicity', type='categorical', is_static=True, 
-                      categories=['White', 'Black', 'Hispanic', 'Asian', 'Other']),
-        
-        # Temporal continuous (biomarkers)
-        VariableConfig(name='glucose', type='continuous', is_static=False, min_val=50, max_val=400),
-        VariableConfig(name='hba1c', type='continuous', is_static=False, min_val=4, max_val=14),
-        VariableConfig(name='ldl', type='continuous', is_static=False, min_val=40, max_val=300),
-        VariableConfig(name='sbp', type='continuous', is_static=False, min_val=80, max_val=200),
-        
-        # Temporal categorical (eventi irreversibili)
-        VariableConfig(name='diabetes', type='categorical', is_static=False, 
-                      categories=[0, 1], is_irreversible=True),
-        VariableConfig(name='cvd', type='categorical', is_static=False,
-                      categories=[0, 1], is_irreversible=True),
-    ]
-    
-    data_config = DataConfig(variables=variables, max_sequence_len=6)
-    
-    return data_config
 
 
 def main():
-    """Esempio completo di training e generation."""
-    
-    # === 1. CONFIGURAZIONE ===
-    data_config = create_example_config()
-    data_config.to_json('data_config.json')
-    
-    model_config = DGANConfig(
-        z_static_dim=32,
-        z_temporal_dim=16,
-        hidden_dim=128,
-        epochs=100,
-        batch_size=64,
-        use_dp=False,
-        gumbel_temperature_start=1.0,
-        gumbel_temperature_end=0.5
+
+    # ============================================================
+    # 1. LOAD CONFIG
+    # ============================================================
+    with open("config/data_config.json", "r") as f:
+        cfg = json.load(f)
+
+    time_cfg = cfg["time"]
+    base_cfg = cfg["baseline"]
+    foll_cfg = cfg["followup"]
+    model_cfg = cfg["model"]
+
+    id_col = time_cfg["patient_id"]
+    time_col = time_cfg["visit_column"]
+    max_visits = time_cfg["max_visits"]
+
+    static_cont = base_cfg["continuous"]
+    static_cat_map = base_cfg["categorical"]
+    temporal_cont = foll_cfg["continuous"]
+    temporal_cat_map = foll_cfg["categorical"]
+
+    static_cat = list(static_cat_map.keys())
+    temporal_cat = list(temporal_cat_map.keys())
+
+    full_cat_map = {}
+    full_cat_map.update(static_cat_map)
+    full_cat_map.update(temporal_cat_map)
+
+    print("CONFIG LOADED")
+    print(f"Static cont: {len(static_cont)}")
+    print(f"Static cat : {len(static_cat)}")
+    print(f"Temp cont  : {len(temporal_cont)}")
+    print(f"Temp cat   : {len(temporal_cat)}")
+
+    # ============================================================
+    # 2. LOAD DATA (LONG)
+    # ============================================================
+    df = pd.read_excel("PBC_UDCA_long.xlsx")
+    print(f"Raw data shape: {df.shape}")
+
+    # ============================================================
+    # 3. ENCODE CATEGORICALS
+    # ============================================================
+    df = encode_categoricals(df, full_cat_map)
+    print("Categorical encoding completed")
+
+    # ============================================================
+    # 4. LONG → WIDE
+    # ============================================================
+    data_wide = long_to_wide(
+        df=df,
+        id_col=id_col,
+        time_col=time_col,
+        temporal_vars=temporal_cont + temporal_cat,
+        static_vars=static_cont + static_cat,
+        max_seq_len=max_visits
     )
-    
-    # === 2. DATI DI ESEMPIO ===
-    # Simula dati reali
-    n_samples = 1000
-    T = data_config.max_sequence_len
-    
-    # Crea dict con dati raw
-    raw_data = {
-        'age': np.random.uniform(18, 90, n_samples),
-        'bmi': np.random.uniform(15, 50, n_samples),
-        'sex': np.random.choice(['M', 'F'], n_samples),
-        'ethnicity': np.random.choice(['White', 'Black', 'Hispanic', 'Asian', 'Other'], n_samples),
-        'glucose': np.random.uniform(50, 400, (n_samples, T)),
-        'hba1c': np.random.uniform(4, 14, (n_samples, T)),
-        'ldl': np.random.uniform(40, 300, (n_samples, T)),
-        'sbp': np.random.uniform(80, 200, (n_samples, T)),
-        'diabetes': np.random.choice([0, 1], (n_samples, T)),
-        'cvd': np.random.choice([0, 1], (n_samples, T)),
-    }
-    
-    # Aggiungi missing values (20% casuale)
-    for var_name, var_data in raw_data.items():
-        if var_name not in ['sex', 'ethnicity']:  # Non mettere NaN in static categorical
-            mask = np.random.random(var_data.shape) < 0.2
-            raw_data[var_name][mask] = np.nan
-    
-    # === 3. PREPROCESSING ===
-    preprocessor = LongitudinalDataPreprocessor(data_config)
-    preprocessor.fit(raw_data)
-    
-    train_data = preprocessor.transform(raw_data)
-    
-    print(f"Data shapes:")
-    for i, name in enumerate(['static_cont', 'static_cat', 'temporal_cont', 'temporal_cat', 'mask']):
-        if train_data[i] is not None:
-            print(f"  {name}: {train_data[i].shape}")
-    
-    # === 4. TRAINING ===
-    dgan = DGAN(data_config, model_config)
-    
-    def progress_callback(epoch, batch, total_batches, losses):
-        if batch % 50 == 0:
-            print(f"Epoch {epoch}, Batch {batch}/{total_batches}, "
-                  f"G: {losses['generator']:.4f}, "
-                  f"D_s: {losses['disc_static']:.4f}, "
-                  f"D_t: {losses['disc_temporal']:.4f}")
-    
-    dgan.fit(train_data, progress_callback=progress_callback)
-    
-    # === 5. GENERATION ===
-    print("\nGenerating synthetic data...")
-    synthetic_outputs = dgan.generate(n_samples=500)
-    
-    # Inverse transform
-    synthetic_data = preprocessor.inverse_transform(
-        static_continuous=synthetic_outputs.get('static_continuous'),
-        static_categorical=synthetic_outputs.get('static_categorical'),
-        temporal_continuous=synthetic_outputs.get('temporal_continuous'),
-        temporal_categorical=synthetic_outputs.get('temporal_categorical'),
-        temporal_mask=synthetic_outputs.get('temporal_mask')
+
+    print("Converted to WIDE format")
+    for k, v in data_wide.items():
+        print(f"{k}: {v.shape}")
+
+    # ============================================================
+    # 5. BUILD DATACONFIG
+    # ============================================================
+    variables = []
+
+    for v in static_cont:
+        variables.append(
+            VariableConfig(
+                name=v,
+                type="continuous",
+                is_static=True
+            )
+        )
+
+    for v, mapping in static_cat_map.items():
+        variables.append(
+            VariableConfig(
+                name=v,
+                type="categorical",
+                is_static=True,
+                categories=list(mapping.values())
+            )
+        )
+
+    for v in temporal_cont:
+        variables.append(
+            VariableConfig(
+                name=v,
+                type="continuous",
+                is_static=False
+            )
+        )
+
+    for v, mapping in temporal_cat_map.items():
+        variables.append(
+            VariableConfig(
+                name=v,
+                type="categorical",
+                is_static=False,
+                categories=list(mapping.values())
+            )
+        )
+
+    data_config = DataConfig(
+        variables=variables,
+        max_sequence_len=max_visits,
+        visit_times_variable="visit_times"
     )
-    
-    print("\nGenerated variables:")
-    for var_name, var_data in synthetic_data.items():
-        print(f"  {var_name}: {var_data.shape}, "
-              f"missing: {np.isnan(var_data).sum() / var_data.size * 100:.1f}%")
-    
-    # === 6. SAVE/LOAD ===
-    dgan.save('dgan_model.pt')
-    print("\nModel saved!")
-    
-    dgan_loaded = DGAN.load('dgan_model.pt')
-    print("Model loaded successfully!")
-    
-    # Test generation con modello caricato
-    test_synthetic = dgan_loaded.generate(n_samples=100)
-    print(f"\nTest generation: {len(test_synthetic)} outputs")
-    
-    # === 7. PLOT LOSSES ===
-    
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    
-    axes[0, 0].plot(dgan.loss_history['generator'])
-    axes[0, 0].set_title('Generator Loss')
-    axes[0, 0].set_xlabel('Epoch')
-    
-    axes[0, 1].plot(dgan.loss_history['disc_static'], label='Static')
-    axes[0, 1].plot(dgan.loss_history['disc_temporal'], label='Temporal')
-    axes[0, 1].set_title('Discriminator Losses')
-    axes[0, 1].legend()
-    axes[0, 1].set_xlabel('Epoch')
-    
-    axes[1, 0].plot(dgan.loss_history['gp_static'], label='Static')
-    axes[1, 0].plot(dgan.loss_history['gp_temporal'], label='Temporal')
-    axes[1, 0].set_title('Gradient Penalties')
-    axes[1, 0].legend()
-    axes[1, 0].set_xlabel('Epoch')
-    
-    plt.tight_layout()
-    plt.savefig('training_curves.png')
-    print("\nTraining curves saved to training_curves.png")
+
+    # ============================================================
+    # 6. PREPROCESSING
+    # ============================================================
+    preproc = LongitudinalDataPreprocessor(data_config)
+    preproc.fit(data_wide)
+
+    dataset = preproc.transform(data_wide)
+
+    print("Preprocessing completed")
+    for x in dataset:
+        if x is not None:
+            print(x.shape)
+
+    # ============================================================
+    # 7. TRAIN / VAL SPLIT
+    # ============================================================
+    N = dataset[0].shape[0]
+    idx = list(range(N))
+    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
+
+    def split(x):
+        return (
+            x[train_idx] if x is not None else None,
+            x[val_idx] if x is not None else None
+        )
+
+    train_data = tuple(split(x)[0] for x in dataset)
+    val_data = tuple(split(x)[1] for x in dataset)
+
+    # ============================================================
+    # 8. MODEL
+    # ============================================================
+    dgan = DGAN(
+        data_config=data_config,
+        config=model_cfg,
+        device="cpu"
+    )
+
+    # ============================================================
+    # 9. TRAIN
+    # ============================================================
+    dgan.fit(
+        train_data,
+        validation_data=val_data,
+        verbose=True
+    )
+
+    # ============================================================
+    # 10. VALIDATE
+    # ============================================================
+    metrics = dgan.validate(val_data)
+    print("VALIDATION METRICS:", metrics)
+
+    # ============================================================
+    # 11. SAVE
+    # ============================================================
+    dgan.save("dgan_trained.pt")
+    print("Model saved")
 
 
 if __name__ == "__main__":
