@@ -25,6 +25,7 @@ Statiche (baseline):
   
   -Variabili irreversibili → inizializzate come probabilità e aggiornate tramite una logica di hazard nel tempo.
 
+
 Temporali (follow-up):
 
 Generazione step-by-step tramite un GRU, dove l’input ad ogni step include:
@@ -36,6 +37,7 @@ Generazione step-by-step tramite un GRU, dove l’input ad ogni step include:
   -Tempo normalizzato [0,1]
 
   -Stato delle variabili irreversibili
+
 
 Head separate per:
 
@@ -57,6 +59,7 @@ Per addestrare il generatore, DGAN utilizza due discriminatori separati, entramb
   
   Valuta la plausibilità delle feature statiche sintetiche rispetto a quelle reali.
 
+
 *Temporal Discriminator:*
 
   GRU per processare sequenze temporali.
@@ -77,9 +80,11 @@ Batch di dati reali pre-elaborati dal preprocessor.
 
 Rumore latente z_static e z_temporal campionato da distribuzione normale.
 
+
 *Aggiornamento discriminatori:*
 
 Per ogni batch, il generatore produce dati sintetici.
+
 
 *Calcolo delle loss WGAN:*
 
@@ -91,6 +96,7 @@ Backprop e aggiornamento dei pesi dei discriminatori.
 
 Ripetizione per più round per stabilizzare il training dei discriminatori rispetto al generatore.
 
+
 *Aggiornamento generatore:*
 
 Generazione di dati sintetici usando z_static e z_temporal.
@@ -98,6 +104,7 @@ Generazione di dati sintetici usando z_static e z_temporal.
 Loss del generatore: massimizzare il punteggio dei discriminatori (-(D_static + D_temporal)).
 
 Se presenti variabili irreversibili, viene calcolata anche la irreversibility loss, penalizzando i flip 1→0 nelle sequenze binarie.
+
 
 *Annealing della temperatura Gumbel-Softmax:*
 
@@ -108,6 +115,7 @@ La temperatura τ parte da un valore iniziale e decresce esponenzialmente fino a
 Se attivato, Opacus aggiunge rumore ai gradienti dei discriminatori e limita la norma dei gradienti.
 
 Durante il training, viene monitorato ε per valutare la privacy.
+
 
 *Logging e tracciamento:*
 
@@ -121,19 +129,17 @@ Possibilità di generare plot dell’andamento delle loss nel tempo.
 
 Una volta addestrato, il modello genera dati sintetici con generate(n_samples):
 
-Campiona rumore latente z_static e z_temporal.
+- Campiona rumore latente z_static e z_temporal.
 
-Passa attraverso il generatore gerarchico.
+- Passa attraverso il generatore gerarchico.
 
-Applica inverse transform per riportare i valori scalati e le one-hot categorical a valori interpretabili.
+- Applica inverse transform per riportare i valori scalati e le one-hot categorical a valori interpretabili.
 
-Restituisce dataset sintetico completo con:
+- Restituisce dataset sintetico completo con:
 
-Feature statiche continue e categoriche
-
-Sequenze temporali continue e categoriali
-
-Possibilità di generare sequenze complete o tronche (simulando mancati follow-up)
+    -Feature statiche continue e categoriche
+    -Sequenze temporali continue e categoriali
+    -Possibilità di generare sequenze complete o tronche (simulando mancati follow-up)
 
 **5. Output del training**
 
@@ -158,4 +164,5 @@ Teacher forcing: permette di utilizzare i valori reali delle variabili irreversi
 Hazard irreversible: gestisce le variabili irreversibili step-by-step, calcolando la probabilità di evento e aggiornando lo stato binario.
 
 Mask temporale: gestisce sequenze di lunghezza variabile, ma non è più necessario fornire un value-mask al generatore.
+
 
