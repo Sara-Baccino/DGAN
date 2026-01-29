@@ -1,184 +1,91 @@
-import json
 import pandas as pd
-import torch
-from sklearn.model_selection import train_test_split
-
-from processing.processor import long_to_wide, LongitudinalDataPreprocessor
-from processing.cat_encoding import encode_categoricals
-from config.config import DataConfig, VariableConfig
+from config.config_loader import load_config, build_data_config
+from processing.processor import Preprocessor
+from utils.check_data import *
 from model.dgan import DGAN
+from utils.check_data import check_one_hot, check_no_nan
 
 
 def main():
+    # LOAD CONFIG
+    config_path = "config/data_config.json"
+    
+    time_cfg, variables, model_cfg = load_config(config_path)
+    data_cfg = build_data_config(time_cfg, variables)
 
-    # ============================================================
-    # 1. LOAD CONFIG
-    # ============================================================
-    with open("config/data_config.json", "r") as f:
-        cfg = json.load(f)
 
-    time_cfg = cfg["time"]
-    base_cfg = cfg["baseline"]
-    foll_cfg = cfg["followup"]
-    model_cfg = cfg["model"]
 
-    id_col = time_cfg["patient_id"]
-    time_col = time_cfg["visit_column"]
-    max_visits = time_cfg["max_visits"]
+    # LOAD DATA
+    dataset_name ="PBC_UDCA_long.xlsx"
+    df = pd.read_excel(dataset_name)
 
-    static_cont = base_cfg["continuous"]
-    static_cat_map = base_cfg["categorical"]
-    temporal_cont = foll_cfg["continuous"]
-    temporal_cat_map = foll_cfg["categorical"]
+    # --- LOGICA DI VALIDAZIONE VISITE ---
+    # Calcoliamo il numero massimo di visite per paziente nei dati reali
+    actual_max_visits = df.groupby(time_cfg.patient_id).size().max()
 
-    static_cat = list(static_cat_map.keys())
-    temporal_cat = list(temporal_cat_map.keys())
+    if time_cfg.max_visits > actual_max_visits:
+        raise ValueError(
+            f"ERRORE: La config richiede {time_cfg.max_visits} visite, "
+            f"ma il paziente con più dati ne ha solo {actual_max_visits}. "
+            f"Riduci 'max_visits' nel JSON."
+        )
+    
+    elif time_cfg.max_visits < actual_max_visits:
+        print(f"[INFO] Troncamento in corso: i dati hanno fino a {actual_max_visits} visite, "
+            f"ma la config ne prevede {time_cfg.max_visits}. Rimuovo le eccedenze.")
+        
+        # Tronchiamo i dati mantenendo solo le prime N visite per ogni paziente
+        df = df.sort_values([time_cfg.patient_id, time_cfg.visit_column])
+        df = df.groupby(time_cfg.patient_id).head(time_cfg.max_visits).reset_index(drop=True)
 
-    full_cat_map = {}
-    full_cat_map.update(static_cat_map)
-    full_cat_map.update(temporal_cat_map)
+    print("Preprocessing...")
+    pre = Preprocessor(data_cfg)
+    data = pre.fit_transform(df)
 
-    print("CONFIG LOADED")
-    print(f"Static cont: {len(static_cont)}")
-    print(f"Static cat : {len(static_cat)}")
-    print(f"Temp cont  : {len(temporal_cont)}")
-    print(f"Temp cat   : {len(temporal_cat)}")
+    print("Preprocessing OK.\n")
+    print("Formato tensori: \n")
+    for k, v in data.items():
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                print(f"{k}/{kk}: {vv.shape}")
+        else:
+            print(k, v.shape)
 
-    # ============================================================
-    # 2. LOAD DATA (LONG)
-    # ============================================================
-    df = pd.read_excel("PBC_UDCA_long.xlsx")
-    print(f"Raw data shape: {df.shape}")
+    # ===============================
+    # CONSISTENCY CHECKS
+    # ===============================
+    print("Check consistenza: \n")
 
-    # ============================================================
-    # 3. ENCODE CATEGORICALS
-    # ============================================================
-    df = encode_categoricals(df, full_cat_map)
-    print("Categorical encoding completed")
+    check_no_nan(data)
 
-    # ============================================================
-    # 4. LONG → WIDE
-    # ============================================================
-    data_wide = long_to_wide(
-        df=df,
-        id_col=id_col,
-        time_col=time_col,
-        temporal_vars=temporal_cont + temporal_cat,
-        static_vars=static_cont + static_cat,
-        max_seq_len=max_visits
+    for v in data["temporal_cat"].values():
+        check_one_hot(v.numpy())
+
+    print("\nInizializzazione modello...")
+
+    model = DGAN(time_cfg=time_cfg, variables=variables, model_cfg=model_cfg)
+
+    print("Training...")
+    model.fit(data)
+
+    print("Generazione dati sintetici (follow-up completi)...")
+
+    synthetic = model.generate(
+        n_samples=len(data["static_cont"]),
+        temperature=0.1,          # quasi deterministico
+        return_torch=False
     )
 
-    print("Converted to WIDE format")
-    for k, v in data_wide.items():
-        print(f"{k}: {v.shape}")
-
-    # ============================================================
-    # 5. BUILD DATACONFIG
-    # ============================================================
-    variables = []
-
-    for v in static_cont:
-        variables.append(
-            VariableConfig(
-                name=v,
-                type="continuous",
-                is_static=True
-            )
-        )
-
-    for v, mapping in static_cat_map.items():
-        variables.append(
-            VariableConfig(
-                name=v,
-                type="categorical",
-                is_static=True,
-                categories=list(mapping.values())
-            )
-        )
-
-    for v in temporal_cont:
-        variables.append(
-            VariableConfig(
-                name=v,
-                type="continuous",
-                is_static=False
-            )
-        )
-
-    for v, mapping in temporal_cat_map.items():
-        variables.append(
-            VariableConfig(
-                name=v,
-                type="categorical",
-                is_static=False,
-                categories=list(mapping.values())
-            )
-        )
-
-    data_config = DataConfig(
-        variables=variables,
-        max_sequence_len=max_visits,
-        visit_times_variable="visit_times"
+    print("Inverse transform...")
+    synthetic_df = pre.inverse_transform(
+        synthetic,
+        complete_followup=True
     )
 
-    # ============================================================
-    # 6. PREPROCESSING
-    # ============================================================
-    preproc = LongitudinalDataPreprocessor(data_config)
-    preproc.fit(data_wide)
+    synthetic_df.to_excel("synthetic_complete_followup.xlsx", index=False)
 
-    dataset = preproc.transform(data_wide)
+    print("Dataset sintetico salvato.")
 
-    print("Preprocessing completed")
-    for x in dataset:
-        if x is not None:
-            print(x.shape)
-
-    # ============================================================
-    # 7. TRAIN / VAL SPLIT
-    # ============================================================
-    N = dataset[0].shape[0]
-    idx = list(range(N))
-    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
-
-    def split(x):
-        return (
-            x[train_idx] if x is not None else None,
-            x[val_idx] if x is not None else None
-        )
-
-    train_data = tuple(split(x)[0] for x in dataset)
-    val_data = tuple(split(x)[1] for x in dataset)
-
-    # ============================================================
-    # 8. MODEL
-    # ============================================================
-    dgan = DGAN(
-        data_config=data_config,
-        config=model_cfg,
-        device="cpu"
-    )
-
-    # ============================================================
-    # 9. TRAIN
-    # ============================================================
-    dgan.fit(
-        train_data,
-        validation_data=val_data,
-        verbose=True
-    )
-
-    # ============================================================
-    # 10. VALIDATE
-    # ============================================================
-    metrics = dgan.validate(val_data)
-    print("VALIDATION METRICS:", metrics)
-
-    # ============================================================
-    # 11. SAVE
-    # ============================================================
-    dgan.save("dgan_trained.pt")
-    print("Model saved")
 
 
 if __name__ == "__main__":

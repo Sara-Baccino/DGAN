@@ -1,113 +1,75 @@
-"""
-================================================================================
-MODULO 3: DISCRIMINATOR.PY
-Discriminatori per static e temporal
-================================================================================
-"""
-
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 class StaticDiscriminator(nn.Module):
-    """Discriminatore per features statiche."""
-    
-    def __init__(self, input_dim: int, num_layers: int = 5, num_units: int = 200):
+    def __init__(self, input_dim: int, hidden: int, layers: int, dropout: float = 0.0):
         super().__init__()
-        
-        layers = []
-        last_dim = input_dim
-        for _ in range(num_layers):
-            layers.extend([
-                nn.Linear(last_dim, num_units),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.1)
-            ])
-            last_dim = num_units
-        
-        layers.append(nn.Linear(last_dim, 1))
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, static_features: torch.Tensor) -> torch.Tensor:
-        return self.net(static_features)
+        net = []
+        d = input_dim
+        for _ in range(layers):
+            net.append(nn.Linear(d, hidden))
+            net.append(nn.LeakyReLU(0.2))
+            if dropout > 0:
+                net.append(nn.Dropout(dropout))
+            d = hidden
+        net.append(nn.Linear(d, 1))
+        self.net = nn.Sequential(*net)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class TemporalDiscriminator(nn.Module):
-    """
-    Discriminatore temporale con GRU per preservare CAUSALITÀ.
-    Condizionato su static features.
-    """
-    
     def __init__(
         self,
         static_dim: int,
         temporal_dim: int,
-        hidden_dim: int = 128,
-        gru_layers: int = 2,
-        num_layers: int = 3,
-        num_units: int = 200
+        hidden_dim: int,
+        gru_layers: int,
+        mlp_layers: int,
+        mlp_units: int,
+        dropout: float = 0.0
     ):
         super().__init__()
-        
-        # Proiezione static
-        self.static_projection = nn.Sequential(
-            nn.Linear(static_dim, hidden_dim),
-            nn.ReLU()
-        )
-        
-        # GRU per processare sequenza temporale (preserva causalità)
-        # Input: temporal_features + static_projection + mask
+
         self.gru = nn.GRU(
-            input_size=temporal_dim + hidden_dim + 1,  # +1 per mask
+            input_size=temporal_dim,
             hidden_size=hidden_dim,
             num_layers=gru_layers,
             batch_first=True,
-            dropout=0.1 if gru_layers > 1 else 0
+            dropout=dropout if gru_layers > 1 else 0.0
         )
-        
-        # Rete finale: prende ultimo hidden state GRU + static_projection
-        layers = []
-        last_dim = hidden_dim * 2  # GRU output + static
-        for _ in range(num_layers):
-            layers.extend([
-                nn.Linear(last_dim, num_units),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.1)
-            ])
-            last_dim = num_units
-        
-        layers.append(nn.Linear(last_dim, 1))
-        self.final_net = nn.Sequential(*layers)
-    
+
+        mlp = []
+        in_dim = hidden_dim + static_dim
+        for _ in range(mlp_layers):
+            mlp.append(nn.Linear(in_dim, mlp_units))
+            mlp.append(nn.LeakyReLU(0.2))
+            if dropout > 0:
+                mlp.append(nn.Dropout(dropout))
+            in_dim = mlp_units
+        mlp.append(nn.Linear(in_dim, 1))
+        self.mlp = nn.Sequential(*mlp)
+
     def forward(
         self,
-        static_features: torch.Tensor,
-        temporal_sequence: torch.Tensor,
-        temporal_mask: torch.Tensor
+        static: torch.Tensor,        # [B, static_dim]
+        temporal: torch.Tensor,      # [B, T, temporal_dim]
+        mask: torch.Tensor           # [B, T]
     ) -> torch.Tensor:
-        """
-        Args:
-            static_features: [B, static_dim]
-            temporal_sequence: [B, T, temporal_dim]
-            temporal_mask: [B, T, 1]
-        """
-        B = temporal_sequence.size(0)
-        T = temporal_sequence.size(1)
-        
-        # Proietta static
-        static_proj = self.static_projection(static_features)  # [B, hidden]
-        static_expanded = static_proj.unsqueeze(1).expand(-1, T, -1)
-        
-        # Combina temporal + static + mask
-        gru_input = torch.cat([temporal_sequence, static_expanded, temporal_mask], dim=-1)
-        
-        # GRU (preserva ordine temporale)
-        gru_output, gru_hidden = self.gru(gru_input)
-        
-        # Usa ultimo hidden state (summary dell'intera sequenza)
-        last_hidden = gru_hidden[-1]  # [B, hidden]
-        
-        # Combina con static projection
-        combined = torch.cat([last_hidden, static_proj], dim=-1)
-        
-        return self.final_net(combined)
+
+        h_seq, _ = self.gru(temporal)   # [B, T, H]
+
+        # Applica mask
+        mask = mask.unsqueeze(-1)       # [B, T, 1]
+        h_seq = h_seq * mask
+
+        # Media pesata
+        lengths = mask.sum(dim=1).clamp(min=1.0)  # [B, 1]
+        h = h_seq.sum(dim=1) / lengths            # [B, H]
+
+        # Concat static
+        x = torch.cat([static, h], dim=-1)
+
+        return self.mlp(x)

@@ -1,50 +1,25 @@
+#cat_encoding.py
 import pandas as pd
-import numpy as np
 from typing import Dict
 
 
-def encode_categoricals(
+def encode_from_config(
     df: pd.DataFrame,
-    categorical_map: Dict[str, Dict]
+    baseline_cat: Dict,
+    followup_cat: Dict
 ) -> pd.DataFrame:
-    """
-    Mappa valori categorici originali → codici numerici
-    secondo il config JSON.
-    """
     df = df.copy()
 
-    for col, mapping in categorical_map.items():
-        if col not in df.columns:
-            continue
+    full = {}
 
-        inverse = set(mapping.keys())
-        observed = set(df[col].dropna().unique())
+    for k, v in baseline_cat.items():
+        full[k] = v
 
-        if not observed.issubset(inverse):
-            raise ValueError(
-                f"Unexpected labels in {col}: {observed - inverse}"
-            )
+    for k, v in followup_cat.items():
+        full[k] = v["mapping"]
 
-        df[col] = df[col].map(mapping).astype(float)
-
-    return df
-
-
-def decode_categoricals(
-    df: pd.DataFrame,
-    categorical_map: Dict[str, Dict]
-) -> pd.DataFrame:
-    """
-    Trasformazione inversa: codici → valori originali
-    """
-    df = df.copy()
-
-    for col, mapping in categorical_map.items():
-        if col not in df.columns:
-            continue
-
-        inv_map = {v: k for k, v in mapping.items()}
-
-        df[col] = df[col].round().map(inv_map)
+    for col, mapping in full.items():
+        if col in df.columns:
+            df[col] = df[col].map(mapping).astype(float)
 
     return df
