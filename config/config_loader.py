@@ -35,10 +35,17 @@ class GeneratorConfig:
 @dataclass
 class DiscriminatorConfig:
     static_layers: int
+    mlp_hidden_dim: int
+    dropout: float
+
+@dataclass
+class TempDiscriminatorConfig:
+    static_layers: int
     temporal_layers: int
-    hidden_dim: int
+    mlp_hidden_dim: int
+    gru_hidden_dim: int
     gru_layers: int           # numero di layer GRU temporale
-    mlp_units: int            # numero di unità per layer MLP temporale
+    mlp_layers: int            # numero di unità per layer MLP temporale
     dropout: float
 
 @dataclass
@@ -50,7 +57,8 @@ class ModelConfig:
     batch_size: int
     lr: float
     generator: GeneratorConfig
-    discriminator: DiscriminatorConfig
+    static_discriminator: DiscriminatorConfig
+    temporal_discriminator: TempDiscriminatorConfig
     noise_std: float
     critic_steps: int
     grad_clip: float
@@ -112,7 +120,8 @@ def build_data_config(
 
 def build_model_config(cfg: dict) -> ModelConfig:
     gen_cfg = GeneratorConfig(**cfg["generator"])
-    disc_cfg = DiscriminatorConfig(**cfg["discriminator"])
+    disc_cfg = DiscriminatorConfig(**cfg["static_discriminator"])
+    temp_disc_cfg = TempDiscriminatorConfig(**cfg["temporal_discriminator"])
 
     return ModelConfig(
         z_static_dim=cfg["z_static_dim"],
@@ -122,7 +131,8 @@ def build_model_config(cfg: dict) -> ModelConfig:
         batch_size=cfg["batch_size"],
         lr=cfg["lr"],
         generator=gen_cfg,
-        discriminator=disc_cfg,
+        static_discriminator=disc_cfg,
+        temporal_discriminator=temp_disc_cfg,
         noise_std=cfg["noise_std"],
         critic_steps=cfg["critic_steps"],
         grad_clip=cfg["grad_clip"],

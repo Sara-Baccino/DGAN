@@ -31,15 +31,15 @@
     "categorical": {
       "SEX": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "1": 1, "2": 2}
+        "mapping": {"1": 1, "2": 2}
       },
       "ETHNICC": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+        "mapping": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
       },
       "CENTRE": {
         "type": "string",
-       "mapping": {"__MISSING__": 0, "PBC0001": 1, "PBC0002": 2, "PBC0003": 3, "PBC0004": 4, "PBC0005": 5,
+       "mapping": { "PBC0001": 1, "PBC0002": 2, "PBC0003": 3, "PBC0004": 4, "PBC0005": 5,
                     "PBC0006": 6, "PBC0007": 7, "PBC0008": 8, "PBC0011": 9, "PBC0014": 10,
                     "PBC0015": 11, "PBC0016": 12, "PBC0019": 13, "PBC0022": 14,
                     "PBC0023": 15, "PBC0024": 16, "PBC0025": 17, "PBC0026": 18,
@@ -52,70 +52,57 @@
                     "PBC0070": 43, "PBC0071": 44, "PBC0074": 45, "PBC0075": 46,
                     "PBC0084": 47, "PBC0087": 48, "PBC0088": 49 }
       },
-      "ALCOHOL": {
-        "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2, "2": 3}
-      },
-      "SMOKING": {
-        "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2, "2": 3}
-      },
-      "Risk_Level_Label": {
-        "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2, "2": 3}
-      },
+      "ALCOHOL": {"type": "int", "mapping": {"0": 0, "1": 1, "2": 2}},
+      "SMOKING": {"type": "int", "mapping": {"0": 0, "1": 1, "2": 2}},
+      "Risk_Level_Label": {"type": "int", "mapping": {"0": 0, "1": 1, "2": 2}},
       "INRPT": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "1": 1, "2": 2}
+        "mapping": {"1": 1, "2": 2}
       },
       "DEATH": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "TRANSP": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "WDRAWYN": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "DEATHRYN": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMBND": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMBIND": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMBOS": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMBOD": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMBPD": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMDAI": {
         "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "CMDMET": {
-        "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "type": "int", "mapping": {"0": 0, "1": 1}
       },
-      "CMDCV": {
-        "type": "int",
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
-      }
+      "CMDCV": {"type": "int", "mapping": {"0": 0, "1": 1}}
     }
   },
 
@@ -132,32 +119,32 @@
       "EGDS": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "HEPC": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "ESOVAR": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "ASCT": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "VARB": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       },
       "ENCP": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"__MISSING__": 0, "0": 1, "1": 2}
+        "mapping": {"0": 0, "1": 1}
       }
     }
   },
@@ -168,9 +155,9 @@
     "z_static_dim": 32,
     "z_temporal_dim": 16,
     "hidden": 64,
-    "epochs": 2000,
-    "batch_size": 64,
-    "lr": 1e-4,
+    "epochs": 250,
+    "batch_size": 128,
+    "lr": 5e-5,
     "generator": {
       "gru_layers": 2,
       "hidden_dim": 64,
@@ -178,20 +165,26 @@
       "z_temporal_dim": 16,
       "dropout": 0.5
     },
-    "discriminator": {
+    "static_discriminator": {
+        "static_layers": 5,
+        "mlp_hidden_dim": 256,          
+        "dropout": 0.3
+    },
+    "temporal_discriminator": {
         "static_layers": 4,
         "temporal_layers": 3,
-        "hidden_dim": 64,
-        "gru_layers": 2 ,          
-        "mlp_units": 64,           
-        "dropout": 0.5
+        "mlp_hidden_dim": 64,
+        "gru_hidden_dim": 16,
+        "gru_layers": 2, 
+        "mlp_layers": 2,           
+        "dropout": 0.3
     },
     "noise_std": 0.01,
-    "critic_steps": 5,
+    "critic_steps": 3,
     "grad_clip": 5,
-    "patience": 50,
-    "use_dp": true,
-    "force_full_mask": true,
+    "patience": 20,
+    "use_dp": false,
+    "force_full_mask": false,
     "regular": true,
     "gumbel_temperature_start": 1
   }
