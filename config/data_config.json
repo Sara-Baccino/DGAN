@@ -1,6 +1,6 @@
 {
   "time": {
-    "max_visits": 7,
+    "max_visits": 5,
     "visit_column": "MONTHS_FROM_BASELINE",
     "patient_id": "RECORD_ID"
   },
@@ -116,11 +116,6 @@
     ],
 
     "categorical": {
-      "EGDS": {
-        "type": "int",
-        "irreversible": true,
-        "mapping": {"0": 0, "1": 1}
-      },
       "HEPC": {
         "type": "int",
         "irreversible": true,
@@ -152,41 +147,44 @@
   "outcomes": ["DEATH", "TRANSP"],
 
   "model": {
-    "z_static_dim": 32,
-    "z_temporal_dim": 16,
-    "hidden": 64,
-    "epochs": 250,
+    "z_static_dim": 64,
+    "z_temporal_dim": 32,
+    "hidden": 128,
+    "epochs": 600,
     "batch_size": 128,
-    "lr": 5e-5,
+    "lr_g": 4e-5,
+    "lr_d_s": 5e-5,
+    "lr_d_t": 3e-5,
     "generator": {
       "gru_layers": 2,
-      "hidden_dim": 64,
-      "z_static_dim": 32,
-      "z_temporal_dim": 16,
-      "dropout": 0.5
+      "hidden_dim": 128,
+      "z_static_dim": 64,
+      "z_temporal_dim": 32,
+      "dropout": 0.15
     },
     "static_discriminator": {
-        "static_layers": 5,
+        "static_layers": 4,
         "mlp_hidden_dim": 256,          
-        "dropout": 0.3
+        "dropout": 0.2
     },
     "temporal_discriminator": {
-        "static_layers": 4,
-        "temporal_layers": 3,
-        "mlp_hidden_dim": 64,
-        "gru_hidden_dim": 16,
+        "mlp_hidden_dim": 128,
+        "gru_hidden_dim": 128,
         "gru_layers": 2, 
-        "mlp_layers": 2,           
-        "dropout": 0.3
+        "mlp_layers": 3,           
+        "dropout": 0.2
     },
     "noise_std": 0.01,
-    "critic_steps": 3,
-    "grad_clip": 5,
-    "patience": 20,
+    "critic_steps": 1,
+    "grad_clip": 1,
+    "patience":  200,
     "use_dp": false,
     "force_full_mask": false,
     "regular": true,
-    "gumbel_temperature_start": 1
+    "gumbel_temperature_start": 1,
+    "lambda_gp": 10,
+    "alpha_irr": 10,
+    "fixed_visits": null
   }
 }
 

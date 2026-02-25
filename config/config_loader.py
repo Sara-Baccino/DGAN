@@ -40,8 +40,6 @@ class DiscriminatorConfig:
 
 @dataclass
 class TempDiscriminatorConfig:
-    static_layers: int
-    temporal_layers: int
     mlp_hidden_dim: int
     gru_hidden_dim: int
     gru_layers: int           # numero di layer GRU temporale
@@ -55,7 +53,9 @@ class ModelConfig:
     hidden: int
     epochs: int
     batch_size: int
-    lr: float
+    lr_g: float
+    lr_d_s: float
+    lr_d_t: float
     generator: GeneratorConfig
     static_discriminator: DiscriminatorConfig
     temporal_discriminator: TempDiscriminatorConfig
@@ -67,6 +67,9 @@ class ModelConfig:
     force_full_mask: bool
     regular: bool
     gumbel_temperature_start: float
+    lambda_gp: float
+    alpha_irr: float
+    fixed_visits: int
 
 @dataclass
 class DataConfig:
@@ -129,7 +132,9 @@ def build_model_config(cfg: dict) -> ModelConfig:
         hidden=cfg["hidden"],
         epochs=cfg["epochs"],
         batch_size=cfg["batch_size"],
-        lr=cfg["lr"],
+        lr_g=cfg["lr_g"],
+        lr_d_s=cfg["lr_d_s"],
+        lr_d_t=cfg["lr_d_t"],
         generator=gen_cfg,
         static_discriminator=disc_cfg,
         temporal_discriminator=temp_disc_cfg,
@@ -140,7 +145,10 @@ def build_model_config(cfg: dict) -> ModelConfig:
         use_dp=cfg["use_dp"],
         force_full_mask=cfg["force_full_mask"],
         regular=cfg["regular"],
-        gumbel_temperature_start=cfg["gumbel_temperature_start"]
+        gumbel_temperature_start=cfg["gumbel_temperature_start"],
+        lambda_gp=cfg["lambda_gp"],
+        alpha_irr=cfg["alpha_irr"],
+        fixed_visits=cfg["fixed_visits"]
     )
 
 

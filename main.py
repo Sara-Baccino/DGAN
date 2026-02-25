@@ -11,6 +11,10 @@ from config.config_loader import load_config, build_data_config
 from processing.processor import Preprocessor
 from model.dgan import DGAN
 
+from datetime import datetime
+#timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
+timestr = "4"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 torch.autograd.set_detect_anomaly(True)
@@ -44,7 +48,7 @@ def main():
     # =========================================================================
     # 2. CARICA DATI
     # =========================================================================
-    df_train = pd.read_excel("PBC_UDCA_long.xlsx")
+    df_train = pd.read_excel("PBC_UDCA_long_stratificato.xlsx")
     print(f"Loaded {len(df_train)} rows, {df_train[data_cfg.patient_id_col].nunique()} patients")
     
     # =========================================================================
@@ -70,9 +74,22 @@ def main():
         "CENTRE": 16
     }
     
-    preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs)
+    LOG_VARS = ["ALP", "BIL", "GGT", "PLC"]
+
+    preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs, log_vars=LOG_VARS)
+
+    #preprocessor = Preprocessor(data_cfg, log_vars=LOG_VARS)
     tensors = preprocessor.fit_transform(df_train)
 
+    '''
+    LOG_VARS = ["ALP", "BIL", "GGT", "PLC"]  # nomi variabili continue
+
+    for j, v in enumerate([v.name for v in preprocessor.vars
+                            if not v.static and v.kind == "continuous"]):
+        if v in LOG_VARS:
+            x = tensors["temporal_cont"][:, :, j]
+            tensors["temporal_cont"][:, :, j] = torch.log1p(x)
+    '''
     # Verifica che le maschere siano coerenti con le OHE
     print("\nVerifying masks and OHE consistency...")
     for name in tensors["temporal_cat"].keys():
@@ -160,7 +177,7 @@ def main():
             axes[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('training_history.png', dpi=150)
+        plt.savefig(f'output/exp_{timestr}/training_history.png', dpi=150)
         print("✓ Saved training history plot: training_history.png")
     except Exception as e:
         logger.warning(f"Could not plot training history: {e}")
@@ -203,7 +220,7 @@ def main():
     
     # Salva dati sintetici
     Path("output").mkdir(exist_ok=True)
-    df_synthetic.to_excel("output/synthetic_data.xlsx", index=False)
+    df_synthetic.to_excel(f"output/exp_{timestr}/synthetic_data.xlsx", index=False)
     print(f"✓ Saved synthetic data: output/synthetic_data.xlsx")
     
     # =========================================================================
@@ -293,8 +310,9 @@ def test_loading():
     data_cfg = build_data_config(time_cfg, variables)
     
     # Ricarica preprocessor
-    embedding_configs = {"CENTRE": 6}
-    preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs)
+    #embedding_configs = {"CENTRE": 6}
+    #preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs)
+    preprocessor = Preprocessor(data_cfg)
     
     # Carica modello
     dgan_loaded = DGAN.load(
@@ -307,6 +325,9 @@ def test_loading():
     
     # Genera nuovi dati
     df_new = dgan_loaded.generate(n_samples=100, temperature=0.6, return_dataframe=True)
+    Path("output").mkdir(exist_ok=True)
+    df_new.to_excel(f"output/exp_{timestr}/test_data.xlsx", index=False)
+    print(f"✓ Saved synthetic data: output/test_data.xlsx")
     logger.info(f"✓ Generated {len(df_new)} rows with loaded model")
     
     return df_new

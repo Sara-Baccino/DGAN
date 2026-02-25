@@ -1,0 +1,215 @@
+1. Caricamento e strutturazione della configurazione
+
+Il sistema utilizza un approccio config-driven, in cui il comportamento del modello e del preprocessing è interamente definito da un file JSON. La configurazione viene caricata e trasformata in oggetti fortemente tipizzati tramite dataclass, garantendo coerenza, leggibilità e validazione implicita dei parametri.
+
+1.1 TimeConfig
+
+La classe TimeConfig definisce la struttura temporale del dataset longitudinale:
+
+max_visits: numero massimo di visite per paziente (lunghezza massima delle sequenze).
+
+visit_column: nome della colonna che rappresenta il tempo/visita.
+
+patient_id: identificativo univoco del paziente.
+
+Questa configurazione governa sia il padding temporale sia la normalizzazione del tempo.
+
+1.2 VariableConfig
+
+Ogni variabile del dataset (statica o temporale) è descritta da un oggetto VariableConfig, che specifica:
+
+name: nome della colonna nel DataFrame.
+
+kind: tipo semantico (continuous o categorical).
+
+static: distingue variabili baseline (statiche) da quelle longitudinali.
+
+dtype: tipo dati atteso.
+
+mapping: dizionario di codifica per variabili categoriche.
+
+irreversible: flag per variabili categoriche temporali irreversibili.
+
+Questa struttura consente di trattare in modo uniforme variabili eterogenee e di derivare automaticamente dimensioni e maschere.
+
+1.3 DataConfig e build_data_config
+
+La funzione build_data_config aggrega tutte le variabili e costruisce una DataConfig, che separa esplicitamente:
+
+variabili statiche vs temporali,
+
+continue vs categoriche.
+
+Vengono inoltre calcolati:
+
+numero di variabili per ciascun gruppo,
+
+cardinalità delle variabili categoriche,
+
+indici delle variabili temporali irreversibili.
+
+DataConfig rappresenta quindi la vista completa dei dati utilizzata dal preprocessing.
+
+1.4 ModelConfig e build_model_config
+
+La configurazione del modello è strutturata gerarchicamente:
+
+GeneratorConfig
+
+DiscriminatorConfig
+
+TempDiscriminatorConfig
+
+La funzione build_model_config trasforma il dizionario JSON in un oggetto ModelConfig, che contiene:
+
+iperparametri di training,
+
+configurazione delle reti,
+
+parametri di regolarizzazione e stabilità (gradient clipping, critic steps, Gumbel temperature, ecc.).
+
+1.5 load_config
+
+La funzione load_config orchestra l’intero caricamento:
+
+legge il file JSON,
+
+costruisce TimeConfig,
+
+costruisce ModelConfig,
+
+istanzia tutte le VariableConfig (baseline e follow-up),
+
+restituisce la configurazione completa pronta per il preprocessing e il training.
+
+2. Preprocessing dei dati
+
+Il preprocessing è implementato nella classe Preprocessor ed è pensato come una pipeline deterministica e riproducibile, che converte un DataFrame long in tensori PyTorch pronti per il modello.
+
+2.1 Panoramica della pipeline
+
+Il metodo principale è fit_transform, che esegue i seguenti passaggi:
+
+Reset degli indici
+
+Forzatura dei tipi
+
+Encoding delle variabili categoriche
+
+Gestione delle variabili continue e delle maschere
+
+Conversione long → padded
+
+Scaling min-max delle variabili continue
+
+Normalizzazione globale del tempo
+
+Costruzione delle feature statiche categoriche
+
+Conversione finale in tensori PyTorch
+
+Ogni passaggio è progettato per preservare l’informazione sui missing values tramite maschere esplicite.
+
+2.2 Forzatura dei tipi
+
+Il metodo force_types:
+
+converte le variabili continue in numerico (NaN per errori),
+
+forza le variabili categoriche a stringa.
+
+Questo garantisce coerenza prima della codifica.
+
+2.3 Encoding delle variabili categoriche
+
+encode_categoricals:
+
+mappa ogni categoria in un intero secondo VariableConfig.mapping,
+
+assegna 0 ai valori mancanti o sconosciuti,
+
+costruisce maschere binarie (1 = presente, 0 = missing),
+
+salva le mappe inverse per il decoding finale.
+
+2.4 Gestione delle variabili continue
+
+process_continuous:
+
+non imputa i missing (restano NaN),
+
+costruisce maschere di presenza,
+
+separa chiaramente valore e informazione di missingness.
+
+2.5 Conversione long → padded
+
+Il metodo long_to_padded trasforma il DataFrame longitudinale in tensori a dimensione fissa:
+
+[N, T, D] per variabili temporali continue,
+
+[N, T] per categoriche temporali,
+
+maschere temporali e di visita,
+
+tempo di visita per normalizzazione successiva.
+
+Le variabili statiche vengono estratte dalla prima visita di ciascun paziente.
+
+2.6 Scaling delle variabili continue
+
+fit_scalers applica uno scaling min-max in [0,1]:
+
+solo sui valori osservati,
+
+separatamente per variabili statiche e temporali,
+
+con clipping di sicurezza.
+
+I parametri di scaling vengono memorizzati per l’inverse transform.
+
+2.7 Normalizzazione del tempo
+
+normalize_time_global:
+
+calcola il massimo globale del tempo osservato,
+
+normalizza tutte le visite in [0,1],
+
+rende il modello indipendente dall’unità temporale originale.
+
+2.8 Costruzione delle variabili statiche categoriche
+
+build_static_tensors produce:
+
+One-Hot Encoding per variabili senza embedding,
+
+indici densi per variabili con embedding,
+
+gestione consistente dei missing (default = 0).
+
+Le variabili continue statiche sono già state scalate in precedenza.
+
+2.9 Conversione in tensori PyTorch
+
+to_tensors converte tutte le componenti in torch.Tensor, mantenendo:
+
+maschere separate,
+
+dizionari per variabili categoriche temporali,
+
+supporto sia a OHE sia a embedding.
+
+Il risultato è un dizionario strutturato pronto per il training.
+
+3. Inverse transform e decoding
+
+Il preprocessing supporta anche la ricostruzione dei dati sintetici:
+
+inverse_transform ricostruisce un DataFrame long senza missing,
+
+denormalizza tempo e variabili continue,
+
+decodifica categoriche via argmax o nearest-neighbor sugli embedding.
+
+Questo consente interpretabilità e validazione dei dati generati.

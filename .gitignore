@@ -10,3 +10,5 @@ __pycache__/
 # Dati (opzionale, ma consigliato per file pesanti)
 *.xlsx
 *.csv
+*.png
+*.pdf

@@ -9,7 +9,7 @@ MAP_MISSING = "__MISSING__"
 
 
 class Preprocessor:
-    def __init__(self, data_cfg: DataConfig, embedding_configs: Optional[Dict[str, int]] = None):
+    def __init__(self, data_cfg: DataConfig, embedding_configs: Optional[Dict[str, int]] = None, log_vars: Optional[List[str]] = None):
         """
         Args:
             data_cfg: configurazione delle variabili
@@ -23,6 +23,8 @@ class Preprocessor:
             data_cfg.temporal_cont +
             data_cfg.temporal_cat
         )
+
+        self.log_vars = log_vars or []  # Esempio: ["ALP", "BIL", "GGT", "PLC"]
 
         self.max_len        = data_cfg.max_len
         self.id_col         = data_cfg.patient_id_col
@@ -227,11 +229,17 @@ class Preprocessor:
 
                 minv = float(col[valid].min()) if valid.any() else 0.0
                 maxv = float(col[valid].max()) if valid.any() else 1.0
+                # Previeni divisione per zero
+                if maxv == minv:
+                    maxv = minv + 1.0
+
                 self.scalers_cont[v.name] = (minv, maxv)
 
-                cols.append(
-                    np.where(valid, (col - minv) / (maxv - minv + 1e-8), 0.0)[:, None]
-                )
+                scaled = np.where(valid, (col - minv) / (maxv - minv), 0.0)
+                # CLIPPING: forza in [0, 1] per sicurezza
+                scaled = np.clip(scaled, 0.0, 1.0)
+                cols.append(scaled[:, None])
+
             if cols:
                 padded["static_cont_scaled"] = np.concatenate(cols, axis=1).astype(np.float32)
 
@@ -242,13 +250,21 @@ class Preprocessor:
             mask  = padded["temporal_cont_mask"][:, :, j]
             valid = (mask == 1) & (~np.isnan(data))
 
+            if v.name in self.log_vars:
+                # Usiamo log1p (log(1+x)) per gestire eventuali zeri
+                # Operiamo solo sui valori validi per evitare NaN/Inf
+                data[valid] = np.log1p(data[valid])
+
             minv = float(data[valid].min()) if valid.any() else 0.0
             maxv = float(data[valid].max()) if valid.any() else 1.0
+            if maxv == minv:
+                maxv = minv + 1.0
             self.scalers_cont[v.name] = (minv, maxv)
 
-            padded["temporal_cont"][:, :, j] = np.where(
-                valid, (data - minv) / (maxv - minv + 1e-8), 0.0
-            )
+            scaled = np.where(valid, (data - minv) / (maxv - minv), 0.0)
+            # CLIPPING
+            scaled = np.clip(scaled, 0.0, 1.0)
+            padded["temporal_cont"][:, :, j] = scaled
 
         return padded
 
@@ -503,8 +519,17 @@ class Preprocessor:
                 # continuous temporali
                 for j, v in enumerate(temporal_cont_vars):
                     s          = float(synthetic["temporal_cont"][i, t, j])
+                    # CLIPPING: forza in [0, 1] prima di denormalizzare
+                    s          = max(0.0, min(1.0, s))
                     minv, maxv = self.scalers_cont[v.name]
-                    row[v.name] = s * (maxv - minv + 1e-8) + minv
+                    val = s * (maxv - minv + 1e-8) + minv
+
+                    # --- TRASFORMAZIONE INVERSA LOG (TEMPORAL) ---
+                    if hasattr(self, 'log_vars') and v.name in self.log_vars:
+                        val = np.expm1(val)
+                    # ----------------------------------------------
+                    
+                    row[v.name] = val
 
                 # categorical temporali  ← dict per variabile
                 for v in temporal_cat_vars:
