@@ -13,7 +13,8 @@ from model.dgan import DGAN
 
 from datetime import datetime
 #timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "4"
+
+timestr = "3"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ def main():
     set_seed(42)
 
     config_path = "config/data_config.json"
+
     time_cfg, variables, model_cfg = load_config(config_path)
     data_cfg = build_data_config(time_cfg, variables)
     
@@ -48,7 +50,9 @@ def main():
     # =========================================================================
     # 2. CARICA DATI
     # =========================================================================
-    df_train = pd.read_excel("PBC_UDCA_long_stratificato.xlsx")
+    df_train = pd.read_excel("PBC_UDCA_long_strat.xlsx")
+    
+
     print(f"Loaded {len(df_train)} rows, {df_train[data_cfg.patient_id_col].nunique()} patients")
     
     # =========================================================================
@@ -71,25 +75,16 @@ def main():
     
     # Configura embedding per CENTRE (48 categorie → 6 dimensioni)
     embedding_configs = {
-        "CENTRE": 16
+        "CENTRE": 12
     }
     
-    LOG_VARS = ["ALP", "BIL", "GGT", "PLC"]
+    LOG_VARS = ["ALP", "BIL", "ALT", "AST", "GGT", "CRE", "TRIGVAL", "NEUTVAL"]
 
     preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs, log_vars=LOG_VARS)
 
     #preprocessor = Preprocessor(data_cfg, log_vars=LOG_VARS)
     tensors = preprocessor.fit_transform(df_train)
 
-    '''
-    LOG_VARS = ["ALP", "BIL", "GGT", "PLC"]  # nomi variabili continue
-
-    for j, v in enumerate([v.name for v in preprocessor.vars
-                            if not v.static and v.kind == "continuous"]):
-        if v in LOG_VARS:
-            x = tensors["temporal_cont"][:, :, j]
-            tensors["temporal_cont"][:, :, j] = torch.log1p(x)
-    '''
     # Verifica che le maschere siano coerenti con le OHE
     print("\nVerifying masks and OHE consistency...")
     for name in tensors["temporal_cat"].keys():
@@ -138,49 +133,16 @@ def main():
     print("STARTING TRAINING")
     logger.info("="*80 + "\n")
     
-    dgan.fit(
-        tensors_dict=tensors,
-        epochs=model_cfg.epochs  # 2000 nel config
-    )
+    dgan.fit(tensors_dict=tensors, epochs=model_cfg.epochs)
     
     print("\n" + "="*80)
     print("TRAINING COMPLETE")
     print("="*80)
     
     # Visualizza loss history
-    try:
-        import matplotlib.pyplot as plt
-        
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        
-        axes[0, 0].plot(dgan.loss_history['generator'])
-        axes[0, 0].set_title('Generator Loss')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        axes[0, 1].plot(dgan.loss_history['disc_static'], label='Static')
-        axes[0, 1].plot(dgan.loss_history['disc_temporal'], label='Temporal')
-        axes[0, 1].set_title('Discriminator Losses')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        axes[1, 0].plot(dgan.loss_history['irreversibility'])
-        axes[1, 0].set_title('Irreversibility Loss')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        if dgan.loss_history['epsilon']:
-            axes[1, 1].plot(dgan.loss_history['epsilon'])
-            axes[1, 1].set_title('Privacy Budget (ε)')
-            axes[1, 1].set_xlabel('Epoch')
-            axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(f'output/exp_{timestr}/training_history.png', dpi=150)
-        print("✓ Saved training history plot: training_history.png")
-    except Exception as e:
-        logger.warning(f"Could not plot training history: {e}")
+    from utils.plots import plot_training_history
+    
+    plot_training_history(dgan, timestr)
     
     # =========================================================================
     # 6. SALVA MODELLO
@@ -199,99 +161,23 @@ def main():
     
     n_synthetic = df_train[data_cfg.patient_id_col].nunique()  # stesso numero di pazienti
     
-    df_synthetic = dgan.generate(
-        n_samples=n_synthetic,
-        temperature=0.6,  # temperatura bassa per output più discreto
+    df_synthetic = dgan.generate(n_samples=n_synthetic,
+        temperature=0.5,  # temperatura bassa per output più discreto
         return_dataframe=True
     )
     
     print(f"Generated {len(df_synthetic)} rows, {df_synthetic[data_cfg.patient_id_col].nunique()} patients")
     
     # Verifica che NON ci siano missing nell'output
-    print("\nVerifying synthetic data has no missing values...")
-    for col in df_synthetic.columns:
-        if col in [data_cfg.patient_id_col, data_cfg.time_col, "Delta_t"]:
-            continue
-        n_missing = df_synthetic[col].isna().sum()
-        if n_missing > 0:
-            logger.warning(f"  ⚠ {col}: {n_missing} missing values (should be 0!)")
-        else:
-            print(f"  ✓ {col}: no missing values")
+    from utils.check_data import check_missing, basic_validation
+
+    check_missing(df_synthetic, data_cfg, timestr)
     
-    # Salva dati sintetici
-    Path("output").mkdir(exist_ok=True)
-    df_synthetic.to_excel(f"output/exp_{timestr}/synthetic_data.xlsx", index=False)
-    print(f"✓ Saved synthetic data: output/synthetic_data.xlsx")
-    
-    # =========================================================================
-    # 8. VALIDAZIONE BASICA
-    # =========================================================================
     logger.info("\n" + "="*80)
     print("VALIDATION SUMMARY")
     logger.info("="*80)
     
-    # Confronta distribuzioni
-    print("\n--- STATIC CONTINUOUS VARIABLES ---")
-    static_cont_vars = [v.name for v in data_cfg.static_cont]
-    for var in static_cont_vars[:5]:  # primi 5
-        real_mean = df_train.groupby(data_cfg.patient_id_col)[var].first().mean()
-        synth_mean = df_synthetic.groupby(data_cfg.patient_id_col)[var].first().mean()
-        print(f"{var:15s} | Real: {real_mean:8.3f} | Synth: {synth_mean:8.3f}")
-    
-    print("\n--- STATIC CATEGORICAL VARIABLES ---")
-    static_cat_vars = [v.name for v in data_cfg.static_cat]
-    for var in static_cat_vars[:5]:  # primi 5
-        real_dist = df_train.groupby(data_cfg.patient_id_col)[var].first().value_counts(normalize=True)
-        synth_dist = df_synthetic.groupby(data_cfg.patient_id_col)[var].first().value_counts(normalize=True)
-        print(f"\n{var}:")
-        print(f"  Real top 3:  {dict(list(real_dist.items())[:3])}")
-        print(f"  Synth top 3: {dict(list(synth_dist.items())[:3])}")
-    
-    print("\n--- TEMPORAL CONTINUOUS VARIABLES ---")
-    temporal_cont_vars = [v.name for v in data_cfg.temporal_cont]
-    for var in temporal_cont_vars[:3]:  # primi 3
-        real_mean = df_train[var].mean()
-        synth_mean = df_synthetic[var].mean()
-        print(f"{var:15s} | Real: {real_mean:8.3f} | Synth: {synth_mean:8.3f}")
-    
-    print("\n--- IRREVERSIBLE VARIABLES (check monotonicity) ---")
-    for idx in data_cfg.irreversible_idx:
-        var = data_cfg.temporal_cat[idx]
-        print(f"\n{var.name}:")
-        
-        # Check violations (1 → 0 transitions)
-        for df, label in [(df_train, "Real"), (df_synthetic, "Synth")]:
-            violations = 0
-            total_transitions = 0
-            
-            for pid, group in df.groupby(data_cfg.patient_id_col):
-                group_sorted = group.sort_values(data_cfg.time_col)
-                values = group_sorted[var.name].astype(str).values
-                
-                for i in range(len(values) - 1):
-                    # Converti in string per gestire vari formati
-                    curr = str(values[i]).strip()
-                    next_val = str(values[i+1]).strip()
-                    
-                    # Skip missing
-                    if curr in ["nan", "NaN", "", "__MISSING__"]:
-                        continue
-                    if next_val in ["nan", "NaN", "", "__MISSING__"]:
-                        continue
-                    
-                    # Check transizione 1→0
-                    if curr == "1" and next_val == "0":
-                        violations += 1
-                    total_transitions += 1
-            
-            violation_rate = violations / total_transitions if total_transitions > 0 else 0
-            print(f"  {label}: {violations}/{total_transitions} violations ({violation_rate*100:.2f}%)")
-    
-    print("\n--- SEQUENCE LENGTHS ---")
-    real_lengths = df_train.groupby(data_cfg.patient_id_col).size()
-    synth_lengths = df_synthetic.groupby(data_cfg.patient_id_col).size()
-    print(f"Real  | Mean: {real_lengths.mean():.2f} | Std: {real_lengths.std():.2f} | Max: {real_lengths.max()}")
-    print(f"Synth | Mean: {synth_lengths.mean():.2f} | Std: {synth_lengths.std():.2f} | Max: {synth_lengths.max()}")
+    basic_validation(df_train, df_synthetic, data_cfg)
     
     logger.info("\n" + "="*80)
     print("✓ PIPELINE COMPLETE")

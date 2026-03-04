@@ -12,3 +12,7 @@ __pycache__/
 *.csv
 *.png
 *.pdf
+.txt
+
+#altri file
+upsampling.py

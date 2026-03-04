@@ -3,6 +3,11 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 def plot_loss_history(loss_history_path, save_path=None):
     """
     Plotta l'andamento delle loss e epsilon durante il training.
@@ -53,4 +58,38 @@ def plot_loss_history(loss_history_path, save_path=None):
         plt.show()
 
 
-
+def plot_training_history(dgan, timestr):
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        
+        axes[0, 0].plot(dgan.loss_history['generator'])
+        axes[0, 0].set_title('Generator Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        axes[0, 1].plot(dgan.loss_history['disc_static'], label='Static')
+        axes[0, 1].plot(dgan.loss_history['disc_temporal'], label='Temporal')
+        axes[0, 1].set_title('Discriminator Losses')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        axes[1, 0].plot(dgan.loss_history['irreversibility'])
+        axes[1, 0].set_title('Irreversibility Loss')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        if dgan.loss_history['epsilon']:
+            axes[1, 1].plot(dgan.loss_history['epsilon'])
+            axes[1, 1].set_title('Privacy Budget (ε)')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'output/exp_{timestr}/training_history.png', dpi=150)
+        print("✓ Saved training history plot: training_history.png")
+    except Exception as e:
+        logger.warning(f"Could not plot training history: {e}")
+    

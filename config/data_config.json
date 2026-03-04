@@ -1,6 +1,6 @@
 {
   "time": {
-    "max_visits": 5,
+    "max_visits": 40,
     "visit_column": "MONTHS_FROM_BASELINE",
     "patient_id": "RECORD_ID"
   },
@@ -13,8 +13,6 @@
       {"name": "TAUDCADOSE", "type": "float"},
       {"name": "D3_fup", "type": "float"},
       {"name": "INRPTVAL", "type": "float"},
-      {"name": "ALT", "type": "float"},
-      {"name": "AST", "type": "float"},
       {"name": "CRE", "type": "float"},
       {"name": "SOD", "type": "float"},
       {"name": "TCHVAL", "type": "float"},
@@ -30,12 +28,10 @@
 
     "categorical": {
       "SEX": {
-        "type": "int",
-        "mapping": {"1": 1, "2": 2}
+        "type": "int", "mapping": {"1": 1, "2": 2}
       },
       "ETHNICC": {
-        "type": "int",
-        "mapping": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+        "type": "int", "mapping": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
       },
       "CENTRE": {
         "type": "string",
@@ -52,64 +48,58 @@
                     "PBC0070": 43, "PBC0071": 44, "PBC0074": 45, "PBC0075": 46,
                     "PBC0084": 47, "PBC0087": 48, "PBC0088": 49 }
       },
-      "ALCOHOL": {"type": "int", "mapping": {"0": 0, "1": 1, "2": 2}},
-      "SMOKING": {"type": "int", "mapping": {"0": 0, "1": 1, "2": 2}},
-      "Risk_Level_Label": {"type": "int", "mapping": {"0": 0, "1": 1, "2": 2}},
+      "ALCOHOL": {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
+      "SMOKING": {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
+      "Risk_Level_Label": {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
       "INRPT": {
         "type": "int",
         "mapping": {"1": 1, "2": 2}
       },
       "DEATH": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "TRANSP": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "WDRAWYN": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "DEATHRYN": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMBND": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMBIND": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMBOS": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMBOD": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMBPD": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMDAI": {
-        "type": "int",
-        "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
       "CMDMET": {
-        "type": "int", "mapping": {"0": 0, "1": 1}
+        "type": "int", "mapping": {"0": 1, "1": 2}
       },
-      "CMDCV": {"type": "int", "mapping": {"0": 0, "1": 1}}
+      "CMDCV": {
+        "type": "int", "mapping": {"0": 1, "1": 2}
+      }
     }
   },
 
   "followup": {
     "continuous": [
-      {"name": "ALP", "type": "float"},
       {"name": "ALB", "type": "float"},
+      {"name": "ALP", "type": "float"},
+      {"name": "ALT", "type": "float"},
+      {"name": "AST", "type": "float"},
       {"name": "BIL", "type": "float"},
       {"name": "GGT", "type": "float"},
       {"name": "PLC", "type": "float"}
@@ -119,27 +109,27 @@
       "HEPC": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"0": 0, "1": 1}
+        "mapping": {"0": 1, "1": 2}
       },
       "ESOVAR": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"0": 0, "1": 1}
+        "mapping": {"0": 1, "1": 2}
       },
       "ASCT": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"0": 0, "1": 1}
+        "mapping": {"0": 1, "1": 2}
       },
       "VARB": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"0": 0, "1": 1}
+        "mapping": {"0": 1, "1": 2}
       },
       "ENCP": {
         "type": "int",
         "irreversible": true,
-        "mapping": {"0": 0, "1": 1}
+        "mapping": {"0": 1, "1": 2}
       }
     }
   },
@@ -150,41 +140,69 @@
     "z_static_dim": 64,
     "z_temporal_dim": 32,
     "hidden": 128,
-    "epochs": 600,
+    "epochs": 400,
+    "patience": 9999,
     "batch_size": 128,
-    "lr_g": 4e-5,
-    "lr_d_s": 5e-5,
-    "lr_d_t": 3e-5,
+    "lr_g": 0.0001,
+    "lr_d_s": 0.0003,
+    "lr_d_t": 0.0001,
+
     "generator": {
-      "gru_layers": 2,
+      "arch": "gru",
       "hidden_dim": 128,
+      "n_layers": 2,
+      "bidirectional": true,
+      "dropout": 0.1,
       "z_static_dim": 64,
-      "z_temporal_dim": 32,
-      "dropout": 0.15
+      "z_temporal_dim": 32
     },
+
     "static_discriminator": {
-        "static_layers": 4,
-        "mlp_hidden_dim": 256,          
-        "dropout": 0.2
+      "static_layers": 3,
+      "mlp_hidden_dim": 256,
+      "dropout": 0.05
     },
+
     "temporal_discriminator": {
-        "mlp_hidden_dim": 128,
-        "gru_hidden_dim": 128,
-        "gru_layers": 2, 
-        "mlp_layers": 3,           
-        "dropout": 0.2
+      "arch": "cnn",
+      "hidden_dim": 128,
+      "kernel_size": 3,
+      "n_layers": 3,
+      "dilation_base": 2,
+      "mlp_layers": 3,
+      "dropout": 0.1
     },
-    "noise_std": 0.01,
-    "critic_steps": 1,
-    "grad_clip": 1,
-    "patience":  200,
+
+    "noise_std": 0.1,
+    "grad_clip": 3,
     "use_dp": false,
     "force_full_mask": false,
     "regular": true,
-    "gumbel_temperature_start": 1,
-    "lambda_gp": 10,
-    "alpha_irr": 10,
+
+    "critic_steps": 3,
+    "critic_steps_temporal": 1,
+
+    "gumbel_temperature_start": 1.0,
+    "temperature_min": 0.5,
+
+    "lambda_gp": 4,
+    "lambda_gp_s": 4,
+    "lambda_gp_t": 8,
+
+    "alpha_irr": 0.25,
+    "lambda_aux": 0.2,
+
+    "lambda_freq_gen": 0.3,
+    "lambda_freq_disc": 0.1,
+    "freq_weight_power": 1.5,
+
+    "lambda_fm": 1.5,
+    "lambda_nv": 2,
+    "lambda_fc": 1.5,
+    "lambda_fup": 2,
+    "lambda_static_cat": 3.0,
+
+    "n_visits_sharpness": 10,
     "fixed_visits": null
   }
 }
-

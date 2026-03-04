@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fpdf>=1.7.2",
+    "lifelines>=0.30.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
     "opacus>=1.5.4",

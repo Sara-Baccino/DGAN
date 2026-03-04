@@ -1,0 +1,63 @@
+ "model": {
+    "z_static_dim": 64,
+    "z_temporal_dim": 32,
+    "hidden": 128,
+    "epochs": 500,
+    "patience": 100,
+    "batch_size": 128,
+    "lr_g": 0.0001,
+    "lr_d_s": 0.0003,
+    "lr_d_t": 0.0001,
+
+    "generator": {
+      "arch": "gru",
+      "hidden_dim": 64,
+      "n_layers": 2,
+      "bidirectional": true,
+      "dropout": 0.1,
+      "z_static_dim": 64,
+      "z_temporal_dim": 32
+    },
+    "static_discriminator": {
+      "static_layers": 3,
+      "mlp_hidden_dim": 128,
+      "dropout": 0.05
+    },
+    "temporal_discriminator": {
+      "arch": "cnn",
+      "hidden_dim": 128,
+      "kernel_size": 3,
+      "n_layers": 3,
+      "dilation_base": 2,
+      "mlp_layers": 3,
+      "dropout": 0.1
+    },
+
+    "noise_std": 0.1,
+    "grad_clip": 3,
+    "use_dp": false,
+    "force_full_mask": false,
+    "regular": true,
+    "critic_steps": 3,
+    "critic_steps_temporal": 1,
+
+    "gumbel_temperature_start": 1,
+    "temperature_min": 0.5,
+    "lambda_gp": 4,
+    "lambda_gp_s": 4,
+    "lambda_gp_t": 8,
+    "alpha_irr": 0.2,
+    "lambda_aux": 0.2,
+    "lambda_freq_gen": 0.1,
+    "lambda_freq_disc": 0.05,
+    "freq_weight_power": 1,
+    "lambda_fm": 1.5,
+    "lambda_nv": 1.5,
+    "lambda_fc": 0.4,
+    "lambda_fup": 0.7,
+    "n_visits_sharpness": 10,
+    "fixed_visits": null
+  }
+}
+
+dataset: x2
