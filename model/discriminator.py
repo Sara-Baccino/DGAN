@@ -303,8 +303,13 @@ class CNNTemporalDiscriminator(nn.Module):
             _DilatedCNNBlock(hidden_dim, kernel_size, dilation_base ** i, dropout)
             for i in range(n_layers)
         ])
+
+        # ── Attention pooling (NUOVO) ─────────────────────────
+        self.attn = nn.Linear(hidden_dim, 1)
+
         mlp  = []
         d_in = hidden_dim + static_dim
+
         for _ in range(mlp_layers):
             mlp.extend([
                 nn.utils.spectral_norm(nn.Linear(d_in, hidden_dim)),
@@ -327,10 +332,108 @@ class CNNTemporalDiscriminator(nn.Module):
         x   = self.input_proj(temporal)
         for block in self.cnn_blocks:
             x = block(x)
+        '''
         n_valid = vm.sum(dim=1, keepdim=True).clamp(min=1.0)
         h       = (x * vm.unsqueeze(-1)).sum(dim=1) / n_valid
         return self.mlp(torch.cat([static, h], dim=-1))
+        '''
+        # ── attention pooling (sostituisce mean pooling)
+        scores = self.attn(x).squeeze(-1)            # [B, T]
 
+        scores = scores.masked_fill(vm == 0, -1e9)   # ignora padding
+
+        weights = torch.softmax(scores, dim=1)       # [B, T]
+
+        h = (weights.unsqueeze(-1) * x).sum(dim=1)   # [B, hidden_dim]
+
+        # ── concat static + temporal summary
+        out = torch.cat([static, h], dim=-1)
+
+        return self.mlp(out)
+
+
+class CNNTemporalDiscriminator1(nn.Module):
+    """
+    Discriminatore temporale CNN con dilatazioni esponenziali
+    + attention pooling (più sensibile ai pattern longitudinali).
+    """
+
+    def __init__(
+        self,
+        static_dim:    int,
+        temporal_dim:  int,
+        hidden_dim:    int   = 64,
+        kernel_size:   int   = 3,
+        n_layers:      int   = 3,
+        dilation_base: int   = 2,
+        mlp_layers:    int   = 2,
+        dropout:       float = 0.1,
+    ):
+        super().__init__()
+
+        # ── Input projection ─────────────────────────────────
+        self.input_proj = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(temporal_dim, hidden_dim)),
+            nn.LeakyReLU(0.2),
+        )
+
+        # ── CNN dilatata ─────────────────────────────────────
+        self.cnn_blocks = nn.ModuleList([
+            _DilatedCNNBlock(hidden_dim, kernel_size, dilation_base ** i, dropout)
+            for i in range(n_layers)
+        ])
+
+        # ── Attention pooling (NUOVO) ─────────────────────────
+        self.attn = nn.Linear(hidden_dim, 1)
+
+        # ── MLP finale ───────────────────────────────────────
+        mlp  = []
+        d_in = hidden_dim + static_dim
+
+        for _ in range(mlp_layers):
+            mlp.extend([
+                nn.utils.spectral_norm(nn.Linear(d_in, hidden_dim)),
+                nn.LeakyReLU(0.2),
+            ])
+
+            if dropout > 0:
+                mlp.append(nn.Dropout(dropout))
+
+            d_in = hidden_dim
+
+        mlp.append(nn.utils.spectral_norm(nn.Linear(d_in, 1)))
+        self.mlp = nn.Sequential(*mlp)
+
+    def forward(
+        self,
+        static:        torch.Tensor,
+        temporal:      torch.Tensor,
+        visit_mask:    torch.Tensor,
+        temporal_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+
+        vm = visit_mask.squeeze(-1) if visit_mask.dim() == 3 else visit_mask
+
+        # ── input projection
+        x = self.input_proj(temporal)
+
+        # ── dilated CNN
+        for block in self.cnn_blocks:
+            x = block(x)
+
+        # ── attention pooling (sostituisce mean pooling)
+        scores = self.attn(x).squeeze(-1)            # [B, T]
+
+        scores = scores.masked_fill(vm == 0, -1e9)   # ignora padding
+
+        weights = torch.softmax(scores, dim=1)       # [B, T]
+
+        h = (weights.unsqueeze(-1) * x).sum(dim=1)   # [B, hidden_dim]
+
+        # ── concat static + temporal summary
+        out = torch.cat([static, h], dim=-1)
+
+        return self.mlp(out)
 
 # ==================================================================
 # GRU TEMPORAL DISCRIMINATOR  (retrocompatibilità v5)

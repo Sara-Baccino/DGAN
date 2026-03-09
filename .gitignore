@@ -7,12 +7,16 @@ env/
 __pycache__/
 *.pyc
 
+#output
+output/
+
 # Dati (opzionale, ma consigliato per file pesanti)
 *.xlsx
 *.csv
 *.png
 *.pdf
-.txt
+*.txt
+*.docx
 
 #altri file
 upsampling.py

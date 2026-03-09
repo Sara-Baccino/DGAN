@@ -1,49 +1,51 @@
 """
 model/generator.py
 ================================================================================
-[v6] Backbone configurabile: GRU | LSTM | Transformer
+[v9] Rumore temporale strutturato + curriculum learning sulla visit_mask
 
-  SELEZIONE VIA CONFIG JSON:
-    "generator": {
-      "backbone":           "gru",   # "gru" | "lstm" | "transformer"
-      "hidden_dim":          128,
-      "rnn_layers":          2,      # GRU / LSTM
-      "dropout":             0.1,
-      "n_transformer_layers": 2,     # Transformer only
-      "n_heads":             4,      # Transformer only
-      "pe_frequencies":      16,     # Transformer only
-      "z_static_dim":        64,
-      "z_temporal_dim":      32
-    }
+CAMBIAMENTI RISPETTO A v8:
 
-  RACCOMANDAZIONE PER ~800 PAZIENTI, T_MEDIO=7, TRAINING LOCALE:
-    backbone="gru", hidden_dim=128, rnn_layers=2
-    → ~120k parametri generatore, ~5-10 sec/epoca su CPU
-    Transformer con T_medio=7 è sovradimensionato: O(T²) attention
-    non porta vantaggi su sequenze così corte ed è 5-10x più lento.
+  1. StructuredTemporalNoise (NUOVO):
+     Sostituisce z_temporal iid con una decomposizione a tre componenti:
 
-  PERCHÉ GRU (non LSTM):
-    - 33% meno parametri a parità di hidden_dim
-    - Nessun vantaggio documentato di LSTM per T<20
-    - Converge più velocemente su sequenze corte
+       z_t[b,t] = sigma_g * z_global[b]      # identità paziente (costante nel tempo)
+                + sigma_r * z_ar[b,t]         # trend correlato AR(1), rho appreso
+                + sigma_e * epsilon[b,t]      # rumore di visita (iid)
 
-  ARCHITETTURA GRU:
-    z_static → fc_static → static_h [B,H]
-                          → followup_head → followup_norm [B]
-                          → n_visits_head → n_v_pred [B]
+     - z_global: cattura le caratteristiche temporali invarianti del paziente
+                 (es. velocità di progressione, livello basale dei biomarker).
+     - z_ar:     cattura i trend a medio termine (es. risposta al trattamento).
+                 rho è un parametro appreso ∈ (0,1) via sigmoid.
+     - epsilon:  cattura la variabilità visita-per-visita (es. fluttuazioni lab).
 
-    z_temporal [B,T,Zt] || t_feat [B,T,2]
-      → input_proj [B,T,H]
-      → GRU con h_0 = fc_static_to_h0(static_h)   [B,T,H]
+     Questo è il modello più generale possibile per dati longitudinali:
+     - Progressione lenta (PBC, ADNI):       rho → 0.85-0.95, sigma_g > sigma_e
+     - Progressione episodica (scompenso):   rho → 0.5-0.7,  sigma_e > sigma_g
+     - Progressione mista (diabete, BPCO):   rho → 0.7-0.8,  sigma_r ≈ sigma_g
 
-    h_seq → temporal_cont_head (output lineare, z-score compatibile)
-    static_h → static_cont_head
+     I pesi sigma_* sono parametri appresi tramite softplus (>0) e normalizzati
+     per mantenere Var(z_t) ≈ 1 (fondamentale per stabilità del GRU/LSTM).
 
-  NOTA IMPORTANTE: n_visits_pred ≠ n_visits
-    - n_visits_pred: output di n_visits_head, usato dalla supervision loss
-    - n_visits: quello che determina la visit_mask (= fixed_visits in training)
-    I due vengono separati per permettere il gradiente su n_visits_head
-    anche quando fixed_visits è fornito (altrimenti NvL = 0 sempre).
+  2. Curriculum learning sulla visit_mask (NUOVO):
+     Problema con fixed_visits=real_n_visits in training:
+     - Il discriminatore vede sempre sequenze della lunghezza corretta.
+     - n_visits_head non riceve gradiente end-to-end dalla visit_mask.
+     - A inference time, n_visits_head ha imparato male → crollo qualità.
+
+     Soluzione: schedule lineare da "100% reale" a "100% predetto":
+       mask_source = "real"  se epoch < warmup_mask_epochs
+       mask_source = mix(real, pred, p=curriculum_p(epoch))  nelle epoche intermedie
+       mask_source = "pred"  se epoch >= total_epochs - finetune_mask_epochs
+
+     curriculum_p(epoch): da 0.0 a 1.0 linearmente nella finestra intermedia.
+     Controllato da HierarchicalGenerator.set_curriculum_p(p).
+
+  3. TimeEncoder v8 invariato (rescaling su slot attivi).
+
+  4. Retrocompatibilità completa:
+     - StructuredTemporalNoise è usato da DGAN._generate_fake().
+     - HierarchicalGenerator.forward() invariato nell'interfaccia.
+     - Il curriculum è gestito da DGAN.fit() via generator.set_curriculum_p().
 ================================================================================
 """
 
@@ -55,7 +57,118 @@ from typing import Dict, Optional
 
 
 # ==================================================================
-# POSITIONAL ENCODING TEMPORALE CONTINUO  (usato solo da Transformer)
+# STRUCTURED TEMPORAL NOISE
+# ==================================================================
+
+class StructuredTemporalNoise(nn.Module):
+    """
+    Decomposizione del rumore temporale in tre componenti ortogonali.
+
+    MOTIVAZIONE:
+      z_temporal iid per ogni slot temporale costringe il backbone (GRU/LSTM)
+      a costruire correlazione temporale partendo da input scorrelati.
+      Questo porta a traiettorie piatte (slope≈0) perché il GRU "media" il
+      rumore producendo output smooth ma senza varianza individuale.
+
+    MODELLO:
+      z_t[b,t] = sigma_g * z_global[b]   +   sigma_r * z_ar[b,t]   +   sigma_e * eps[b,t]
+                 ─────────────────────       ───────────────────────   ─────────────────────
+                 identità paziente           trend correlato AR(1)     rumore visita (iid)
+
+    PARAMETRI APPRESI (tutti ∈ ℝ, poi trasformati):
+      log_rho:      rho = sigmoid(log_rho) ∈ (0,1)  — persistenza AR(1)
+      log_sigma_*:  sigma_* = softplus(log_sigma_*) — pesi componenti
+
+    NORMALIZZAZIONE:
+      I sigma vengono normalizzati per garantire Var(z_t) ≈ 1:
+        Var(z_t) = sigma_g² + sigma_r² * Var(z_ar) + sigma_e²
+      dove Var(z_ar) ≈ 1/(1-rho²) per AR(1) stazionario.
+      Senza normalizzazione, il GRU riceve input con varianza variabile
+      durante il training → instabilità.
+
+    GENERALITY:
+      Funziona per qualsiasi dataset longitudinale. rho appreso si adatta
+      automaticamente alla velocità di progressione della patologia.
+      - PBC, ADNI (progressione lenta):      rho converge verso 0.85-0.95
+      - Scompenso, sepsi (episodico):         rho converge verso 0.5-0.7
+      - Diabete, BPCO (misto):               rho converge verso 0.7-0.8
+    """
+
+    def __init__(self, z_dim: int):
+        super().__init__()
+        self.z_dim = z_dim
+
+        # rho: persistenza AR(1), init sigmoid(1.5) ≈ 0.82
+        self.log_rho = nn.Parameter(torch.tensor(1.5))
+
+        # Pesi delle tre componenti (tutti init a softplus(1.0) ≈ 1.31)
+        self.log_sigma_g = nn.Parameter(torch.tensor(1.0))  # global
+        self.log_sigma_r = nn.Parameter(torch.tensor(1.0))  # ar trend
+        self.log_sigma_e = nn.Parameter(torch.tensor(0.0))  # episodic (init più basso)
+
+    def forward(self, B: int, T: int, device: torch.device) -> torch.Tensor:
+        """
+        Campiona z_temporal strutturato [B, T, z_dim].
+
+        Args:
+            B: batch size
+            T: sequenza massima (max_len)
+            device: device target
+
+        Returns:
+            z_t: [B, T, z_dim] con struttura temporale AR(1) + global + iid
+        """
+        rho     = torch.sigmoid(self.log_rho)                    # ∈ (0,1)
+        sigma_g = F.softplus(self.log_sigma_g)
+        sigma_r = F.softplus(self.log_sigma_r)
+        sigma_e = F.softplus(self.log_sigma_e)
+
+        # ── Componente globale: costante nel tempo per paziente ───────
+        z_global = torch.randn(B, self.z_dim, device=device)    # [B, D]
+        z_global_seq = z_global.unsqueeze(1).expand(-1, T, -1)  # [B, T, D]
+
+        # ── Componente AR(1): trend correlato ─────────────────────────
+        # z_ar[t] = rho * z_ar[t-1] + sqrt(1-rho²) * eps[t]
+        # Var(z_ar) = 1 per stazionarietà (verifica: Var = sigma_eps² / (1-rho²) = 1)
+        noise_scale = torch.sqrt(1.0 - rho ** 2 + 1e-8)
+        eps_ar      = torch.randn(B, T, self.z_dim, device=device)
+        z_ar        = torch.zeros(B, T, self.z_dim, device=device)
+        # Stato iniziale: campionato dalla distribuzione stazionaria N(0,1)
+        z_ar_t      = torch.randn(B, self.z_dim, device=device)
+        for t in range(T):
+            z_ar_t    = rho * z_ar_t + noise_scale * eps_ar[:, t, :]
+            z_ar[:, t, :] = z_ar_t
+
+        # ── Componente episodica: rumore iid per visita ───────────────
+        z_eps = torch.randn(B, T, self.z_dim, device=device)
+
+        # ── Varianza totale per normalizzazione ───────────────────────
+        # Var(z_t) = sigma_g² * Var(z_global) + sigma_r² * Var(z_ar) + sigma_e² * Var(eps)
+        # Var(z_global) = 1 (N(0,1)), Var(z_ar) ≈ 1 per costruzione, Var(eps) = 1
+        var_total = sigma_g ** 2 + sigma_r ** 2 + sigma_e ** 2
+        norm      = torch.sqrt(var_total + 1e-8)
+
+        z_t = (sigma_g * z_global_seq + sigma_r * z_ar + sigma_e * z_eps) / norm
+        return z_t
+
+    def get_stats(self) -> Dict[str, float]:
+        """Restituisce statistiche interpretabili per il logging."""
+        with torch.no_grad():
+            rho     = float(torch.sigmoid(self.log_rho))
+            sigma_g = float(F.softplus(self.log_sigma_g))
+            sigma_r = float(F.softplus(self.log_sigma_r))
+            sigma_e = float(F.softplus(self.log_sigma_e))
+            total   = (sigma_g**2 + sigma_r**2 + sigma_e**2) ** 0.5
+        return {
+            "rho":     rho,
+            "w_global": sigma_g / total,
+            "w_ar":     sigma_r / total,
+            "w_episod": sigma_e / total,
+        }
+
+
+# ==================================================================
+# POSITIONAL ENCODING TEMPORALE CONTINUO
 # ==================================================================
 
 class ContinuousTemporalPE(nn.Module):
@@ -70,78 +183,78 @@ class ContinuousTemporalPE(nn.Module):
         self.static_to_pe = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
     def forward(self, t_norm: torch.Tensor, static_h: torch.Tensor) -> torch.Tensor:
-        angles      = 2.0 * math.pi * t_norm.unsqueeze(-1) * self.freqs
-        pe_in       = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        pe          = self.pe_proj(pe_in)
-        static_bias = self.static_to_pe(static_h).unsqueeze(1)
-        return pe + static_bias
+        angles  = 2.0 * math.pi * t_norm.unsqueeze(-1) * self.freqs
+        pe_in   = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        pe      = self.pe_proj(pe_in)
+        return pe + self.static_to_pe(static_h).unsqueeze(1)
 
 
 # ==================================================================
-# TIME ENCODER
+# TIME ENCODER  [v8 — rescaling su slot attivi, invariato]
 # ==================================================================
 
 class TimeEncoder(nn.Module):
     """
-    Produce t_norm ∈ [0,1] e delta_t da z_temporal.
+    [v8] Rescaling sui soli slot attivi.
 
-    [v5.1] Prima visita sempre a t=0: delta_raw[:,0] = 0.
+    sum(delta_months[slot attivi]) == D3_fup_months per costruzione.
+    => t[n_visits-1] == D3_fup => Cov ≈ 0 automaticamente.
 
-    [v6.1] Ancoraggio a D3_fup via d3_fup_scale (opzionale).
-      - d3_fup_scale ∈ [0,1]: follow-up normalizzato del paziente
-        (D3_fup_reale / D3_fup_max, come prodotto dal preprocessor)
-      - Se fornito: t_norm[-1] ≈ d3_fup_scale → nessuna visita
-        sintetica supera il follow-up reale del paziente
-      - In training: passato come real_followup_norm dal batch reale
-      - In inference: campionato da followup_head(z_static)
-
-    PERCHÉ SERVE:
-      Senza ancoraggio, il TimeEncoder genera t_norm ∈ [0,1] per tutti
-      i pazienti indipendentemente da D3_fup. Un paziente con 6 mesi
-      di follow-up reale ottiene visite sintetiche fino a mese 36
-      (se D3_fup_max=36). Questo causa:
-        1. KS(D3_fup) = 0.68 — distribuzione del follow-up completamente
-           sbagliata (il sintetico concentra tutto a 150-200 mesi)
-        2. Traiettorie temporali che esplodono dopo il mese 15 — perché
-           il discriminatore vede solo i primi mesi reali ma il generatore
-           continua a produrre valori oltre quell'orizzonte
+    Grad-safe: nessuna assegnazione in-place su tensori con grad.
     """
-    def __init__(self, z_temporal_dim: int, hidden_dim: int):
+    def __init__(self, z_temporal_dim: int, hidden_dim: int,
+                 global_time_max: float = 400.0):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(z_temporal_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        nn.init.constant_(self.mlp[-1].bias, 2.3)
+        gtm = float(global_time_max) if global_time_max and global_time_max > 0 else 400.0
+        self.register_buffer("global_time_max", torch.tensor(gtm))
 
     def forward(
         self,
         z_temporal:   torch.Tensor,
-        d3_fup_scale: Optional[torch.Tensor] = None,   # [B] ∈ [0,1]
+        d3_fup_scale: Optional[torch.Tensor],
+        n_visits:     Optional[torch.Tensor],
     ):
-        delta_raw        = F.softplus(self.mlp(z_temporal).squeeze(-1))
-        delta_raw        = delta_raw.clone()
-        delta_raw[:, 0]  = 0.0
-        t_cumul          = torch.cumsum(delta_raw, dim=1)
+        B, T, _ = z_temporal.shape
+        device  = z_temporal.device
 
-        # Normalizza lo spacing relativo tra le visite (invariante per paziente)
-        t_self_max       = t_cumul[:, -1:].clamp(min=1e-8)
-        t_norm_relative  = t_cumul / t_self_max        # ∈ [0,1], shape [B,T]
+        delta_raw = F.softplus(self.mlp(z_temporal).squeeze(-1))   # [B,T]
+
+        t_pos = torch.arange(T, dtype=torch.float32, device=device)
+
+        if n_visits is not None:
+            n_v         = n_visits.float().clamp(1.0, float(T))
+            active_mask = (t_pos.unsqueeze(0) < n_v.unsqueeze(1)).float()
+        else:
+            active_mask = torch.ones(B, T, device=device)
+
+        slot0_mask   = (t_pos > 0).float().unsqueeze(0)
+        delta_active = delta_raw * active_mask * slot0_mask         # [B,T]
 
         if d3_fup_scale is not None:
-            # Scala in modo che t_norm[-1] = d3_fup_scale del paziente
-            # d3_fup_scale = D3_fup / D3_fup_max, già ∈ [0,1] dal preprocessor
-            scale  = d3_fup_scale.unsqueeze(1).clamp(min=1e-3, max=1.0)  # [B,1]
-            t_norm = t_norm_relative * scale                               # [B,T]
+            d3_fup_months = d3_fup_scale.float().clamp(0.01, 1.0) * self.global_time_max
         else:
-            t_norm = t_norm_relative
+            d3_fup_months = torch.full(
+                (B,), float(self.global_time_max) * 0.35, device=device)
 
-        # delta_t = incrementi consecutivi (primo sempre 0 per costruzione)
-        delta_t          = torch.zeros_like(t_norm)
-        delta_t[:, 1:]   = t_norm[:, 1:] - t_norm[:, :-1]
+        sum_active   = delta_active[:, 1:].sum(dim=1).clamp(min=1e-8)
+        scale_factor = (d3_fup_months / sum_active).unsqueeze(1)
+        delta_months = delta_active * scale_factor                  # [B,T] mesi
 
-        t_feat = torch.stack([t_norm, delta_t], dim=-1)
-        return t_norm, delta_t, t_feat
+        t_months     = torch.cumsum(delta_months, dim=1)
+        t_norm       = (t_months / self.global_time_max).clamp(max=1.5)
+        delta_t_norm = torch.cat([
+            torch.zeros(B, 1, device=device),
+            t_norm[:, 1:] - t_norm[:, :-1],
+        ], dim=1)
+        t_feat = torch.stack([t_norm, delta_t_norm], dim=-1)
+
+        return t_norm, delta_t_norm, t_feat, t_months, delta_months
 
 
 # ==================================================================
@@ -149,48 +262,37 @@ class TimeEncoder(nn.Module):
 # ==================================================================
 
 class GRUBackbone(nn.Module):
-    """
-    GRU con h_0 inizializzato da static_h.
-    Il conditioning statico è iniettato nell'hidden state iniziale:
-    più efficiente del broadcast ad ogni step, stesso gradiente.
-    """
     def __init__(self, input_dim: int, hidden_dim: int, n_layers: int, dropout: float):
         super().__init__()
         self.n_layers   = n_layers
         self.hidden_dim = hidden_dim
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.input_proj = nn.Linear(input_dim + hidden_dim, hidden_dim)
         self.gru = nn.GRU(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=n_layers,
-            batch_first=True,
+            input_size=hidden_dim, hidden_size=hidden_dim,
+            num_layers=n_layers, batch_first=True,
             dropout=dropout if n_layers > 1 else 0.0,
         )
         self.static_to_h0 = nn.Linear(hidden_dim, n_layers * hidden_dim)
 
     def forward(self, x: torch.Tensor, static_h: torch.Tensor) -> torch.Tensor:
-        x   = self.input_proj(x)
-        h0  = self.static_to_h0(static_h)
-        h0  = h0.view(-1, self.n_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        T  = x.shape[1]
+        s  = static_h.unsqueeze(1).expand(-1, T, -1)
+        x  = self.input_proj(torch.cat([x, s], dim=-1))
+        h0 = self.static_to_h0(static_h)
+        h0 = h0.view(-1, self.n_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
         h, _ = self.gru(x, h0)
         return h
 
 
 class LSTMBackbone(nn.Module):
-    """
-    LSTM con (h_0, c_0) inizializzati da static_h.
-    Più parametri di GRU (1.33x); considera LSTM solo per T_medio > 15.
-    """
     def __init__(self, input_dim: int, hidden_dim: int, n_layers: int, dropout: float):
         super().__init__()
         self.n_layers   = n_layers
         self.hidden_dim = hidden_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         self.lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=n_layers,
-            batch_first=True,
+            input_size=hidden_dim, hidden_size=hidden_dim,
+            num_layers=n_layers, batch_first=True,
             dropout=dropout if n_layers > 1 else 0.0,
         )
         self.static_to_h0 = nn.Linear(hidden_dim, 2 * n_layers * hidden_dim)
@@ -205,30 +307,19 @@ class LSTMBackbone(nn.Module):
 
 
 class TransformerBackbone(nn.Module):
-    """
-    Transformer con PE continuo. Preferibile per T_medio > 15 e con GPU.
-    Con T_medio=7: nessun vantaggio rispetto a GRU, costo 5-10x maggiore.
-    """
-    def __init__(
-        self,
-        input_dim: int, hidden_dim: int, n_layers: int,
-        n_heads: int, dropout: float, pe_frequencies: int,
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, n_layers: int,
+                 n_heads: int, dropout: float, pe_frequencies: int):
         super().__init__()
         self.input_proj  = nn.Linear(input_dim, hidden_dim)
         self.temporal_pe = ContinuousTemporalPE(hidden_dim, pe_frequencies)
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout, activation="gelu",
-            batch_first=True, norm_first=True,
+            d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
-            enc_layer, num_layers=n_layers, enable_nested_tensor=False,
-        )
+            enc_layer, num_layers=n_layers, enable_nested_tensor=False)
 
     def forward(self, x: torch.Tensor, static_h: torch.Tensor) -> torch.Tensor:
-        # Le ultime 2 colonne di x sono (t_norm, delta_t) → usate per PE
         t_norm = x[:, :, -2]
         h      = self.input_proj(x)
         h      = h + self.temporal_pe(t_norm, static_h) + static_h.unsqueeze(1)
@@ -236,21 +327,18 @@ class TransformerBackbone(nn.Module):
 
 
 # ==================================================================
-# HIERARCHICAL GENERATOR
+# HIERARCHICAL GENERATOR  [v9]
 # ==================================================================
 
 class HierarchicalGenerator(nn.Module):
     """
-    Generatore con backbone selezionabile via config.
-
-    PARAMETRI CHIAVE:
-      backbone:    "gru" | "lstm" | "transformer"
-      hidden_dim:  dimensione uniforme di tutte le proiezioni
-      rnn_layers:  profondità GRU/LSTM (ignorato da Transformer)
-
-    OUTPUT forward() include SEMPRE:
-      n_visits_pred: output di n_visits_head (usato da supervision loss)
-      n_visits:      n_visits effettivo per la mask (= fixed_visits in training)
+    [v9] Aggiunge:
+      - StructuredTemporalNoise: modulo che vive nel generator e produce
+        z_temporal strutturato. I suoi parametri (rho, sigma_*) sono
+        ottimizzati end-to-end col resto del generatore.
+      - set_curriculum_p(p): controlla la probabilità di usare n_visits_pred
+        invece di n_visits_real per la visit_mask. Chiamato da DGAN.fit().
+        p=0.0 → sempre reale (warmup), p=1.0 → sempre predetto (fine training).
     """
 
     def __init__(
@@ -267,7 +355,6 @@ class HierarchicalGenerator(nn.Module):
         n_transformer_layers: int   = 2,
         n_heads:              int   = 4,
         pe_frequencies:       int   = 16,
-        # retrocompatibilità
         gru_layers:           int   = None,
     ):
         super().__init__()
@@ -279,11 +366,19 @@ class HierarchicalGenerator(nn.Module):
         self.n_visits_sharpness = n_visits_sharpness
         self.backbone_name      = backbone
 
+        # Curriculum: prob di usare n_visits_pred per la mask [0,1]
+        # Aggiornato da DGAN.fit() via set_curriculum_p()
+        self._curriculum_p = 0.0
+
         if gru_layers is not None:
             rnn_layers = gru_layers
 
-        # ── Time encoder ─────────────────────────────────────────────
-        self.time_encoder = TimeEncoder(z_temporal_dim, hidden_dim)
+        # ── Structured temporal noise [v9] ────────────────────────────
+        self.noise_model = StructuredTemporalNoise(z_dim=z_temporal_dim)
+
+        # ── Time encoder [v8] ─────────────────────────────────────────
+        gtm = float(getattr(preprocessor, "global_time_max", 400.0) or 400.0)
+        self.time_encoder = TimeEncoder(z_temporal_dim, hidden_dim, global_time_max=gtm)
 
         # ── Static branch ─────────────────────────────────────────────
         self.fc_static = nn.Sequential(
@@ -298,10 +393,6 @@ class HierarchicalGenerator(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid(),
         )
-        # [v6.2] Warm start followup_head: bias → sigmoid⁻¹(0.35) ≈ -0.62
-        # Il follow-up mediano reale è ~35% del massimo (distribuzione skew-right).
-        # Senza warm start, sigmoid(0)=0.5 → il generatore sovrastima il follow-up
-        # nei primi epoch e il gradiente diverge prima di stabilizzarsi.
         nn.init.constant_(self.followup_head[-2].bias, -0.62)
 
         self.n_visits_head = nn.Sequential(
@@ -309,23 +400,19 @@ class HierarchicalGenerator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
-        nn.init.constant_(self.n_visits_head[-1].bias, 6.0)  # warm start ≈7 visite
+        nn.init.constant_(self.n_visits_head[-1].bias, 6.0)
 
         # ── Temporal backbone ─────────────────────────────────────────
-        input_dim = z_temporal_dim + 2   # z_t || (t_norm, delta_t)
+        input_dim = z_temporal_dim + 2
         if backbone == "gru":
             self.backbone = GRUBackbone(input_dim, hidden_dim, rnn_layers, dropout)
         elif backbone == "lstm":
             self.backbone = LSTMBackbone(input_dim, hidden_dim, rnn_layers, dropout)
         elif backbone == "transformer":
             self.backbone = TransformerBackbone(
-                input_dim, hidden_dim,
-                n_transformer_layers, n_heads, dropout, pe_frequencies,
-            )
+                input_dim, hidden_dim, n_transformer_layers, n_heads, dropout, pe_frequencies)
         else:
-            raise ValueError(
-                f"backbone deve essere 'gru', 'lstm' o 'transformer'. Ricevuto: {backbone!r}"
-            )
+            raise ValueError(f"backbone non valido: {backbone!r}")
 
         # ── Output statici ────────────────────────────────────────────
         self.static_cont_head = None
@@ -341,13 +428,11 @@ class HierarchicalGenerator(nn.Module):
         for v in data_config.static_cat:
             if v.name in preprocessor.embedding_configs:
                 self.static_cat_heads[v.name] = nn.Linear(
-                    hidden_dim, preprocessor.embedding_configs[v.name]
-                )
+                    hidden_dim, preprocessor.embedding_configs[v.name])
             else:
                 self.static_cat_heads[v.name] = nn.Linear(hidden_dim, v.n_categories)
 
         # ── Output temporali ──────────────────────────────────────────
-        # Output lineare (z-score), LayerNorm + zero-init per stabilità.
         self.temporal_cont_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -371,6 +456,33 @@ class HierarchicalGenerator(nn.Module):
 
     # ─────────────────────────────────────────────────────────────────
 
+    def set_curriculum_p(self, p: float):
+        """
+        Imposta la probabilità curriculum per la visit_mask.
+
+        p=0.0: usa sempre n_visits reale (warmup, discriminatore non vede errori di lunghezza)
+        p=1.0: usa sempre n_visits_pred (fine training, end-to-end)
+
+        Chiamato da DGAN.fit() ad ogni epoca.
+        """
+        self._curriculum_p = float(max(0.0, min(1.0, p)))
+
+    def sample_noise(self, B: int, device: torch.device):
+        """
+        Campiona z_static e z_temporal strutturato.
+        Usato da DGAN._generate_fake() invece di campionare z_t direttamente.
+
+        Returns:
+            z_s: [B, z_static_dim]
+            z_t: [B, T, z_temporal_dim]  — strutturato con StructuredTemporalNoise
+        """
+        z_s = torch.randn(B, self.data_config.z_static_dim
+                          if hasattr(self.data_config, "z_static_dim")
+                          else self.fc_static[0].in_features,
+                          device=device)
+        z_t = self.noise_model(B, self.max_len, device)
+        return z_s, z_t
+
     @staticmethod
     def _cummax_irreversible(hazard: torch.Tensor) -> torch.Tensor:
         states, _ = torch.cummax(hazard, dim=1)
@@ -381,7 +493,58 @@ class HierarchicalGenerator(nn.Module):
         device = n_v.device
         t_pos  = torch.arange(T, dtype=torch.float32, device=device)
         logits = self.n_visits_sharpness * (n_v.unsqueeze(-1) - 0.5 - t_pos.unsqueeze(0))
-        return torch.sigmoid(logits).unsqueeze(-1)  # [B,T,1]
+        return torch.sigmoid(logits).unsqueeze(-1)
+
+    def _build_visit_mask(
+        self,
+        n_v_pred:     torch.Tensor,
+        fixed_visits: Optional[torch.Tensor],
+        hard_mask:    bool,
+        device:       torch.device,
+    ):
+        """
+        Costruisce visit_mask e n_v applicando il curriculum learning.
+
+        Logica:
+          1. Se fixed_visits è fornito (da DGAN con real_n_visits):
+             - Con prob (1 - curriculum_p): usa fixed_visits (reale)
+             - Con prob curriculum_p:       usa n_v_pred (predetto)
+          2. Se fixed_visits è None:
+             - hard_mask=True: n_v_pred arrotondato
+             - hard_mask=False: soft mask differenziabile
+
+        In entrambi i casi la mask è differenziabile rispetto a n_v_pred
+        quando si usa il ramo predetto, permettendo gradiente end-to-end.
+        """
+        T = self.max_len
+        t_pos = torch.arange(T, dtype=torch.float32, device=device)
+
+        if fixed_visits is not None:
+            n_v_real = fixed_visits.to(device).float().clamp(2.0, float(T))
+
+            # Curriculum: decide per ogni campione del batch se usare reale o predetto
+            if self._curriculum_p > 0.0 and self.training:
+                # Maschera booleana: True → usa predetto, False → usa reale
+                use_pred = (torch.rand(n_v_real.shape[0], device=device)
+                            < self._curriculum_p)
+                # n_v misto: reale o predetto per ogni campione
+                n_v_mix  = torch.where(use_pred, n_v_pred.clamp(2.0, float(T)), n_v_real)
+            else:
+                n_v_mix = n_v_real
+
+            # Soft mask differenziabile per i campioni con n_v predetto
+            visit_mask = self._soft_visit_mask(n_v_mix)
+            n_v        = n_v_mix
+
+        elif hard_mask:
+            n_v_hard   = n_v_pred.round().clamp(2.0, float(T))
+            visit_mask = (n_v_hard.unsqueeze(-1) > t_pos.unsqueeze(0)).float().unsqueeze(-1)
+            n_v        = n_v_hard
+        else:
+            visit_mask = self._soft_visit_mask(n_v_pred)
+            n_v        = n_v_pred
+
+        return visit_mask, n_v
 
     # ─────────────────────────────────────────────────────────────────
 
@@ -399,54 +562,35 @@ class HierarchicalGenerator(nn.Module):
         B, T, _ = z_temporal.shape
         device   = z_temporal.device
 
-        # 1. Follow-up prediction — followup_head è SEMPRE calcolato e usato
-        #    [v6.2] In training: followup_head riceve gradiente sia da lambda_fup
-        #    (supervisione verso il valore reale) sia dal TimeEncoder → WGAN.
-        #    NON usiamo più il valore reale direttamente nel TimeEncoder perché
-        #    questo interrompeva il gradiente su followup_head in training,
-        #    rendendo followup_head inutile in inference.
-        #    real_followup_norm viene usato solo come target della fup_loss.
+        # 1. Follow-up prediction
         followup_scale = self.followup_head(z_static).squeeze(-1)   # [B] ∈ [0,1]
 
-        # 2. n_visits predetto — MAI sovrascritto da fixed_visits
-        #    È l'output grezzo di n_visits_head che la supervision loss deve allenare.
+        # 2. n_visits predetto
         n_v_raw  = F.softplus(self.n_visits_head(z_static).squeeze(-1)) + 1.0
         n_v_pred = n_v_raw.clamp(1.0, float(T))
 
-        # 3. Visit mask
-        if fixed_visits is not None:
-            # Training: mask esatta basata sul n_visits reale campionato
-            n_v_used   = fixed_visits.to(device).float().clamp(1.0, float(T))
-            t_pos      = torch.arange(T, dtype=torch.float32, device=device)
-            visit_mask = (n_v_used.unsqueeze(-1) > t_pos.unsqueeze(0)).float().unsqueeze(-1)
-            n_v        = n_v_used
-        elif hard_mask:
-            # Inference con mask binaria
-            n_v_hard   = n_v_pred.round()
-            t_pos      = torch.arange(T, dtype=torch.float32, device=device)
-            visit_mask = (n_v_hard.unsqueeze(-1) > t_pos.unsqueeze(0)).float().unsqueeze(-1)
-            n_v        = n_v_hard
-        else:
-            # Training senza conditioning: soft mask differenziabile
-            visit_mask = self._soft_visit_mask(n_v_pred)
-            n_v        = n_v_pred
+        # 3. Visit mask con curriculum [v9]
+        visit_mask, n_v = self._build_visit_mask(
+            n_v_pred=n_v_pred, fixed_visits=fixed_visits,
+            hard_mask=hard_mask, device=device)
 
-        # 4. Time encoding — [v6.1] ancoraggio a followup_scale (D3_fup normalizzato)
-        # followup_scale è già calcolato sopra (reale in training, predetto in inference)
-        t_norm, delta_t, t_feat = self.time_encoder(z_temporal, d3_fup_scale=followup_scale)
+        # 4. Time encoding [v8]: rescaling su slot attivi
+        t_norm, delta_t, t_feat, t_months, delta_months = self.time_encoder(
+            z_temporal, d3_fup_scale=followup_scale, n_visits=n_v)
 
         # 5. Static encoding
         static_h = self.fc_static(z_static)   # [B, H]
 
         # 6. Backbone temporale
-        backbone_in = torch.cat([z_temporal, t_feat], dim=-1)   # [B, T, Zt+2]
-        h_seq       = self.backbone(backbone_in, static_h)       # [B, T, H]
+        backbone_in = torch.cat([z_temporal, t_feat], dim=-1)
+        h_seq       = self.backbone(backbone_in, static_h)
 
         # 7. Output statici
-        static_cont      = None
-        static_cat       = {}
-        static_cat_embed = {}
-        embed_cfg        = self.preprocessor.embedding_configs
+        static_cont     = None
+        static_cat      = {}
+        static_cat_soft = {}
+        static_cat_embed= {}
+        embed_cfg       = self.preprocessor.embedding_configs
 
         if self.static_cont_head is not None:
             static_cont = self.static_cont_head(static_h)
@@ -456,9 +600,10 @@ class HierarchicalGenerator(nn.Module):
             if name in embed_cfg:
                 static_cat_embed[name] = out.contiguous()
             else:
-                static_cat[name] = F.gumbel_softmax(out, tau=temperature, hard=True, dim=-1)
+                static_cat[name]      = F.gumbel_softmax(out, tau=temperature, hard=True,  dim=-1)
+                static_cat_soft[name] = F.gumbel_softmax(out, tau=temperature, hard=False, dim=-1)
 
-        # 8. Output temporali (moltiplicati per visit_mask: padding → 0)
+        # 8. Output temporali
         temporal_cont = self.temporal_cont_head(h_seq) * visit_mask
 
         temporal_cat    = {}
@@ -479,14 +624,17 @@ class HierarchicalGenerator(nn.Module):
                 temporal_cat[name] = y * visit_mask
 
         return {
-            "static_cont":      static_cont,
-            "static_cat":       static_cat       if static_cat       else None,
-            "static_cat_embed": static_cat_embed if static_cat_embed else None,
-            "temporal_cont":    temporal_cont,
-            "temporal_cat":     temporal_cat,
-            "visit_mask":       visit_mask,
-            "visit_times":      t_norm,
-            "followup_norm":    followup_scale,
-            "n_visits":         n_v,          # per la mask e il log Nv=
-            "n_visits_pred":    n_v_pred,     # per n_visits_supervision_loss
+            "static_cont":        static_cont,
+            "static_cat":         static_cat       if static_cat       else None,
+            "static_cat_soft":    static_cat_soft  if static_cat_soft  else {},
+            "static_cat_embed":   static_cat_embed if static_cat_embed else None,
+            "temporal_cont":      temporal_cont,
+            "temporal_cat":       temporal_cat,
+            "visit_mask":         visit_mask,
+            "visit_times":        t_norm,
+            "visit_times_months": t_months,
+            "delta_months":       delta_months,
+            "followup_norm":      followup_scale,
+            "n_visits":           n_v,
+            "n_visits_pred":      n_v_pred,
         }

@@ -137,15 +137,15 @@
   "outcomes": ["DEATH", "TRANSP"],
 
   "model": {
-    "z_static_dim": 64,
-    "z_temporal_dim": 32,
+    "z_static_dim": 96,
+    "z_temporal_dim": 48,
     "hidden": 128,
-    "epochs": 400,
-    "patience": 9999,
+    "epochs": 500,
+    "patience": 300,
     "batch_size": 128,
     "lr_g": 0.0001,
-    "lr_d_s": 0.0003,
-    "lr_d_t": 0.0001,
+    "lr_d_s": 0.0001,
+    "lr_d_t": 0.00005,
 
     "generator": {
       "arch": "gru",
@@ -153,28 +153,28 @@
       "n_layers": 2,
       "bidirectional": true,
       "dropout": 0.1,
-      "z_static_dim": 64,
-      "z_temporal_dim": 32
+      "z_static_dim": 96,
+      "z_temporal_dim": 48
     },
 
     "static_discriminator": {
-      "static_layers": 3,
-      "mlp_hidden_dim": 256,
+      "static_layers": 4,
+      "mlp_hidden_dim": 128,
       "dropout": 0.05
     },
 
     "temporal_discriminator": {
       "arch": "cnn",
-      "hidden_dim": 128,
+      "hidden_dim": 96,
       "kernel_size": 3,
-      "n_layers": 3,
+      "n_layers": 4,
       "dilation_base": 2,
       "mlp_layers": 3,
       "dropout": 0.1
     },
 
     "noise_std": 0.1,
-    "grad_clip": 3,
+    "grad_clip": 3.5,
     "use_dp": false,
     "force_full_mask": false,
     "regular": true,
@@ -187,20 +187,24 @@
 
     "lambda_gp": 4,
     "lambda_gp_s": 4,
-    "lambda_gp_t": 8,
+    "lambda_gp_t": 2,
 
-    "alpha_irr": 0.25,
+    "alpha_irr": 1,
     "lambda_aux": 0.2,
 
-    "lambda_freq_gen": 0.3,
+    "lambda_freq_gen": 0,
     "lambda_freq_disc": 0.1,
-    "freq_weight_power": 1.5,
+    "freq_weight_power": 1,
 
-    "lambda_fm": 1.5,
+    "lambda_fm": 1,
     "lambda_nv": 2,
-    "lambda_fc": 1.5,
+    "lambda_fc": 0,
     "lambda_fup": 2,
-    "lambda_static_cat": 3.0,
+    "lambda_static_cat": 0,
+    "lambda_sc_var": 5.0,
+    "lambda_ivi": 6,
+    "lambda_coverage": 0,
+    "lambda_uniformity": 0,
 
     "n_visits_sharpness": 10,
     "fixed_visits": null

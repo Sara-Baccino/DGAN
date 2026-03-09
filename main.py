@@ -14,7 +14,7 @@ from model.dgan import DGAN
 from datetime import datetime
 #timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-timestr = "3"
+timestr = "2"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ def main():
         "CENTRE": 12
     }
     
-    LOG_VARS = ["ALP", "BIL", "ALT", "AST", "GGT", "CRE", "TRIGVAL", "NEUTVAL"]
+    LOG_VARS = ["ALP", "BIL", "ALT", "AST", "GGT", "CRE", "TRIGVAL", "NEUTVAL", "SOD", "VITDVAL", "LINFVAL"]
 
     preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs, log_vars=LOG_VARS)
 
@@ -139,11 +139,6 @@ def main():
     print("TRAINING COMPLETE")
     print("="*80)
     
-    # Visualizza loss history
-    from utils.plots import plot_training_history
-    
-    plot_training_history(dgan, timestr)
-    
     # =========================================================================
     # 6. SALVA MODELLO
     # =========================================================================
@@ -178,6 +173,13 @@ def main():
     logger.info("="*80)
     
     basic_validation(df_train, df_synthetic, data_cfg)
+
+    # Visualizza loss history
+    from utils.plots import plot_training_history, plot_training_history2
+    
+    plot_training_history(dgan, timestr)
+
+    plot_training_history2(dgan, timestr, config_path=config_path)
     
     logger.info("\n" + "="*80)
     print("✓ PIPELINE COMPLETE")

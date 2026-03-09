@@ -1,34 +1,44 @@
 """
-config/config_loader.py  [v6 — architettura configurabile GRU/LSTM/Transformer + CNN disc]
+config/config_loader.py  [v6.4]
 ================================================================================
-Modifiche rispetto alla versione precedente:
+Modifiche rispetto a v6:
 
-  [v6] GeneratorConfig:
-    - Nuovo campo obbligatorio: arch ("gru" | "lstm" | "transformer")
-    - Nuovi campi: n_layers, bidirectional
-    - gru_layers mantenuto per retrocompatibilità (alias di n_layers se
-      arch non è presente nel JSON vecchio)
-    - n_transformer_layers, n_heads, pe_frequencies: ora opzionali con default,
-      usati solo quando arch="transformer"
+  [v6.4] ModelConfig — nuovi parametri aggiunti:
+    - lambda_static_cat : supervisione distribuzione marginale categoriche statiche
+                          default 5.0 (era mancante → getattr in dgan.py → None)
+    - lambda_sc_var     : supervisione distribuzione continue statiche (quantili+var)
+                          default 1.0 (era mancante → stessa situazione)
 
-  [v6] TempDiscriminatorConfig:
-    - Nuovo campo: arch ("cnn" | "gru"), default "cnn"
-    - Campi CNN: hidden_dim, kernel_size, n_layers, dilation_base
-    - Campi GRU: mlp_hidden_dim, gru_hidden_dim, gru_layers, mlp_layers
-    - Tutti con default → retrocompatibile con JSON che aveva solo campi GRU
-    - Con arch="cnn" i parametri GRU vengono ignorati dalla factory
+  [v6.4] Default allineati tra ModelConfig e dgan.py:
+    I default in ModelConfig erano disallineati rispetto ai getattr di dgan.py.
+    Quando il JSON non specifica un parametro, ModelConfig usava valori troppo
+    bassi (es. lambda_fc=0.3 invece di 2.5). Ora i default sono:
+      lambda_fup        : 3.0  (era 0.5)
+      lambda_fc         : 2.5  (era 0.3)
+      lambda_nv         : 3.0  (era 0.5)
+      lambda_static_cat : 5.0  (era mancante)
+      lambda_sc_var     : 1.0  (era mancante)
+      lambda_gp_t       : 4.0  (era 8.0 — causava D_t dominante)
+      alpha_irr         : 0.25 (era 0.4)
 
-  [v6] ModelConfig:
-    - Aggiunto critic_steps_temporal (default = critic_steps)
-    - Aggiunti lambda_fm, lambda_nv, lambda_fc, lambda_fup
-      (prima usati in dgan.py via getattr, ora dichiarati esplicitamente)
+  [v6.4] _get() helper con null-safety:
+    cfg.get(key, default) or default → gestisce JSON con valori null espliciti.
 
-  [v6] build_model_config:
-    - Tutti i nuovi campi con .get() e default → compatibile con JSON v5
+  [v6.4] dgan.py — allineamento getattr:
+    I getattr in dgan.py ora trovano l'attributo in ModelConfig (non più mancante),
+    quindi leggono il valore corretto dal JSON o il default allineato.
+    I getattr restano come doppia sicurezza ma non sono più la fonte primaria.
 
-  RETROCOMPATIBILITÀ:
-    Un JSON v5 senza arch, bidirectional, lambda_fm ecc. funziona ancora:
-    ottiene arch="gru", bidirectional=True, e tutti i default sensati.
+  INVARIATO da v6:
+    - GeneratorConfig: arch, n_layers, bidirectional, transformer params
+    - TempDiscriminatorConfig: CNN/GRU, tutti i parametri
+    - critic_steps_temporal: __post_init__ gestisce -1 → critic_steps
+    - Retrocompatibilità completa con JSON v5/v6
+
+  NOTA — visit_time vs visit_times (NON un bug):
+    preprocessor.to_tensors() → "visit_time"  (tempi reali, per il discriminatore)
+    Generator.forward()       → "visit_times" (tempi sintetici, per fc_loss)
+    Le due chiavi sono diverse intenzionalmente. Non vanno unificate.
 ================================================================================
 """
 
@@ -51,9 +61,9 @@ class TimeConfig:
 @dataclass
 class VariableConfig:
     name:         str
-    kind:         str          # "continuous" | "categorical"
+    kind:         str
     static:       bool
-    dtype:        str          # "int" | "float" | "string"
+    dtype:        str
     mapping:      Optional[Dict] = None
     irreversible: bool = False
 
@@ -67,35 +77,18 @@ class VariableConfig:
 @dataclass
 class GeneratorConfig:
     """
-    Configurazione generatore.
-
-    arch:          "gru" (default) | "lstm" | "transformer"
-    hidden_dim:    dimensione hidden
-    n_layers:      layer RNN o Transformer (alias: gru_layers per retrocompat.)
-    bidirectional: solo gru/lstm — ogni step vede passato e futuro
-    z_static_dim, z_temporal_dim: dimensioni spazio latente
-    dropout:       dropout tra layer
-
-    Solo arch="transformer":
-      n_transformer_layers: sovrascrive n_layers per il Transformer
-      n_heads:              attention heads (hidden_dim % n_heads == 0)
-      pe_frequencies:       frequenze positional encoding continuo
+    arch: "gru" | "lstm" | "transformer"
     """
-    # Obbligatori (nel JSON o con default nel build)
     hidden_dim:     int
     z_static_dim:   int
     z_temporal_dim: int
     dropout:        float
 
-    # Architettura — tutti con default per retrocompatibilità
-    arch:          str   = "gru"   # "gru" | "lstm" | "transformer"
-    n_layers:      int   = 2       # layer RNN o Transformer
-    bidirectional: bool  = True    # solo gru/lstm
+    arch:          str  = "gru"
+    n_layers:      int  = 2
+    bidirectional: bool = True
+    gru_layers:    int  = 2   # retrocompatibilità v5
 
-    # Retrocompatibilità: gru_layers → alias di n_layers se arch assente
-    gru_layers:    int   = 2
-
-    # Transformer-only (ignorati da gru/lstm)
     n_transformer_layers: int = 2
     n_heads:              int = 4
     pe_frequencies:       int = 16
@@ -103,7 +96,6 @@ class GeneratorConfig:
 
 @dataclass
 class DiscriminatorConfig:
-    """Discriminatore statico (Residual MLP con Spectral Norm)."""
     static_layers:  int
     mlp_hidden_dim: int
     dropout:        float
@@ -112,26 +104,10 @@ class DiscriminatorConfig:
 @dataclass
 class TempDiscriminatorConfig:
     """
-    Discriminatore temporale configurabile.
-
-    arch: "cnn" (default) | "gru"
-
-    Parametri CNN (arch="cnn"):
-      hidden_dim:    canali Conv1d
-      kernel_size:   dimensione kernel (default 3)
-      n_layers:      blocchi dilatati (default 3, receptive field = 7 con k=3)
-      dilation_base: base esponenziale dilatazioni (default 2 → d=1,2,4)
-      mlp_layers:    layer MLP finale
-
-    Parametri GRU (arch="gru"):
-      gru_hidden_dim, gru_layers: architettura GRU
-      mlp_hidden_dim, mlp_layers: MLP finale
-
-    dropout: condiviso tra arch
+    arch: "cnn" | "gru"
     """
-    # Comune
     dropout:   float = 0.1
-    arch:      str   = "cnn"     # "cnn" | "gru"
+    arch:      str   = "cnn"
     mlp_layers: int  = 2
 
     # CNN
@@ -153,10 +129,7 @@ class TempDiscriminatorConfig:
 @dataclass
 class ModelConfig:
     """
-    Configurazione completa del modello.
-
-    Tutti i parametri con default → retrocompatibile con JSON v5.
-    I parametri senza default sono obbligatori nel JSON.
+    [v6.4] Tutti i parametri lambda dichiarati con default allineati a dgan.py.
     """
     # Spazio latente
     z_static_dim:   int
@@ -175,7 +148,7 @@ class ModelConfig:
     static_discriminator:   DiscriminatorConfig
     temporal_discriminator: TempDiscriminatorConfig
 
-    # Misc training
+    # Misc
     noise_std:                float
     critic_steps:             int
     grad_clip:                float
@@ -186,43 +159,59 @@ class ModelConfig:
     gumbel_temperature_start: float
     fixed_visits:             Optional[int]
 
-    # [v6] Critic steps asimmetrici: D_t si aggiorna meno di D_s
-    # Se D_t >> D_s (es. -20 vs -0.3), abbassa critic_steps_temporal a 2.
-    # Default = critic_steps (comportamento identico a versione precedente).
-    critic_steps_temporal: int = -1   # -1 = usa critic_steps (impostato in __post_init__)
+    # Critic steps asimmetrici (-1 → __post_init__ = critic_steps)
+    critic_steps_temporal: int = -1
 
-    # Gradient penalty separati per i due discriminatori
+    # Gradient penalty
     lambda_gp:   float = 4.0
     lambda_gp_s: float = 4.0
-    lambda_gp_t: float = 8.0
+    lambda_gp_t: float = 4.0   # [v6.4] abbassato da 8.0 → riduce D_t dominance
 
     # Irreversibilità e auxiliary
-    alpha_irr:  float = 0.4
+    alpha_irr:  float = 0.25   # [v6.4] abbassato da 0.4
     lambda_aux: float = 0.2
 
-    # Categorical frequency regularization
-    lambda_freq_gen:   float = 0.20
-    lambda_freq_disc:  float = 0.05
+    # Categorical frequency
+    lambda_freq_gen:   float = 0.30
+    lambda_freq_disc:  float = 0.10
     freq_weight_power: float = 1.5
 
     # Gumbel temperature
     temperature_min: float = 0.5
 
-    # Visit mask sharpness
+    # Visit mask
     n_visits_sharpness: float = 10.0
 
-    # [v6] Losses ausiliarie generatore
-    # lambda_fm:  feature matching disc_static (0=disabilitato)
-    # lambda_nv:  n_visits supervision (forza n_visits_head verso reale)
-    # lambda_fc:  followup constraint (t_norm_last ≈ 1.0)
-    # lambda_fup: followup_norm MSE (followup_head verso reale)
-    lambda_fm:  float = 3.0
-    lambda_nv:  float = 0.5
-    lambda_fc:  float = 0.3
-    lambda_fup: float = 0.5
+    # ── Loss generatore [v6.4] ─────────────────────────────────────────
+    # Feature matching
+    lambda_fm: float = 1.5
+
+    # Follow-up norm distribution (media + varianza + quantili)
+    lambda_fup: float = 3.0   # [v6.4] era 0.5
+
+    # Follow-up constraint (ultima visita attiva = followup_scale)
+    lambda_fc: float = 2.5   # [v6.4] era 0.3
+
+    # n_visits supervision (distribuzione media+var+quantili)
+    lambda_nv: float = 3.0   # [v6.4] era 0.5
+
+    # Static categorical marginal [v6.4] NUOVO — era mancante
+    lambda_static_cat: float = 5.0
+
+    # Static continuous distribution [v6.4] NUOVO
+    lambda_sc_var: float = 1.0
+
+    # Inter-visit interval distribution [v6.5] NUOVO
+    # Supervisiona la distribuzione degli intervalli tra visite consecutive.
+    lambda_ivi: float = 2.0
+
+    lambda_coverage: float = 25
+
+    lambda_uniformity: float = 5
+
+    
 
     def __post_init__(self):
-        # critic_steps_temporal = critic_steps se non specificato
         if self.critic_steps_temporal < 0:
             self.critic_steps_temporal = self.critic_steps
 
@@ -280,29 +269,19 @@ def build_data_config(
 
 
 def _build_generator_config(gen_raw: dict) -> GeneratorConfig:
-    """
-    Costruisce GeneratorConfig da dict JSON.
-
-    Retrocompatibilità con JSON v5 (senza arch/n_layers/bidirectional):
-      - arch: default "gru"
-      - n_layers: usa n_layers se presente, poi gru_layers, poi 2
-      - bidirectional: default True
-      - n_transformer_layers: mantiene v5 se arch="transformer"
-    """
     arch       = gen_raw.get("arch", "gru").lower()
     gru_layers = gen_raw.get("gru_layers", 2)
-    n_layers   = gen_raw.get("n_layers", gru_layers)  # n_layers > gru_layers > 2
+    n_layers   = gen_raw.get("n_layers", gru_layers)
 
     return GeneratorConfig(
-        arch          = arch,
-        hidden_dim    = gen_raw["hidden_dim"],
-        z_static_dim  = gen_raw["z_static_dim"],
+        arch           = arch,
+        hidden_dim     = gen_raw["hidden_dim"],
+        z_static_dim   = gen_raw["z_static_dim"],
         z_temporal_dim = gen_raw["z_temporal_dim"],
-        dropout       = gen_raw["dropout"],
-        n_layers      = n_layers,
-        bidirectional = gen_raw.get("bidirectional", True),
-        gru_layers    = gru_layers,
-        # Transformer-only
+        dropout        = gen_raw["dropout"],
+        n_layers       = n_layers,
+        bidirectional  = gen_raw.get("bidirectional", True),
+        gru_layers     = gru_layers,
         n_transformer_layers = gen_raw.get("n_transformer_layers", n_layers),
         n_heads              = gen_raw.get("n_heads", 4),
         pe_frequencies       = gen_raw.get("pe_frequencies", 16),
@@ -310,83 +289,91 @@ def _build_generator_config(gen_raw: dict) -> GeneratorConfig:
 
 
 def _build_temp_disc_config(td_raw: dict) -> TempDiscriminatorConfig:
-    """
-    Costruisce TempDiscriminatorConfig da dict JSON.
-
-    Retrocompatibilità con JSON v5 (solo parametri GRU):
-      - arch: default "cnn" se non specificato
-      - parametri CNN hanno default → nessun errore su JSON vecchi
-    """
     return TempDiscriminatorConfig(
-        arch         = td_raw.get("arch", "cnn").lower(),
-        dropout      = td_raw.get("dropout", 0.1),
-        mlp_layers   = td_raw.get("mlp_layers", 2),
-        # CNN
-        hidden_dim   = td_raw.get("hidden_dim",   64),
-        kernel_size  = td_raw.get("kernel_size",   3),
-        n_layers     = td_raw.get("n_layers",      3),
+        arch          = td_raw.get("arch", "cnn").lower(),
+        dropout       = td_raw.get("dropout", 0.1),
+        mlp_layers    = td_raw.get("mlp_layers", 2),
+        hidden_dim    = td_raw.get("hidden_dim",    64),
+        kernel_size   = td_raw.get("kernel_size",   3),
+        n_layers      = td_raw.get("n_layers",      3),
         dilation_base = td_raw.get("dilation_base", 2),
-        # GRU (retrocompatibilità)
         mlp_hidden_dim = td_raw.get("mlp_hidden_dim", 128),
         gru_hidden_dim = td_raw.get("gru_hidden_dim",  64),
         gru_layers     = td_raw.get("gru_layers",       2),
     )
 
 
+def _get(cfg: dict, key: str, default):
+    """
+    Legge cfg[key] con null-safety.
+    Se il valore è None/null nel JSON, restituisce default.
+    Equivalente a: cfg.get(key, default) or default, ma più esplicito.
+    """
+    val = cfg.get(key, default)
+    return val if val is not None else default
+
+
 def build_model_config(cfg: dict) -> ModelConfig:
     """
-    Costruisce ModelConfig da dict JSON (sezione "model").
-    Usa .get() con default per tutti i campi nuovi → retrocompatibile.
+    [v6.4] Costruisce ModelConfig da dict JSON.
+    Tutti i parametri lambda usano _get() per null-safety.
     """
     gen_cfg      = _build_generator_config(cfg["generator"])
     disc_cfg     = DiscriminatorConfig(**cfg["static_discriminator"])
     td_cfg       = _build_temp_disc_config(cfg["temporal_discriminator"])
-    lambda_gp_d  = cfg.get("lambda_gp", 4.0)
+    lambda_gp_d  = _get(cfg, "lambda_gp", 4.0)
     critic_steps = cfg["critic_steps"]
 
     return ModelConfig(
-        # Spazio latente
         z_static_dim   = cfg["z_static_dim"],
         z_temporal_dim = cfg["z_temporal_dim"],
         hidden         = cfg["hidden"],
-        # Training
+
         epochs     = cfg["epochs"],
         batch_size = cfg["batch_size"],
         lr_g       = cfg["lr_g"],
         lr_d_s     = cfg["lr_d_s"],
-        lr_d_t     = cfg.get("lr_d_t", cfg["lr_d_s"] / 3.0),
-        # Architetture
+        lr_d_t     = _get(cfg, "lr_d_t", cfg["lr_d_s"] / 3.0),
+
         generator              = gen_cfg,
         static_discriminator   = disc_cfg,
         temporal_discriminator = td_cfg,
-        # Misc
+
         noise_std                = cfg["noise_std"],
         critic_steps             = critic_steps,
-        critic_steps_temporal    = cfg.get("critic_steps_temporal", -1),  # -1 → __post_init__
+        critic_steps_temporal    = _get(cfg, "critic_steps_temporal", -1),
         grad_clip                = cfg["grad_clip"],
         patience                 = cfg["patience"],
         use_dp                   = cfg["use_dp"],
-        force_full_mask          = cfg.get("force_full_mask", False),
-        regular                  = cfg.get("regular", True),
-        gumbel_temperature_start = cfg.get("gumbel_temperature_start", 1.0),
-        fixed_visits             = cfg.get("fixed_visits", None),
-        # Gradient penalty
+        force_full_mask          = _get(cfg, "force_full_mask",          False),
+        regular                  = _get(cfg, "regular",                  True),
+        gumbel_temperature_start = _get(cfg, "gumbel_temperature_start", 1.0),
+        fixed_visits             = _get(cfg, "fixed_visits",             None),
+
         lambda_gp   = lambda_gp_d,
-        lambda_gp_s = cfg.get("lambda_gp_s", lambda_gp_d),
-        lambda_gp_t = cfg.get("lambda_gp_t", lambda_gp_d * 2.0),
-        # Losses
-        alpha_irr          = cfg.get("alpha_irr",   0.4),
-        lambda_aux         = cfg.get("lambda_aux",  0.2),
-        lambda_freq_gen    = cfg.get("lambda_freq_gen",   0.20),
-        lambda_freq_disc   = cfg.get("lambda_freq_disc",  0.05),
-        freq_weight_power  = cfg.get("freq_weight_power", 1.5),
-        temperature_min    = cfg.get("temperature_min",   0.5),
-        n_visits_sharpness = cfg.get("n_visits_sharpness", 10.0),
-        # [v6] nuove losses
-        lambda_fm  = cfg.get("lambda_fm",  3.0),
-        lambda_nv  = cfg.get("lambda_nv",  0.5),
-        lambda_fc  = cfg.get("lambda_fc",  0.3),
-        lambda_fup = cfg.get("lambda_fup", 0.5),
+        lambda_gp_s = _get(cfg, "lambda_gp_s", lambda_gp_d),
+        lambda_gp_t = _get(cfg, "lambda_gp_t", lambda_gp_d),   # [v6.4] default = gp_s
+
+        alpha_irr  = _get(cfg, "alpha_irr",  0.25),
+        lambda_aux = _get(cfg, "lambda_aux", 0.2),
+
+        lambda_freq_gen    = _get(cfg, "lambda_freq_gen",    0.30),
+        lambda_freq_disc   = _get(cfg, "lambda_freq_disc",   0.10),
+        freq_weight_power  = _get(cfg, "freq_weight_power",  1.5),
+
+        temperature_min    = _get(cfg, "temperature_min",    0.5),
+        n_visits_sharpness = _get(cfg, "n_visits_sharpness", 10.0),
+
+        # ── Loss generatore [v6.4] ──────────────────────────────────
+        lambda_fm         = _get(cfg, "lambda_fm",          1.5),
+        lambda_fup        = _get(cfg, "lambda_fup",         3.0),
+        lambda_fc         = _get(cfg, "lambda_fc",          2.5),
+        lambda_nv         = _get(cfg, "lambda_nv",          3.0),
+        lambda_static_cat = _get(cfg, "lambda_static_cat",  5.0),   # [v6.4] NUOVO
+        lambda_sc_var     = _get(cfg, "lambda_sc_var",      1.0),   # [v6.4] NUOVO
+        lambda_ivi        = _get(cfg, "lambda_ivi",         2.0),   # [v6.5] NUOVO
+        lambda_coverage   = _get(cfg, "lambda_coverage",     25),
+        lambda_uniformity = _get(cfg, "lambda_uniformity",    5),
     )
 
 
