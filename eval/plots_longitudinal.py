@@ -114,9 +114,9 @@ def plot_temporal_trajectory(
 # -- Longitudinal KDE grids ---------------------------
 
 def _kde_panel(ax, real_vals, synth_vals, title):
-    sns.kdeplot(real_vals,  ax=ax, label=f"Real (n={len(real_vals)})",  fill=True, alpha=0.3,
+    sns.kdeplot(real_vals,  ax=ax, label=f"Real (n={len(real_vals)})",  fill=True, alpha=0.3, warn_singular=False,
                 color=COLOR_REAL)
-    sns.kdeplot(synth_vals, ax=ax, label=f"Synth (n={len(synth_vals)})", fill=True, alpha=0.3,
+    sns.kdeplot(synth_vals, ax=ax, label=f"Synth (n={len(synth_vals)})", fill=True, alpha=0.3, warn_singular=False,
                 color=COLOR_SYNTH)
     if len(real_vals) > 5 and len(synth_vals) > 5:
         ks, p = ks_2samp(real_vals, synth_vals)
@@ -220,8 +220,8 @@ def plot_visit_timing(real, synth, time_col, outdir) -> str:
     s_times = pd.to_numeric(synth[time_col], errors="coerce").dropna()
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    sns.kdeplot(r_times, ax=ax, color=COLOR_REAL,  label=f"Real (n={len(r_times)})",  fill=True, alpha=0.3)
-    sns.kdeplot(s_times, ax=ax, color=COLOR_SYNTH, label=f"Synth (n={len(s_times)})", fill=True, alpha=0.3)
+    sns.kdeplot(r_times, ax=ax, color=COLOR_REAL,  label=f"Real (n={len(r_times)})", warn_singular=False, fill=True, alpha=0.3)
+    sns.kdeplot(s_times, ax=ax, color=COLOR_SYNTH, label=f"Synth (n={len(s_times)})", warn_singular=False, fill=True, alpha=0.3)
 
     ks, p = ks_2samp(r_times, s_times)
     p_str = f"p={p:.3f}" if p >= 0.001 else "p<0.001"
@@ -278,7 +278,7 @@ def plot_visit_position_timing(
     ncols: int = 4,
 ) -> list[str]:
     """
-    [NEW] For each visit position 1..N (where N = median of synthetic visit counts),
+    [NEW] For each visit position 1..N (where N = mean of synthetic visit counts),
     plot a KDE comparing the distribution of absolute visit times in real vs synthetic.
 
     This reveals whether the model learns the correct visit spacing at each
@@ -299,13 +299,13 @@ def plot_visit_position_timing(
     real_counts  = real.groupby(patient_col).size()
 
     if n_positions is None:
-        n_positions = int(np.median(synth_counts.values))
+        n_positions = int(np.mean(synth_counts.values))
 
     n_positions = max(2, min(n_positions, int(synth_counts.max())))
 
     print(f"  [visit-position] N = {n_positions} "
-          f"(synth median={np.median(synth_counts):.1f}, "
-          f"real median={np.median(real_counts):.1f})")
+          f"(synth mean={np.mean(synth_counts):.1f}, "
+          f"real mean={np.mean(real_counts):.1f})")
 
     real_pos  = _extract_visit_times_by_position(real,  time_col, patient_col, n_positions)
     synth_pos = _extract_visit_times_by_position(synth, time_col, patient_col, n_positions)
@@ -334,7 +334,7 @@ def plot_visit_position_timing(
                     ax.axvline(r_vals[0], color=COLOR_REAL, lw=2,
                                label=f"Real  n={len(r_vals)} (all={r_vals[0]:.1f})")
                 else:
-                    sns.kdeplot(r_vals, ax=ax, color=COLOR_REAL, fill=True, alpha=0.35,
+                    sns.kdeplot(r_vals, ax=ax, color=COLOR_REAL, fill=True, alpha=0.35, 
                                 label=f"Real  n={len(r_vals)}", warn_singular=False)
             if len(s_vals) >= 3:
                 if np.std(s_vals) < 1e-9:
@@ -351,9 +351,9 @@ def plot_visit_position_timing(
                 p_str = f"p={p_val:.3f}" if p_val >= 0.001 else "p<0.001"
                 annotations.append(f"KS={ks_stat:.3f}, {p_str}")
             if len(r_vals) >= 1:
-                annotations.append(f"med_real={np.median(r_vals):.1f} mo")
+                annotations.append(f"mean_real={np.median(r_vals):.1f} mo")
             if len(s_vals) >= 1:
-                annotations.append(f"med_synth={np.median(s_vals):.1f} mo")
+                annotations.append(f"mean_synth={np.median(s_vals):.1f} mo")
 
             if annotations:
                 ax.text(0.02, 0.97, "\n".join(annotations),
@@ -382,8 +382,8 @@ def plot_visit_position_timing(
     # -- 2. Median-and-IQR summary plot -------------------------------
     # One figure: median line + IQR band for real and synth across positions
     positions_arr  = np.array(all_positions)
-    r_medians = np.array([np.median(real_pos[p])  for p in all_positions])
-    s_medians = np.array([np.median(synth_pos[p]) for p in all_positions])
+    r_medians = np.array([np.mean(real_pos[p])  for p in all_positions])
+    s_medians = np.array([np.mean(synth_pos[p]) for p in all_positions])
     r_q25 = np.array([np.percentile(real_pos[p],  25) for p in all_positions])
     r_q75 = np.array([np.percentile(real_pos[p],  75) for p in all_positions])
     s_q25 = np.array([np.percentile(synth_pos[p], 25) for p in all_positions])
@@ -406,11 +406,11 @@ def plot_visit_position_timing(
 
     # Main: median lines + IQR bands
     ax_main.plot(positions_arr, r_medians, "o-", color=COLOR_REAL,
-                 lw=2, ms=5, label="Real -- median")
+                 lw=2, ms=5, label="Real -- mean")
     ax_main.fill_between(positions_arr, r_q25, r_q75,
                          color=COLOR_REAL, alpha=0.20, label="Real IQR")
     ax_main.plot(positions_arr, s_medians, "s--", color=COLOR_SYNTH,
-                 lw=2, ms=5, label="Synth -- median")
+                 lw=2, ms=5, label="Synth -- mean")
     ax_main.fill_between(positions_arr, s_q25, s_q75,
                          color=COLOR_SYNTH, alpha=0.20, label="Synth IQR")
 
@@ -422,7 +422,7 @@ def plot_visit_position_timing(
 
     ax_main.set_ylabel("Months from baseline")
     ax_main.set_title(
-        f"Median visit time by sequential position (first {n_positions} visits)\n"
+        f"Mean visit time by sequential position (first {n_positions} visits)\n"
         "Shaded area = IQR. Dotted lines = expected PBC schedule (0, 6, 12 months).",
         fontsize=10, fontweight="bold"
     )
@@ -470,17 +470,17 @@ def plot_last_visit_vs_d3fup(
     """
     [NEW] Diagnose the discrepancy between the time of the last recorded visit
     (last value of `time_col` per patient) and the declared follow-up duration
-    (`d3fup_col`, in the same unit as `time_col`).
+    (`fup_col`, in the same unit as `time_col`).
 
     For PBC/UDCA data, MONTHS_FROM_BASELINE of the last visit should equal
-    D3_fup (total follow-up from randomisation).  In exp 5 this was not the
+    t_FUP (total follow-up from randomisation).  In exp 5 this was not the
     case because the synthetic inter-visit intervals were too compressed
     (mean 3 months vs real 10.7 months), so the last visit fell well short
     of D3_fup.
 
     Produces three panels:
-      1. Scatter: last_visit_time vs D3_fup  (real & synth side by side)
-      2. KDE:     distribution of (D3_fup - last_visit_time), the residual gap
+      1. Scatter: last_visit_time vs t_FUP  (real & synth side by side)
+      2. KDE:     distribution of (t_FUP - last_visit_time), the residual gap
       3. KDE:     distribution of last_visit_time itself
 
     Also returns a metrics dict for the caller to embed in the PDF.
@@ -488,7 +488,7 @@ def plot_last_visit_vs_d3fup(
     paths = []
 
     def _per_patient(df: pd.DataFrame, label: str):
-        """Return per-patient DataFrame with last_visit and d3fup columns."""
+        """Return per-patient DataFrame with last_visit and t_FUP columns."""
         last_t = (
             df.groupby(patient_col)[time_col]
             .apply(lambda s: pd.to_numeric(s, errors="coerce").max())
@@ -530,8 +530,8 @@ def plot_last_visit_vs_d3fup(
 
     # -- Scatter: last_visit vs d3fup ----------------------------------
     for ax, df_pt, color, title in [
-        (ax_scatter_r, r_df, COLOR_REAL,  "Real: last visit vs D3_fup"),
-        (ax_scatter_s, s_df, COLOR_SYNTH, "Synthetic: last visit vs D3_fup"),
+        (ax_scatter_r, r_df, COLOR_REAL,  "Real: last visit vs t_FUP"),
+        (ax_scatter_s, s_df, COLOR_SYNTH, "Synthetic: last visit vs t_FUP"),
     ]:
         lim = max(df_pt["d3fup"].max(), df_pt["last_visit"].max()) * 1.05
         ax.scatter(df_pt["d3fup"], df_pt["last_visit"],
@@ -547,7 +547,7 @@ def plot_last_visit_vs_d3fup(
                 transform=ax.transAxes, fontsize=8, va="top",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85))
 
-        ax.set_xlabel("D3_fup (months)", fontsize=9)
+        ax.set_xlabel("t_FUP (months)", fontsize=9)
         ax.set_ylabel("Last visit time (months)", fontsize=9)
         ax.set_title(title, fontsize=10, fontweight="bold")
         ax.set_xlim(0, lim); ax.set_ylim(0, lim)
@@ -555,13 +555,14 @@ def plot_last_visit_vs_d3fup(
         ax.grid(alpha=0.3)
 
     # -- KDE: gap = D3_fup - last_visit -------------------------------
+    '''
     gap_r = r_df["gap"].dropna().values
     gap_s = s_df["gap"].dropna().values
 
-    sns.kdeplot(gap_r, ax=ax_gap, color=COLOR_REAL,  fill=True, alpha=0.35,
+    sns.kdeplot(gap_r, ax=ax_gap, color=COLOR_REAL,  fill=True, alpha=0.35, warn_singular=False,
                 label=f"Real  -- median gap = {np.median(gap_r):.1f} mo  "
                       f"(mean {np.mean(gap_r):.1f} mo)")
-    sns.kdeplot(gap_s, ax=ax_gap, color=COLOR_SYNTH, fill=True, alpha=0.35,
+    sns.kdeplot(gap_s, ax=ax_gap, color=COLOR_SYNTH, fill=True, alpha=0.35, warn_singular=False,
                 label=f"Synth -- median gap = {np.median(gap_s):.1f} mo  "
                       f"(mean {np.mean(gap_s):.1f} mo)")
     ax_gap.axvline(0, color="black", lw=1.2, ls="--", label="Gap = 0 (perfect)")
@@ -583,14 +584,14 @@ def plot_last_visit_vs_d3fup(
     )
     ax_gap.legend(fontsize=8)
     ax_gap.grid(alpha=0.3)
-
+    '''
     # -- KDE: last_visit distribution ---------------------------------
     lv_r = r_df["last_visit"].dropna().values
     lv_s = s_df["last_visit"].dropna().values
 
-    sns.kdeplot(lv_r, ax=ax_last, color=COLOR_REAL,  fill=True, alpha=0.35,
+    sns.kdeplot(lv_r, ax=ax_last, color=COLOR_REAL,  fill=True, alpha=0.35, warn_singular=False,
                 label=f"Real  -- median {np.median(lv_r):.1f} mo")
-    sns.kdeplot(lv_s, ax=ax_last, color=COLOR_SYNTH, fill=True, alpha=0.35,
+    sns.kdeplot(lv_s, ax=ax_last, color=COLOR_SYNTH, fill=True, alpha=0.35, warn_singular=False,
                 label=f"Synth -- median {np.median(lv_s):.1f} mo")
 
     if len(lv_r) >= 2 and len(lv_s) >= 2:
@@ -607,8 +608,8 @@ def plot_last_visit_vs_d3fup(
     ax_last.grid(alpha=0.3)
 
     fig.suptitle(
-        "Last visit vs D3_fup: temporal alignment diagnostic\n"
-        "In a well-calibrated model the last visit time ~= D3_fup for every patient.",
+        "Last visit vs t_FUP: temporal alignment diagnostic\n"
+        "In a well-calibrated model the last visit time ~= t_FUP for every patient.",
         fontsize=12, fontweight="bold", y=1.01
     )
 
@@ -643,12 +644,12 @@ def plot_last_visit_vs_d3fup(
                          color=color, alpha=0.2, label="IQR coverage")
         ax2.axhline(0.95, color="gray", lw=1, ls="--", label="95% coverage threshold")
         ax2.axhline(1.00, color="black", lw=0.8, ls=":")
-        ax2.set_xlabel("D3_fup median per decile (months)", fontsize=9)
-        ax2.set_ylabel("Coverage = last_visit / D3_fup", fontsize=9)
+        ax2.set_xlabel("t_FUP median per decile (months)", fontsize=9)
+        ax2.set_ylabel("Coverage = last_visit / t_FUP", fontsize=9)
         ax2.set_ylim(0, 1.1)
         ax2.set_title(
-            f"{label_str}: last-visit coverage by D3_fup decile\n"
-            "Coverage = 1 means last visit aligns perfectly with D3_fup.",
+            f"{label_str}: last-visit coverage by t_FUP decile\n"
+            "Coverage = 1 means last visit aligns perfectly with t_FUP.",
             fontsize=9, fontweight="bold"
         )
         ax2.legend(fontsize=8)
@@ -682,15 +683,15 @@ def compute_last_visit_vs_d3fup_metrics(
             lambda s: pd.to_numeric(s, errors="coerce").max()
         ).rename("last_visit").reset_index()
         fup = df.groupby(patient_col)[d3fup_col].first().reset_index().rename(
-            columns={d3fup_col: "d3fup"}
+            columns={d3fup_col: "fup"}
         )
-        m = last_t.merge(fup, on=patient_col).dropna(subset=["d3fup", "last_visit"])
+        m = last_t.merge(fup, on=patient_col).dropna(subset=["fup", "last_visit"])
         if m.empty:
             return
-        m["d3fup"]      = pd.to_numeric(m["d3fup"],      errors="coerce")
+        m["fup"]      = pd.to_numeric(m["fup"],      errors="coerce")
         m["last_visit"] = pd.to_numeric(m["last_visit"],  errors="coerce")
-        m["gap"]        = m["d3fup"] - m["last_visit"]
-        m["pct_cov"]    = (m["last_visit"] / m["d3fup"].replace(0, np.nan)).clip(0, 1)
+        m["gap"]        = m["fup"] - m["last_visit"]
+        m["pct_cov"]    = (m["last_visit"] / m["fup"].replace(0, np.nan)).clip(0, 1)
         pfx = f"Last-visit vs D3_fup [{label}]"
         metrics[f"{pfx} - Median gap (months)"]           = float(m["gap"].median())
         metrics[f"{pfx} - Mean gap (months)"]             = float(m["gap"].mean())

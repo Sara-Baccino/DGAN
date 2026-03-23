@@ -1,42 +1,55 @@
 """
-processing/preprocessor.py
+processing/preprocessor.py  [v6-fully-parametrized]
 ================================================================================
-Modifiche rispetto alla versione precedente:
+Rispetto a v5:
 
-  [v4] Normalizzazione temporale a due livelli (per-paziente):
+  [NUOVO] Gestione warning ed errori espliciti:
+    - WARNING se nessuna variabile continua o categorica (temporale o statica)
+      → imputazione saltata, non crash silenzioso
+    - ERROR se il DataFrame è vuoto o ha meno di 2 pazienti
+    - ERROR se la colonna time_col manca
+    - ERROR se max_len < 1
+    - WARNING se alcuni pazienti hanno 0 visite valide
+    - WARNING se max_len viene superato (troncamento silenzioso → ora loggato)
+    - WARNING se un paziente ha 1 sola visita (delta_max = 0 → followup forzato)
+    - ERROR se la colonna fup_col è dichiarata in config ma mancante nel DataFrame
 
-    PROBLEMA CON SCHEMA GLOBALE:
-      global_time_max ≈ 240 mesi (paziente con 20 anni di follow-up)
-      Paziente con 2 visite in 6 mesi → t_norm = [0, 0.025]
-      Il GRU riceve delta_t ≈ 0 per quasi tutti i pazienti corti.
-      La struttura temporale viene persa per il 90%+ dei pazienti.
+  [NUOVO] t_FUP dalla colonna reale:
+    - Se data_cfg.fup_col è presente nel DataFrame, il follow-up per paziente
+      viene letto direttamente da quella colonna (prima visita per paziente).
+    - La normalizzazione usa t_FUP come delta_max del paziente invece della
+      durata calcolata dall'ultima visita.
+    - In questo modo l'ultimo step temporale generato corrisponde esattamente
+      al tempo di follow-up del paziente.
+    - Se la colonna manca → warning e fallback al comportamento v5
+      (delta dalla prima all'ultima visita).
 
-    NUOVO SCHEMA A DUE LIVELLI:
-      t_norm[i,t]      = t_raw[i,t] / t_max[i]           ∈ [0,1] per-paziente
-      followup_norm[i] = t_max[i]   / global_time_max     ∈ [0,1]
+  [NUOVO] Parametri da config:
+    - mice_max_iter, knn_neighbors: ora argomenti espliciti del costruttore
+    - clip_z: clipping z-score in inverse_transform (da prep_cfg.clip_z)
 
-      Il GRU vede sempre [0,1] indipendentemente dalla durata assoluta.
-      followup_norm cattura la durata assoluta normalizzata:
-        - paziente con 6 mesi su 240: followup_norm = 0.025
-        - paziente con 20 anni:       followup_norm = 1.0
-      In inverse_transform: t_abs = t_norm × followup_norm × global_time_max
-
-  [v4] followup_norm aggiunto ai tensori di output (dtype float32, shape [N]).
-       Viene passato al discriminatore come feature temporale broadcastata
-       e usato dal followup_head del generatore come target implicito.
-
-  I bug fix delle versioni precedenti (missing sentinel, validate_mappings,
-  BUG 5 ordine static_cat, BUG 6 expm1 static, BUG 8 valid_steps) sono
-  tutti mantenuti.
+  Invariato rispetto a v5:
+    - MICE per continue temporali e statiche
+    - KNNImputer per categoriche
+    - valid_flag [N,T] bool
+    - Normalizzazione temporale delta-shift per paziente (v4.2)
+    - Gestione embedding
 ================================================================================
 """
 
+import logging
+import warnings
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
+
+from sklearn.experimental import enable_iterative_imputer   # noqa: F401
+from sklearn.impute import IterativeImputer, KNNImputer
 from config.config_loader import DataConfig
+
+_logger = logging.getLogger(__name__)
 
 MAP_MISSING = "__MISSING__"
 
@@ -47,7 +60,10 @@ class Preprocessor:
         self,
         data_cfg:          DataConfig,
         embedding_configs: Optional[Dict[str, int]] = None,
-        log_vars:          Optional[List[str]] = None,
+        log_vars:          Optional[List[str]]       = None,
+        mice_max_iter:     int                       = 10,
+        knn_neighbors:     int                       = 5,
+        clip_z:            float                     = 4.0,
     ):
         self.vars = (
             data_cfg.static_cont
@@ -59,17 +75,39 @@ class Preprocessor:
         self.max_len           = data_cfg.max_len
         self.id_col            = data_cfg.patient_id_col
         self.time_col          = data_cfg.time_col
+        self.fup_col           = data_cfg.fup_col   # colonna t_FUP dal config
         self.embedding_configs = embedding_configs or {}
         self.embeddings        = nn.ModuleDict()
         self.scalers_cont      = {}
         self.inverse_maps      = {}
-        self.global_time_max   = None  # impostato in normalize_time_per_patient
+        self.global_time_max   = None
+        self.mice_max_iter     = mice_max_iter
+        self.knn_neighbors     = knn_neighbors
+        self.clip_z            = clip_z
 
-        self._validate_mappings()
+        # Imputer fitted durante fit_transform
+        self._mice_temporal: Optional[IterativeImputer] = None
+        self._mice_static:   Optional[IterativeImputer] = None
+        self._knn_static:    Optional[KNNImputer]       = None
+        self._knn_temporal:  Optional[KNNImputer]       = None
+
+        self._validate_config()
 
     # ------------------------------------------------------------------
-    def _validate_mappings(self):
-        """Encoding 0 riservato per missing. Lancia ValueError se violato."""
+    def _validate_config(self):
+        """Controlla la configurazione al momento della costruzione."""
+        if self.max_len < 1:
+            raise ValueError(
+                f"max_len deve essere >= 1, ricevuto: {self.max_len}"
+            )
+        if self.mice_max_iter < 1:
+            raise ValueError(
+                f"mice_max_iter deve essere >= 1, ricevuto: {self.mice_max_iter}"
+            )
+        if self.knn_neighbors < 1:
+            raise ValueError(
+                f"knn_neighbors deve essere >= 1, ricevuto: {self.knn_neighbors}"
+            )
         for v in self.vars:
             if v.kind != "categorical":
                 continue
@@ -84,30 +122,164 @@ class Preprocessor:
     # ==================================================================
 
     def fit_transform(self, df: pd.DataFrame) -> Dict:
-        df               = df.reset_index(drop=True)
-        df               = self.force_types(df)
-        df, cat_masks    = self.encode_categoricals(df)
-        df, cont_masks   = self.process_continuous(df)
-        padded           = self.long_to_padded(df, cat_masks, cont_masks)
-        padded           = self.fit_scalers(padded)
-        padded           = self.normalize_time_per_patient(padded)   # [v4]
-        static_out       = self.build_static_tensors(padded["df_static"])
+        """
+        Trasforma il DataFrame long in tensori pronti per il training.
+        Esegue validazione, imputazione, encoding, padding, scaling.
+        """
+        # ── Validazione DataFrame ──────────────────────────────────────
+        self._validate_dataframe(df)
+
+        df            = df.reset_index(drop=True)
+        df            = self._force_types(df)
+        df            = self._impute(df)
+        df            = self._encode_categoricals(df)
+        padded        = self._long_to_padded(df)
+        padded        = self._fit_scalers(padded)
+        padded        = self._normalize_time_per_patient(padded)
+        static_out    = self._build_static_tensors(padded["df_static"])
         padded.update(static_out)
-        return self.to_tensors(padded)
+        return self._to_tensors(padded)
+
+    def _validate_dataframe(self, df: pd.DataFrame):
+        """Controlla il DataFrame prima dell'elaborazione. Lancia errori/warning."""
+        if df is None or len(df) == 0:
+            raise ValueError(
+                "Il DataFrame è vuoto. Impossibile procedere con il training."
+            )
+
+        if self.id_col not in df.columns:
+            raise ValueError(
+                f"Colonna paziente '{self.id_col}' non trovata nel DataFrame. "
+                f"Colonne disponibili: {list(df.columns)}"
+            )
+
+        if self.time_col not in df.columns:
+            raise ValueError(
+                f"Colonna tempo '{self.time_col}' non trovata nel DataFrame. "
+                f"Colonne disponibili: {list(df.columns)}"
+            )
+
+        n_patients = df[self.id_col].nunique()
+        if n_patients < 2:
+            raise ValueError(
+                f"Il DataFrame contiene solo {n_patients} paziente/i. "
+                f"MICE richiede almeno 2 pazienti per funzionare correttamente."
+            )
+
+        # Warning se fup_col dichiarata ma mancante
+        if self.fup_col and self.fup_col not in df.columns:
+            warnings.warn(
+                f"La colonna follow-up '{self.fup_col}' non è presente nel DataFrame. "
+                f"Il tempo di follow-up verrà calcolato dall'ultima visita registrata. "
+                f"Se questo è intenzionale, imposta fup_col=null nel config JSON.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # Controlla variabili dichiarate ma mancanti
+        all_var_names = [v.name for v in self.vars]
+        missing_cols  = [n for n in all_var_names if n not in df.columns]
+        if missing_cols:
+            warnings.warn(
+                f"Le seguenti variabili dichiarate in config NON sono presenti "
+                f"nel DataFrame e verranno ignorate: {missing_cols}",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # Warning se max_len < mediana visite
+        visits_per_patient = df.groupby(self.id_col).size()
+        median_visits      = int(visits_per_patient.median())
+        max_visits         = int(visits_per_patient.max())
+        if max_visits > self.max_len:
+            n_truncated = int((visits_per_patient > self.max_len).sum())
+            warnings.warn(
+                f"max_len={self.max_len} è inferiore al numero massimo di visite "
+                f"({max_visits}). {n_truncated} pazienti verranno troncati. "
+                f"Considera di aumentare max_len nel config.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if self.max_len < median_visits:
+            warnings.warn(
+                f"max_len={self.max_len} è inferiore alla mediana delle visite "
+                f"({median_visits}). Più del 50% dei pazienti verrà troncato.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # Conta pazienti con 0 visite valide (impossibile, ma per sicurezza)
+        zero_visits = (visits_per_patient == 0).sum()
+        if zero_visits > 0:
+            warnings.warn(
+                f"{zero_visits} pazienti hanno 0 visite e verranno ignorati.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # Warning variabili temporali assenti per tipo
+        temp_cont_names = [v.name for v in self.vars
+                           if not v.static and v.kind == "continuous"
+                           and v.name in df.columns]
+        temp_cat_names  = [v.name for v in self.vars
+                           if not v.static and v.kind == "categorical"
+                           and v.name in df.columns]
+        stat_cont_names = [v.name for v in self.vars
+                           if v.static and v.kind == "continuous"
+                           and v.name in df.columns]
+        stat_cat_names  = [v.name for v in self.vars
+                           if v.static and v.kind == "categorical"
+                           and v.name in df.columns]
+
+        if not temp_cont_names and not temp_cat_names:
+            raise ValueError(
+                "Non sono presenti né variabili continue né categoriche temporali. "
+                "Il modello richiede almeno un tipo di feature temporale."
+            )
+        if not temp_cont_names:
+            warnings.warn(
+                "Nessuna variabile continua temporale trovata nel DataFrame. "
+                "MICE temporale verrà saltato. Il discriminatore temporale userà "
+                "solo feature categoriche. Verifica la configurazione.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if not temp_cat_names:
+            warnings.warn(
+                "Nessuna variabile categorica temporale trovata nel DataFrame. "
+                "KNN temporale verrà saltato.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if not stat_cont_names and not stat_cat_names:
+            warnings.warn(
+                "Nessuna variabile statica trovata nel DataFrame. "
+                "Il modello opererà senza features statiche.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if not stat_cont_names:
+            warnings.warn(
+                "Nessuna variabile continua statica trovata nel DataFrame. "
+                "MICE statico verrà saltato.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if not stat_cat_names:
+            warnings.warn(
+                "Nessuna variabile categorica statica trovata nel DataFrame. "
+                "KNN statico verrà saltato.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     # ==================================================================
     # FORCE TYPES
     # ==================================================================
 
-    def force_types(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Converte i tipi. Per categoriche: NaN/None/'' → MAP_MISSING
-        prima di astype(str), altrimenti pd.NA diventa "nan" e sfugge
-        al controllo missing in encode_categoricals.
-        """
+    def _force_types(self, df: pd.DataFrame) -> pd.DataFrame:
         df        = df.copy()
         _STR_NANS = {"nan", "none", "<na>", "nat", ""}
-
         for v in self.vars:
             if v.name not in df.columns:
                 continue
@@ -121,242 +293,428 @@ class Preprocessor:
         return df
 
     # ==================================================================
+    # IMPUTATION — MICE per continue, KNN per categoriche
+    # ==================================================================
+
+    def _impute(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Imputazione in-place sul DataFrame long prima del padding.
+
+        Strategia:
+          1. Temporali continue  → MICE (IterativeImputer, mice_max_iter)
+          2. Statiche continue   → MICE
+          3. Categoriche (stat + temp) → KNNImputer su encoding numerico
+          4. Dopo l'imputazione non esistono più NaN/MAP_MISSING.
+
+        Se un gruppo di variabili è assente o ha 0 colonne nel DataFrame,
+        il passo corrispondente viene saltato con warning (già emesso in
+        _validate_dataframe).
+        """
+        df = df.copy()
+
+        # ── 1. Temporali continue — MICE ──────────────────────────────
+        temp_cont_names = [v.name for v in self.vars
+                           if not v.static and v.kind == "continuous"
+                           and v.name in df.columns]
+        if temp_cont_names:
+            tc_data = df[temp_cont_names].values.astype(np.float64)
+            # Solo se ci sono effettivamente NaN da imputare
+            if np.isnan(tc_data).any():
+                try:
+                    imputer = IterativeImputer(
+                        max_iter=self.mice_max_iter, random_state=0, min_value=-np.inf)
+                    imputer.fit(tc_data)
+                    self._mice_temporal = imputer
+                    df[temp_cont_names] = imputer.transform(tc_data).astype(np.float32)
+                except Exception as e:
+                    warnings.warn(
+                        f"MICE su variabili temporali continue fallito: {e}. "
+                        f"Le colonne con NaN verranno imputate con la mediana.",
+                        UserWarning,
+                    )
+                    for col in temp_cont_names:
+                        if df[col].isna().any():
+                            df[col] = df[col].fillna(df[col].median())
+
+        # ── 2. Statiche continue — MICE ───────────────────────────────
+        stat_cont_names = [v.name for v in self.vars
+                           if v.static and v.kind == "continuous"
+                           and v.name in df.columns]
+        if stat_cont_names:
+            first_rows = df.groupby(self.id_col, sort=False).first().reset_index()
+            sc_data    = first_rows[stat_cont_names].values.astype(np.float64)
+            if np.isnan(sc_data).any():
+                try:
+                    imputer = IterativeImputer(
+                        max_iter=self.mice_max_iter, random_state=1, min_value=-np.inf)
+                    imputer.fit(sc_data)
+                    self._mice_static = imputer
+                    df[stat_cont_names] = imputer.transform(
+                        df[stat_cont_names].values.astype(np.float64)).astype(np.float32)
+                except Exception as e:
+                    warnings.warn(
+                        f"MICE su variabili statiche continue fallito: {e}. "
+                        f"Le colonne con NaN verranno imputate con la mediana.",
+                        UserWarning,
+                    )
+                    for col in stat_cont_names:
+                        if df[col].isna().any():
+                            df[col] = df[col].fillna(df[col].median())
+
+        # ── 3. Categoriche statiche — KNN ─────────────────────────────
+        stat_cat_names = [v.name for v in self.vars
+                          if v.static and v.kind == "categorical"
+                          and v.name in df.columns]
+        if stat_cat_names:
+            n_missing = sum(
+                (df[n] == MAP_MISSING).sum() for n in stat_cat_names)
+            if n_missing > 0:
+                try:
+                    df = self._knn_impute_cat(df, stat_cat_names, key="static")
+                except Exception as e:
+                    warnings.warn(
+                        f"KNN su categoriche statiche fallito: {e}. "
+                        f"I missing verranno sostituiti con la moda.",
+                        UserWarning,
+                    )
+                    for col in stat_cat_names:
+                        mode = df[col][df[col] != MAP_MISSING].mode()
+                        if len(mode) > 0:
+                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+
+        # ── 4. Categoriche temporali — KNN ────────────────────────────
+        temp_cat_names = [v.name for v in self.vars
+                          if not v.static and v.kind == "categorical"
+                          and v.name in df.columns]
+        if temp_cat_names:
+            n_missing = sum(
+                (df[n] == MAP_MISSING).sum() for n in temp_cat_names)
+            if n_missing > 0:
+                try:
+                    df = self._knn_impute_cat(df, temp_cat_names, key="temporal")
+                except Exception as e:
+                    warnings.warn(
+                        f"KNN su categoriche temporali fallito: {e}. "
+                        f"I missing verranno sostituiti con la moda.",
+                        UserWarning,
+                    )
+                    for col in temp_cat_names:
+                        mode = df[col][df[col] != MAP_MISSING].mode()
+                        if len(mode) > 0:
+                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+
+        return df
+
+    def _knn_impute_cat(
+        self, df: pd.DataFrame, cat_names: List[str], key: str
+    ) -> pd.DataFrame:
+        """
+        KNNImputer sulle categoriche: MAP_MISSING → NaN numerico → imputa → arrotonda.
+        Mappa i valori di stringa in interi prima (0=missing), poi ritorna a stringa.
+        """
+        if len(cat_names) == 0:
+            return df
+
+        num_df = pd.DataFrame(index=df.index)
+
+        for name in cat_names:
+            col  = df[name]
+            uniq = [v for v in col.unique() if v != MAP_MISSING]
+            if not uniq:
+                warnings.warn(
+                    f"Variabile categorica '{name}': tutti i valori sono missing. "
+                    f"Impossibile imputare con KNN. La variabile verrà ignorata.",
+                    UserWarning,
+                )
+                num_df[name] = np.nan
+                continue
+            code = {u: i + 1 for i, u in enumerate(uniq)}
+            code[MAP_MISSING] = np.nan
+            num_df[name] = col.map(lambda x, c=code: c.get(x, np.nan))
+
+        # Controlla se ha senso fare KNN (almeno 1 valore non-NaN per colonna)
+        all_nan_cols = [c for c in num_df.columns if num_df[c].isna().all()]
+        if all_nan_cols:
+            warnings.warn(
+                f"Colonne con tutti NaN nel KNN categorico: {all_nan_cols}. "
+                f"Verranno lasciate come NaN e gestite dal fallback.",
+                UserWarning,
+            )
+            num_df = num_df.drop(columns=all_nan_cols)
+            cat_names = [n for n in cat_names if n not in all_nan_cols]
+
+        if len(cat_names) == 0:
+            return df
+
+        n_neighbors = min(self.knn_neighbors, len(df) - 1)
+        if n_neighbors < 1:
+            n_neighbors = 1
+
+        imp = KNNImputer(n_neighbors=n_neighbors, weights="distance")
+        arr = imp.fit_transform(num_df.values.astype(np.float64))
+
+        if key == "static":
+            self._knn_static = imp
+        else:
+            self._knn_temporal = imp
+
+        arr_rounded = np.round(arr).astype(int).clip(1, None)
+        for j, name in enumerate(cat_names):
+            codes = arr_rounded[:, j]
+            inv   = {i + 1: u for i, u in enumerate(
+                [v for v in df[name].unique() if v != MAP_MISSING])}
+            if not inv:
+                continue
+            df[name] = [inv.get(c, inv[min(inv)]) for c in codes]
+
+        return df
+
+    # ==================================================================
     # ENCODE CATEGORICALS
     # ==================================================================
 
-    def encode_categoricals(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
-        df    = df.copy()
-        masks = {}
+    def _encode_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Dopo l'imputazione non ci sono più MAP_MISSING → encoding diretto."""
+        df = df.copy()
         for v in self.vars:
             if v.kind != "categorical" or v.name not in df.columns:
                 continue
+            # Controlla valori fuori mapping
+            known = set(v.mapping.keys())
+            unknown = set(df[v.name].unique()) - known - {MAP_MISSING}
+            if unknown:
+                warnings.warn(
+                    f"Variable '{v.name}': valori non nel mapping: {unknown}. "
+                    f"Verranno mappati al codice 1 (primo valore del mapping).",
+                    UserWarning,
+                )
             self.inverse_maps[v.name] = {val: key for key, val in v.mapping.items()}
-            col           = df[v.name]
-            masks[v.name] = (col != MAP_MISSING).astype(float).values
-            df[v.name]    = col.map(lambda x, m=v.mapping: m.get(x, 0)).astype(int)
-        return df, masks
+            df[v.name] = df[v.name].map(
+                lambda x, m=v.mapping: m.get(x, 1)
+            ).astype(int)
+        return df
 
     # ==================================================================
-    # PROCESS CONTINUOUS
+    # LONG → PADDED  [valid_flag invece di visit_mask]
     # ==================================================================
 
-    def process_continuous(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
-        df    = df.copy()
-        masks = {}
-        for v in self.vars:
-            if v.kind != "continuous" or v.name not in df.columns:
-                continue
-            masks[v.name] = (~df[v.name].isna()).astype(float).values
-        return df, masks
-
-    # ==================================================================
-    # LONG → PADDED
-    # ==================================================================
-
-    def long_to_padded(
-        self,
-        df:         pd.DataFrame,
-        cat_masks:  Dict[str, np.ndarray],
-        cont_masks: Dict[str, np.ndarray],
-    ) -> Dict:
-
+    def _long_to_padded(self, df: pd.DataFrame) -> Dict:
         temporal_cont_vars = [v for v in self.vars if not v.static and v.kind == "continuous"]
         temporal_cat_vars  = [v for v in self.vars if not v.static and v.kind == "categorical"]
-        static_cont_vars   = [v for v in self.vars if v.static     and v.kind == "continuous"]
-        static_cat_vars    = [v for v in self.vars if v.static     and v.kind == "categorical"]
 
         ids  = df[self.id_col].unique()
         N, T = len(ids), self.max_len
         nc   = len(temporal_cont_vars)
 
-        Xc        = np.full((N, T, nc), np.nan, dtype=np.float32)
-        Xc_mask   = np.zeros((N, T, nc), dtype=np.float32)
-        Xcat      = {v.name: np.zeros((N, T), dtype=np.int64)  for v in temporal_cat_vars}
-        Xcat_mask = {v.name: np.zeros((N, T), dtype=np.float32) for v in temporal_cat_vars}
-        visit_mask  = np.zeros((N, T, 1), dtype=np.float32)
-        visit_times_raw = np.zeros((N, T),  dtype=np.float32)   # [v4] tempi assoluti
+        Xc              = np.zeros((N, T, nc),  dtype=np.float32)
+        Xcat            = {v.name: np.zeros((N, T), dtype=np.int64) for v in temporal_cat_vars}
+        valid_flag      = np.zeros((N, T),       dtype=bool)
+        visit_times_raw = np.zeros((N, T),       dtype=np.float32)
+        fup_times       = np.zeros(N,            dtype=np.float32)  # t_FUP per paziente
+        static_rows     = []
 
-        sc_mask  = np.ones((N, len(static_cont_vars)), dtype=np.float32)
-        scat_mask = {v.name: np.ones(N, dtype=np.float32) for v in static_cat_vars}
-        static_rows = []
+        # Controlla se la colonna fup_col è disponibile
+        has_fup_col = bool(self.fup_col and self.fup_col in df.columns)
 
         for i, pid in enumerate(ids):
-            sub      = df[df[self.id_col] == pid].sort_values(self.time_col)
-            static_rows.append(sub.iloc[0])
-            L        = min(len(sub), T)
-            orig_idx = sub.index[:L].values
+            sub = df[df[self.id_col] == pid].sort_values(self.time_col)
+            if len(sub) == 0:
+                _logger.debug("Paziente '%s' ha 0 visite. Trattato come padding.", pid)
+                static_rows.append(df.iloc[0])  # placeholder
+                continue
 
-            visit_mask[i, :L, 0]    = 1.0
-            visit_times_raw[i, :L]  = sub[self.time_col].values[:L].astype(np.float32)
+            static_rows.append(sub.iloc[0])
+            L = min(len(sub), T)
+
+            if len(sub) > T:
+                # Usa debug invece di UserWarning per evitare spam
+                # (il warning aggregato viene emesso in _validate_dataframe)
+                _logger.debug(
+                    "Paziente '%s' ha %d visite > max_len=%d. Troncato.",
+                    pid, len(sub), T,
+                )
+
+            valid_flag[i, :L]      = True
+            visit_times_raw[i, :L] = sub[self.time_col].values[:L].astype(np.float32)
+
+            # t_FUP reale dal DataFrame
+            if has_fup_col:
+                fup_val = sub[self.fup_col].iloc[0]
+                if pd.isna(fup_val):
+                    warnings.warn(
+                        f"Paziente '{pid}': colonna '{self.fup_col}' è NaN. "
+                        f"Uso l'ultima visita come follow-up.",
+                        UserWarning,
+                    )
+                    fup_times[i] = float(sub[self.time_col].values[L - 1])
+                else:
+                    fup_times[i] = float(fup_val)
+                    # Sanity check: t_FUP >= ultima visita registrata
+                    last_visit = float(sub[self.time_col].values[L - 1])
+                    if fup_times[i] < last_visit - 1e-6:
+                        warnings.warn(
+                            f"Paziente '{pid}': t_FUP={fup_times[i]:.2f} è "
+                            f"inferiore all'ultima visita ({last_visit:.2f}). "
+                            f"Uso l'ultima visita come follow-up.",
+                            UserWarning,
+                        )
+                        fup_times[i] = last_visit
+            else:
+                # Fallback: usa l'ultima visita
+                fup_times[i] = float(sub[self.time_col].values[L - 1])
 
             for j, v in enumerate(temporal_cont_vars):
-                Xc[i, :L, j]       = sub[v.name].values[:L]
-                Xc_mask[i, :L, j]  = cont_masks[v.name][orig_idx]
+                if v.name in sub.columns:
+                    Xc[i, :L, j] = sub[v.name].values[:L]
 
             for v in temporal_cat_vars:
-                Xcat[v.name][i, :L]      = sub[v.name].values[:L]
-                Xcat_mask[v.name][i, :L] = cat_masks[v.name][orig_idx]
-
-            first = sub.index[0]
-            for j, v in enumerate(static_cont_vars):
-                sc_mask[i, j] = cont_masks[v.name][first]
-            for v in static_cat_vars:
-                scat_mask[v.name][i] = cat_masks[v.name][first]
+                if v.name in sub.columns:
+                    Xcat[v.name][i, :L] = sub[v.name].values[:L]
 
         return {
-            "temporal_cont":      Xc,
-            "temporal_cont_mask": Xc_mask,
-            "temporal_cat":       Xcat,
-            "temporal_cat_mask":  Xcat_mask,
-            "visit_mask":         visit_mask,
-            "visit_times_raw":    visit_times_raw,   # [v4]
-            "df_static":          pd.DataFrame(static_rows).reset_index(drop=True),
-            "static_cont_mask":   sc_mask,
-            "static_cat_mask":    scat_mask,
+            "temporal_cont":   Xc,
+            "temporal_cat":    Xcat,
+            "valid_flag":      valid_flag,
+            "visit_times_raw": visit_times_raw,
+            "fup_times":       fup_times,       # ← t_FUP reale per paziente [N]
+            "df_static":       pd.DataFrame(static_rows).reset_index(drop=True),
         }
 
     # ==================================================================
-    # FIT SCALERS — Z-SCORE (media / deviazione standard)
+    # FIT SCALERS — Z-SCORE
     # ==================================================================
 
-    def fit_scalers(self, padded: Dict) -> Dict:
-        """
-        [v5.1] Standard z-score: scaled = (x - μ) / σ.
-
-        SCELTA MOTIVATA:
-          Le variabili con distribuzione asimmetrica (BIL, GGT, ALP, AST)
-          ricevono log1p PRIMA dello scaling grazie a log_vars nella config.
-          Dopo la log-trasformazione le distribuzioni sono quasi simmetriche
-          → z-score è appropriato e più semplice del RobustScaler.
-          Per le variabili già simmetriche (ALB, ALT, AGE, HEIGHT, WEIGHT)
-          lo z-score è la scelta naturale.
-
-        OUTPUT:
-          scaled ∈ (-∞, +∞), in pratica ±3σ per quasi tutti i valori.
-          Missing/padding → 0.0 (= media normalizzata, valore neutro).
-
-        COMPATIBILITÀ CON SIGMOID:
-          Il generatore NON usa Sigmoid sugli output continui (rimossa in v5).
-          Gli output lineari possono replicare qualsiasi range z-score.
-          L'inverse_transform ricostruisce: x = scaled * σ + μ.
-
-        scalers_cont[v.name] = (mean, std)
-        """
+    def _fit_scalers(self, padded: Dict) -> Dict:
         static_cont_vars   = [v for v in self.vars if v.static     and v.kind == "continuous"]
         temporal_cont_vars = [v for v in self.vars if not v.static and v.kind == "continuous"]
+        vf                 = padded["valid_flag"]  # [N,T] bool
 
-        # ── Statici ──────────────────────────────────────────────────
+        # ── Statici ───────────────────────────────────────────────────
         if static_cont_vars and "df_static" in padded:
             cols = []
             for v in static_cont_vars:
-                col   = padded["df_static"][v.name].values.astype(np.float32)
-                valid = ~np.isnan(col)
+                if v.name not in padded["df_static"].columns:
+                    continue
+                col = padded["df_static"][v.name].values.astype(np.float32)
                 if v.name in self.log_vars:
-                    col = col.copy()
-                    col[valid] = np.log1p(np.maximum(col[valid], 0))
-                mean = float(col[valid].mean()) if valid.any() else 0.0
-                std  = float(col[valid].std())  if valid.any() else 1.0
+                    col = np.log1p(np.maximum(col, 0))
+                mean = float(col.mean()) if len(col) > 0 else 0.0
+                std  = float(col.std())  if len(col) > 0 else 1.0
                 if std < 1e-8:
                     std = 1.0
                 self.scalers_cont[v.name] = (mean, std)
-                out = np.where(valid, (col - mean) / std, 0.0)
-                cols.append(out[:, None].astype(np.float32))
+                cols.append(((col - mean) / std)[:, None].astype(np.float32))
             if cols:
                 padded["static_cont_scaled"] = np.concatenate(cols, axis=1)
 
-        # ── Temporali ────────────────────────────────────────────────
+        # ── Temporali ─────────────────────────────────────────────────
         for j, v in enumerate(temporal_cont_vars):
             data  = padded["temporal_cont"][:, :, j]
-            mask  = padded["temporal_cont_mask"][:, :, j]
-            valid = (mask == 1) & (~np.isnan(data))
             if v.name in self.log_vars:
                 data = data.copy()
-                data[valid] = np.log1p(np.maximum(data[valid], 0))
-            mean = float(data[valid].mean()) if valid.any() else 0.0
-            std  = float(data[valid].std())  if valid.any() else 1.0
+                data[vf] = np.log1p(np.maximum(data[vf], 0))
+            mean = float(data[vf].mean()) if vf.any() else 0.0
+            std  = float(data[vf].std())  if vf.any() else 1.0
             if std < 1e-8:
                 std = 1.0
             self.scalers_cont[v.name] = (mean, std)
-            padded["temporal_cont"][:, :, j] = np.where(valid, (data - mean) / std, 0.0)
+            scaled = np.where(vf, (data - mean) / std, 0.0)
+            padded["temporal_cont"][:, :, j] = scaled
 
         return padded
 
     # ==================================================================
-    # [v4] NORMALIZE TIME — PER-PAZIENTE
+    # NORMALIZE TIME — PER-PAZIENTE con t_FUP reale
     # ==================================================================
 
-    def normalize_time_per_patient(self, padded: Dict) -> Dict:
+    def _normalize_time_per_patient(self, padded: Dict) -> Dict:
         """
-        [v4.2] Normalizzazione temporale delta-shift: t_norm[0] = 0 garantito.
+        Normalizzazione temporale per paziente.
 
-        PROBLEMA CON D3_fup O max(visit_times):
-          Se la prima visita ha t_raw[0] > 0 (es. arruolamento a 3 mesi
-          dall'inizio dello studio), entrambi gli schemi precedenti
-          producono t_norm[0] > 0. Il GRU non vede un "inizio" canonico.
+        Se fup_times[i] > 0 (da colonna t_FUP reale):
+          - delta_max[i] = fup_times[i] - t_first[i]
+          - t_norm[i, t] = (t_raw - t_first) / delta_max  ∈ [0, 1]
+          - L'ultimo step valido corrisponde esattamente a t_FUP.
 
-        SOLUZIONE — schema delta-shift:
-          t_offset[i,t] = t_raw[i,t] - t_raw[i,0]      ≥ 0, offset alla prima visita
-          delta_max[i]  = t_offset[i, last_valid]        durata osservata del follow-up
-          t_norm[i,t]   = t_offset[i,t] / delta_max[i]  ∈ [0,1], t_norm[0] = 0 ✓
-
-        Livello 2 — durata assoluta:
-          followup_norm[i] = delta_max[i] / global_delta_max  ∈ [0,1]
-          Cattura "quanto è lungo il follow-up" indipendentemente dall'offset.
-
-        In inverse_transform:
-          t_abs[i,t] = t_norm[i,t] × delta_max_i + t_first[i]
-          Ma t_first è perso nel processo sintetico → si ricostruisce
-          come t_abs[i,t] = t_norm[i,t] × (followup_norm[i] × global_delta_max)
-          (relativo all'inizio del follow-up, impostato a 0).
-
-        Salva:
-          padded["visit_times"]   : t_norm [N,T] ∈ [0,1], t_norm[0]=0
-          padded["followup_norm"] : [N] ∈ [0,1]
-          self.global_time_max    : global_delta_max per inverse_transform
+        Se fup_times[i] == 0 o la colonna non c'era:
+          - Fallback: delta_max[i] = t_last - t_first (comportamento v5)
         """
-        vt = padded["visit_times_raw"]      # [N, T] tempi assoluti
-        vm = padded["visit_mask"][:, :, 0]  # [N, T]
-        N  = vt.shape[0]
+        vt  = padded["visit_times_raw"]   # [N,T]
+        vf  = padded["valid_flag"]        # [N,T] bool
+        fup = padded["fup_times"]         # [N]  (0 se non disponibile)
+        N   = vt.shape[0]
 
-        t_offset    = np.zeros_like(vt)   # tempi relativi alla prima visita
-        delta_max   = np.ones(N, dtype=np.float32)  # durata del follow-up
+        t_offset  = np.zeros_like(vt)
+        delta_max = np.ones(N, dtype=np.float32)
+
+        single_visit_warned = False
 
         for i in range(N):
-            valid_idx = np.where(vm[i] == 1)[0]
+            valid_idx = np.where(vf[i])[0]
             if len(valid_idx) == 0:
                 continue
-            t_first = vt[i, valid_idx[0]]     # tempo prima visita
-            t_last  = vt[i, valid_idx[-1]]    # tempo ultima visita
 
-            t_offset[i] = vt[i] - t_first     # shift: prima visita → 0
-            t_offset[i][vm[i] == 0] = 0.0     # azzera il padding
+            t_first = vt[i, valid_idx[0]]
 
-            d = float(t_last - t_first)
-            delta_max[i] = d if d > 1e-8 else 1.0  # pazienti con 1 sola visita: delta=1
+            # Determina delta_max: usa t_FUP se disponibile e > 0
+            if fup[i] > 1e-8:
+                # t_FUP è assoluto → delta = t_FUP - t_first
+                d = float(fup[i]) - float(t_first)
+                if d < 1e-8:
+                    # t_FUP coincide o precede la prima visita (non dovrebbe accadere)
+                    if not single_visit_warned:
+                        warnings.warn(
+                            f"Paziente indice {i}: delta t_FUP - t_first = {d:.4f} "
+                            f"(quasi zero). Potrebbe indicare t_FUP espresso come "
+                            f"durata dal baseline invece che come data assoluta. "
+                            f"Usa delta_max = max(fup[i], ultima_visita - t_first).",
+                            UserWarning,
+                        )
+                        single_visit_warned = True
+                    d = max(float(vt[i, valid_idx[-1]]) - float(t_first), 1.0)
+                delta_max[i] = d
+            else:
+                # Fallback: distanza prima-ultima visita
+                t_last = vt[i, valid_idx[-1]]
+                d      = float(t_last) - float(t_first)
+                if d < 1e-8:
+                    if not single_visit_warned:
+                        warnings.warn(
+                            f"Paziente indice {i} ha una sola visita o visite "
+                            f"con lo stesso timestamp. delta_max forzato a 1.0.",
+                            UserWarning,
+                        )
+                        single_visit_warned = True
+                    d = 1.0
+                delta_max[i] = d
+
+            t_offset[i]          = vt[i] - t_first
+            t_offset[i][~vf[i]]  = 0.0
 
         self.global_time_max = float(delta_max.max())
         if self.global_time_max < 1e-8:
             self.global_time_max = 1.0
 
-        # t_norm per-paziente ∈ [0,1], t_norm[:,0] = 0 garantito
-        t_norm = np.zeros_like(vt)
-        for i in range(N):
-            t_norm[i]             = t_offset[i] / delta_max[i]
-            t_norm[i][vm[i] == 0] = 0.0
+        t_norm        = np.zeros_like(vt)
+        followup_norm = np.zeros(N, dtype=np.float32)
 
-        # followup_norm: durata relativa al massimo globale ∈ [0,1]
-        followup_norm = delta_max / self.global_time_max
+        for i in range(N):
+            t_norm[i]          = t_offset[i] / delta_max[i]
+            t_norm[i][~vf[i]]  = 0.0
+            followup_norm[i]   = delta_max[i] / self.global_time_max
 
         padded["visit_times"]   = t_norm.astype(np.float32)
         padded["followup_norm"] = followup_norm.astype(np.float32)
+        # Salva delta_max per uso in inverse_transform
+        padded["delta_max_per_patient"] = delta_max
         return padded
 
     # ==================================================================
     # BUILD STATIC TENSORS
     # ==================================================================
 
-    def build_static_tensors(self, df: pd.DataFrame) -> Dict:
-        out = {}
+    def _build_static_tensors(self, df: pd.DataFrame) -> Dict:
+        out            = {}
         cat_ohe_parts  = []
         cat_embed_data = {}
 
@@ -372,14 +730,13 @@ class Preprocessor:
                 cat_embed_data[v.name] = indices
                 if v.name not in self.embeddings:
                     self.embeddings[v.name] = nn.Embedding(
-                        len(values), self.embedding_configs[v.name]
-                    )
+                        len(values), self.embedding_configs[v.name])
             else:
                 indices = np.array([idx_map.get(x, 0) for x in encoded], dtype=np.int64)
                 cat_ohe_parts.append(np.eye(len(values), dtype=np.float32)[indices])
 
         if cat_ohe_parts:
-            out["static_cat_ohe"] = np.concatenate(cat_ohe_parts, axis=1)
+            out["static_cat_ohe"]   = np.concatenate(cat_ohe_parts, axis=1)
         if cat_embed_data:
             out["static_cat_embed"] = cat_embed_data
         return out
@@ -388,52 +745,20 @@ class Preprocessor:
     # TO TENSORS
     # ==================================================================
 
-    def to_tensors(self, padded: Dict) -> Dict:
-        # n_visits: numero di visite valide per paziente [N], calcolato da visit_mask
-        # Usato in dgan._train_generator per conditioning del generatore:
-        # invece di predire n_v da z_static, si campiona n_visits reale
-        # → la distribuzione di lunghezza sequenza è garantita per costruzione.
-        n_visits_np = padded["visit_mask"][:, :, 0].sum(axis=1).astype(np.int64)
+    def _to_tensors(self, padded: Dict) -> Dict:
+        vf_np       = padded["valid_flag"]   # bool [N,T]
+        n_visits_np = vf_np.sum(axis=1).astype(np.int64)
 
         out = {
-            "temporal_cont":      torch.tensor(padded["temporal_cont"],      dtype=torch.float32),
-            "temporal_cont_mask": torch.tensor(padded["temporal_cont_mask"], dtype=torch.float32),
-            "visit_mask":         torch.tensor(padded["visit_mask"],         dtype=torch.float32),
-            "visit_time":         torch.tensor(padded["visit_times"],        dtype=torch.float32),
-            "followup_norm":      torch.tensor(padded["followup_norm"],      dtype=torch.float32),
-            "n_visits":           torch.tensor(n_visits_np,                  dtype=torch.long),
-            "temporal_cat":       {},
-            "temporal_cat_mask":  {},
+            "temporal_cont":  torch.tensor(padded["temporal_cont"], dtype=torch.float32),
+            "valid_flag":     torch.tensor(vf_np,                   dtype=torch.bool),
+            "visit_time":     torch.tensor(padded["visit_times"],    dtype=torch.float32),
+            "followup_norm":  torch.tensor(padded["followup_norm"],  dtype=torch.float32),
+            "n_visits":       torch.tensor(n_visits_np,              dtype=torch.long),
+            "temporal_cat":   {},
         }
 
-        if "static_cont_mask" in padded:
-            out["static_cont_mask"] = torch.tensor(padded["static_cont_mask"], dtype=torch.float32)
-
-        # static_cat_mask: una maschera per ogni OHE dim
-        ohe_mask_parts = []
-        for v in self.vars:
-            if not v.static or v.kind != "categorical" or v.name in self.embedding_configs:
-                continue
-            if v.name in padded.get("static_cat_mask", {}):
-                n_cat    = len(v.mapping)
-                mask_vec = torch.tensor(padded["static_cat_mask"][v.name], dtype=torch.float32)
-                ohe_mask_parts.append(mask_vec.unsqueeze(-1).expand(-1, n_cat))
-        if ohe_mask_parts:
-            out["static_cat_mask"] = torch.cat(ohe_mask_parts, dim=-1)
-
-        # embed mask
-        embed_mask = {}
-        for v in self.vars:
-            if not v.static or v.kind != "categorical" or v.name not in self.embedding_configs:
-                continue
-            if v.name in padded.get("static_cat_mask", {}):
-                embed_mask[v.name] = torch.tensor(
-                    padded["static_cat_mask"][v.name], dtype=torch.float32
-                )
-        if embed_mask:
-            out["static_cat_embed_mask"] = embed_mask
-
-        # Temporal categorical → OHE × mask
+        # Temporal categorical → OHE (padding = zero vector, non usato)
         for v in [v for v in self.vars if not v.static and v.kind == "categorical"]:
             values  = sorted(v.mapping.values())
             idx_map = {val: i for i, val in enumerate(values)}
@@ -442,17 +767,13 @@ class Preprocessor:
                 [[idx_map.get(x, 0) for x in row] for row in encoded],
                 dtype=np.int64,
             )
-            ohe  = np.eye(len(values), dtype=np.float32)[idx]
-            ohe *= padded["temporal_cat_mask"][v.name][:, :, None]
-            out["temporal_cat"][v.name]      = torch.tensor(ohe, dtype=torch.float32)
-            out["temporal_cat_mask"][v.name] = torch.tensor(
-                padded["temporal_cat_mask"][v.name], dtype=torch.float32
-            )
+            ohe                        = np.eye(len(values), dtype=np.float32)[idx]
+            out["temporal_cat"][v.name] = torch.tensor(ohe, dtype=torch.float32)
 
         if "static_cont_scaled" in padded:
             out["static_cont"] = torch.tensor(padded["static_cont_scaled"], dtype=torch.float32)
         if "static_cat_ohe" in padded:
-            out["static_cat"]  = torch.tensor(padded["static_cat_ohe"], dtype=torch.float32)
+            out["static_cat"]  = torch.tensor(padded["static_cat_ohe"],     dtype=torch.float32)
         if "static_cat_embed" in padded:
             out["static_cat_embed"] = {
                 name: torch.tensor(idx, dtype=torch.long)
@@ -474,60 +795,64 @@ class Preprocessor:
         if "static_cat_embed" in batch:
             for name, indices in batch["static_cat_embed"].items():
                 parts.append(self.embeddings[name](indices))
+        if not parts:
+            raise ValueError(
+                "Nessuna feature statica disponibile per apply_embeddings. "
+                "Verifica che static_cont, static_cat o static_cat_embed siano presenti nel batch."
+            )
         return torch.cat(parts, dim=-1)
 
     # ==================================================================
     # INVERSE TRANSFORM
     # ==================================================================
 
-    def inverse_transform(
-        self,
-        synthetic:         Dict,
-        complete_followup: bool = True,
-    ) -> pd.DataFrame:
+    def inverse_transform(self, synthetic: Dict) -> pd.DataFrame:
         """
-        [v4.2] Ricostruzione tempi con schema delta-shift.
-
-        Poiché t_norm è relativo alla prima visita (t_norm[0]=0 sempre),
-        il tempo ricostruito parte da 0 per ogni paziente sintetico:
-          delta_max_i = followup_norm[i] × global_time_max
-          t_abs[t]    = t_norm[t] × delta_max_i   (prima visita = 0)
-          D3_fup      = delta_max_i (aggiunto come colonna)
-
-        ATTENZIONE [BUG PREVENUTO]: questo metodo deve gestire anche
-        le variabili con embedding (es. CENTRE) nel blocco 2b.
-        Senza il blocco 2b check_data.py lancia KeyError: 'CENTRE'.
+        Ricostruzione dal formato sintetico a DataFrame long.
+        valid_flag determina gli step attivi.
+        Il tempo dell'ultimo step viene agganciato a followup_norm * global_time_max.
         """
         temporal_cont_vars = [v for v in self.vars if not v.static and v.kind == "continuous"]
         temporal_cat_vars  = [v for v in self.vars if not v.static and v.kind == "categorical"]
         static_cont_vars   = [v for v in self.vars if v.static     and v.kind == "continuous"]
         static_cat_vars    = [v for v in self.vars if v.static     and v.kind == "categorical"]
 
-        N, T, _ = synthetic["temporal_cont"].shape
-        records  = []
+        tc   = synthetic["temporal_cont"]
+        N, T = tc.shape[0], tc.shape[1]
+        records = []
+
+        if "valid_flag" in synthetic:
+            vf_raw = synthetic["valid_flag"]
+        elif "visit_mask" in synthetic:
+            vf_raw = synthetic["visit_mask"]
+        else:
+            vf_raw = torch.ones(N, T, dtype=torch.bool)
+
+        if vf_raw.dim() == 3:
+            vf_raw = vf_raw.squeeze(-1)
 
         followup_norm = synthetic.get("followup_norm", None)
-        if followup_norm is not None and hasattr(followup_norm, "squeeze"):
-            fn = followup_norm
-            followup_norm = fn.squeeze(-1) if fn.dim() > 1 else fn  # [N]
+        if followup_norm is not None and followup_norm.dim() > 1:
+            followup_norm = followup_norm.squeeze(-1)
+
+        Z_CLIP = self.clip_z   # da config, non hardcoded
 
         for i in range(N):
             static_data = {}
 
-            # 1. Attributi statici continui
+            # 1. Statici continui
             if "static_cont" in synthetic and synthetic["static_cont"] is not None:
-                Z_CLIP = 4.0
                 for j, v in enumerate(static_cont_vars):
-                    s          = float(synthetic["static_cont"][i, j])
-                    s          = max(-Z_CLIP, min(Z_CLIP, s))
-                    mean, std  = self.scalers_cont[v.name]
-                    val        = s * std + mean
+                    s         = float(synthetic["static_cont"][i, j])
+                    s         = max(-Z_CLIP, min(Z_CLIP, s))
+                    mean, std = self.scalers_cont[v.name]
+                    val       = s * std + mean
                     if v.name in self.log_vars:
                         val = float(np.expm1(max(val, -30.0)))
                         val = max(0.0, val)
                     static_data[v.name] = val
 
-            # 2a. Attributi statici categorici — OHE [FIX BUG 5: ordine da self.vars]
+            # 2. Statici categorici — OHE
             if "static_cat" in synthetic and synthetic["static_cat"] is not None:
                 offset = 0
                 for v in static_cat_vars:
@@ -540,9 +865,7 @@ class Preprocessor:
                     static_data[v.name] = self.inverse_maps[v.name][val_enc]
                     offset += n_cat
 
-            # 2b. Attributi statici categorici — EMBEDDING (es. CENTRE)
-            # OBBLIGATORIO: senza questo blocco CENTRE manca nel DataFrame
-            # e check_data.py lancia KeyError: 'Column not found: CENTRE'.
+            # 3. Statici categorici — Embedding
             if "static_cat_embed_decoded" in synthetic:
                 for v in static_cat_vars:
                     if v.name not in self.embedding_configs:
@@ -552,25 +875,29 @@ class Preprocessor:
                     val_enc = values[idx_enc]
                     static_data[v.name] = self.inverse_maps[v.name][val_enc]
 
-            # 3. Durata follow-up sintetico (delta dalla prima visita)
-            # Con schema delta-shift: t_abs[0]=0 per costruzione
+            # 4. Durata follow-up (denormalizzata)
             if followup_norm is not None:
                 delta_max_i = float(followup_norm[i]) * self.global_time_max
             else:
                 delta_max_i = self.global_time_max
-            static_data["D3_fup"] = delta_max_i
+            static_data[self.fup_col] = delta_max_i   # colonna t_FUP configurabile
 
-            # 4. Visite temporali [FIX BUG 8]
-            valid_steps = [
-                t for t in range(T)
-                if float(synthetic["visit_mask"][i, t, 0]) > 0.5
-            ]
+            # 5. Visite temporali — usa valid_flag
+            if vf_raw.dtype == torch.bool:
+                valid_steps = vf_raw[i].nonzero(as_tuple=True)[0].tolist()
+            else:
+                valid_steps = (vf_raw[i] > 0.5).nonzero(as_tuple=True)[0].tolist()
 
+            n_valid = len(valid_steps)
             prev_time = 0.0
-            for t in valid_steps:
+            for step_i, t in enumerate(valid_steps):
                 if "visit_times" in synthetic and synthetic["visit_times"] is not None:
-                    t_norm_val  = min(1.0, max(0.0, float(synthetic["visit_times"][i, t])))
-                    time_denorm = t_norm_val * delta_max_i
+                    t_norm_val = min(1.0, max(0.0, float(synthetic["visit_times"][i, t])))
+                    # Aggancia l'ultimo step esattamente a delta_max_i
+                    if step_i == n_valid - 1:
+                        time_denorm = delta_max_i
+                    else:
+                        time_denorm = t_norm_val * delta_max_i
                 else:
                     time_denorm = float(t) * (delta_max_i / max(T - 1, 1))
 
@@ -584,25 +911,16 @@ class Preprocessor:
                 }
                 row.update(static_data)
 
-                # Continui temporali
-                # [v5.1] Clip z-score a ±4σ prima di inverse_transform.
-                # Il generatore produce output lineari non limitati → z-score
-                # estremi (es. z=+10) → expm1(z*std+mean) = valori 1e9.
-                # ±4σ copre il 99.994% della distribuzione normale e
-                # previene overflow nell'inverse_transform senza distorcere
-                # i valori nell'intervallo fisicamente plausibile.
-                Z_CLIP = 4.0
                 for j, v in enumerate(temporal_cont_vars):
-                    s          = float(synthetic["temporal_cont"][i, t, j])
-                    s          = max(-Z_CLIP, min(Z_CLIP, s))   # clip z-score
-                    mean, std  = self.scalers_cont[v.name]
-                    val        = s * std + mean
+                    s         = float(tc[i, t, j])
+                    s         = max(-Z_CLIP, min(Z_CLIP, s))
+                    mean, std = self.scalers_cont[v.name]
+                    val       = s * std + mean
                     if v.name in self.log_vars:
-                        val = float(np.expm1(max(val, -30.0)))  # expm1 safe
-                        val = max(0.0, val)                      # fisicamente ≥ 0
+                        val = float(np.expm1(max(val, -30.0)))
+                        val = max(0.0, val)
                     row[v.name] = val
 
-                # Categorici temporali
                 for v in temporal_cat_vars:
                     oh      = synthetic["temporal_cat"][v.name][i, t]
                     values  = sorted(v.mapping.values())
@@ -614,8 +932,7 @@ class Preprocessor:
         df_out = pd.DataFrame(records)
         if len(df_out) > 0:
             df_out = df_out.sort_values(
-                [self.id_col, self.time_col]
-            ).reset_index(drop=True)
+                [self.id_col, self.time_col]).reset_index(drop=True)
         return df_out
 
     # ==================================================================
@@ -628,6 +945,11 @@ class Preprocessor:
         decoded = {}
         for name, vec in embedded.items():
             if name not in self.embeddings:
+                warnings.warn(
+                    f"Embedding '{name}' non trovato nel preprocessore. "
+                    f"Verrà saltato nel decode.",
+                    UserWarning,
+                )
                 continue
             W             = self.embeddings[name].weight.data
             dists         = torch.cdist(vec.float(), W.float(), p=2)

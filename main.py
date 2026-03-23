@@ -1,4 +1,4 @@
-#main.py
+# main.py
 
 import pandas as pd
 import torch
@@ -12,22 +12,22 @@ from processing.processor import Preprocessor
 from model.dgan import DGAN
 
 from datetime import datetime
-#timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-timestr = "2"
+# timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
+timestr = "4"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 torch.autograd.set_detect_anomaly(True)
+
 
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 def main():
     # =========================================================================
@@ -35,35 +35,42 @@ def main():
     # =========================================================================
     set_seed(42)
 
-    config_path = "config/data_config.json"
+    config_path = "config/data_config2.json"
 
-    time_cfg, variables, model_cfg = load_config(config_path)
+    # ── FIX: load_config restituisce 4 valori (aggiunto prep_cfg) ────────────
+    # Vecchia firma (v1):  time_cfg, variables, model_cfg = load_config(...)
+    # Nuova firma (v2):    time_cfg, variables, model_cfg, prep_cfg = load_config(...)
+    time_cfg, variables, model_cfg, prep_cfg = load_config(config_path)
+
     data_cfg = build_data_config(time_cfg, variables)
-    
-    print(f"Max visits: {data_cfg.max_len}")
-    print(f"Static continuous: {data_cfg.n_static_cont}")
-    print(f"Static categorical: {data_cfg.n_static_cat}")
-    print(f"Temporal continuous: {data_cfg.n_temp_cont}")
+
+    print(f"Max visits:           {data_cfg.max_len}")
+    print(f"Min visits (config):  {data_cfg.min_visits}")
+    print(f"t_FUP column:         {data_cfg.fup_col}")
+    print(f"Static continuous:    {data_cfg.n_static_cont}")
+    print(f"Static categorical:   {data_cfg.n_static_cat}")
+    print(f"Temporal continuous:  {data_cfg.n_temp_cont}")
     print(f"Temporal categorical: {data_cfg.n_temp_cat}")
     print(f"Irreversible indices: {data_cfg.irreversible_idx}")
-    
+    print(f"Preprocessing: mice_max_iter={prep_cfg.mice_max_iter}  "
+          f"knn_neighbors={prep_cfg.knn_neighbors}  "
+          f"log_vars={prep_cfg.log_vars}  clip_z={prep_cfg.clip_z}")
+
     # =========================================================================
     # 2. CARICA DATI
     # =========================================================================
-    df_train = pd.read_excel("PBC_UDCA_long_strat.xlsx")
-    
+    df_train = pd.read_excel("DGAN_PBC.xlsx")
+    print(f"\nLoaded {len(df_train)} rows, "
+          f"{df_train[data_cfg.patient_id_col].nunique()} patients")
 
-    print(f"Loaded {len(df_train)} rows, {df_train[data_cfg.patient_id_col].nunique()} patients")
-    
     # =========================================================================
-    # 3. PREPROCESSING CON EMBEDDING
+    # 3. VERIFICA MAPPING CATEGORICI
     # =========================================================================
-    # VERIFICA CRITICA: __MISSING__ non deve essere nei mapping
     print("\nVerifying config mappings...")
     for v in variables:
         if v.kind == "categorical" and v.mapping:
-            invalid_keys = [k for k in v.mapping.keys() 
-                          if k in ["__MISSING__", "nan", "NaN", ""]]
+            invalid_keys = [k for k in v.mapping.keys()
+                            if k in ["__MISSING__", "nan", "NaN", ""]]
             if invalid_keys:
                 raise ValueError(
                     f"❌ Variable '{v.name}' has INVALID keys in mapping: {invalid_keys}\n"
@@ -72,158 +79,192 @@ def main():
                     f"   Missing values will be handled automatically by the preprocessor."
                 )
             logger.info(f"  ✓ {v.name}: {len(v.mapping)} categories (no missing placeholder)")
-    
-    # Configura embedding per CENTRE (48 categorie → 6 dimensioni)
-    embedding_configs = {
-        "CENTRE": 12
-    }
-    
-    LOG_VARS = ["ALP", "BIL", "ALT", "AST", "GGT", "CRE", "TRIGVAL", "NEUTVAL", "SOD", "VITDVAL", "LINFVAL"]
 
-    preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs, log_vars=LOG_VARS)
+    # =========================================================================
+    # 4. PREPROCESSING
+    # =========================================================================
+    # Configura embedding per CENTRE (48 categorie → 12 dimensioni)
+    embedding_configs = {"CENTRE": 12}
 
-    #preprocessor = Preprocessor(data_cfg, log_vars=LOG_VARS)
+    # ── Tutti i parametri di preprocessing vengono ora da prep_cfg (config JSON) ──
+    preprocessor = Preprocessor(
+        data_cfg,
+        embedding_configs = embedding_configs,
+        log_vars          = prep_cfg.log_vars,
+        mice_max_iter     = prep_cfg.mice_max_iter,
+        knn_neighbors     = prep_cfg.knn_neighbors,
+        clip_z            = prep_cfg.clip_z,
+    )
+
     tensors = preprocessor.fit_transform(df_train)
 
-    # Verifica che le maschere siano coerenti con le OHE
-    print("\nVerifying masks and OHE consistency...")
-    for name in tensors["temporal_cat"].keys():
-        ohe = tensors["temporal_cat"][name]           # [N, T, K]
-        mask = tensors["temporal_cat_mask"][name]     # [N, T]
-        
-        # Dove mask=0, la OHE dovrebbe essere [0, 0, ..., 0]
-        missing_positions = (mask == 0)
-        ohe_sum = ohe.sum(dim=-1)  # [N, T] — somma su K
-        
-        # Se questa assertion fallisce, c'è un bug nel preprocessor
-        assert (ohe_sum[missing_positions] == 0).all(), \
-            f"❌ {name}: OHE non è zero dove mask=0"
-        
-        n_missing = missing_positions.sum().item()
-        n_total = mask.numel()
-        print(f"  ✓ {name}: {n_missing}/{n_total} missing ({n_missing/n_total*100:.1f}%)")
-    
+    # ── NOTA: le vecchie maschere (temporal_cat_mask, visit_mask) sono rimosse ──
+    # Il codice usa ora valid_flag [N,T] bool come unico indicatore di padding.
+    # Non fare più assert su temporal_cat_mask — non esiste nel nuovo preprocessor.
+
     print("\nPreprocessing complete:")
-    logger.info(f"  - Static cont shape: {tensors['static_cont'].shape}")
-    logger.info(f"  - Static cat shape: {tensors.get('static_cat', torch.empty(0)).shape}")
-    logger.info(f"  - Static embed: {list(tensors.get('static_cat_embed', {}).keys())}")
-    logger.info(f"  - Temporal cont shape: {tensors['temporal_cont'].shape}")
-    logger.info(f"  - Temporal cat variables: {list(tensors['temporal_cat'].keys())}")
-    logger.info(f"  - Visit mask shape: {tensors['visit_mask'].shape}")
-    
+    logger.info(f"  - valid_flag shape:     {tensors['valid_flag'].shape}")
+    logger.info(f"  - temporal_cont shape:  {tensors['temporal_cont'].shape}")
+    logger.info(f"  - static_cont shape:    {tensors.get('static_cont', torch.empty(0)).shape}")
+    logger.info(f"  - static_cat shape:     {tensors.get('static_cat', torch.empty(0)).shape}")
+    logger.info(f"  - static embed keys:    {list(tensors.get('static_cat_embed', {}).keys())}")
+    logger.info(f"  - temporal_cat keys:    {list(tensors.get('temporal_cat', {}).keys())}")
+    logger.info(f"  - followup_norm shape:  {tensors['followup_norm'].shape}")
+    logger.info(f"  - n_visits shape:       {tensors['n_visits'].shape}")
+
+    # Statistiche rapide
+    vf       = tensors["valid_flag"]
+    nv       = vf.sum(dim=1).float()
+    fn       = tensors["followup_norm"]
+    print(f"\n  n_visits: min={nv.min().item():.0f}  "
+          f"median={nv.median().item():.0f}  max={nv.max().item():.0f}")
+    print(f"  followup_norm: min={fn.min().item():.3f}  "
+          f"mean={fn.mean().item():.3f}  max={fn.max().item():.3f}")
+
     # =========================================================================
-    # 4. INIZIALIZZA DGAN
+    # 5. INIZIALIZZA DGAN
     # =========================================================================
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"\nUsing device: {device}")
-    
-    dgan = DGAN(data_config=data_cfg, model_config=model_cfg, preprocessor=preprocessor, device=device)
-    
-    print(f"Model initialized:")
-    print(f"  - Static dim: {dgan.static_dim}")
-    print(f"  - Temporal dim: {dgan.temporal_dim}")
-    print(f"  - Generator params: {sum(p.numel() for p in dgan.generator.parameters()):,}")
-    print(f"  - Disc static params: {sum(p.numel() for p in dgan.disc_static.parameters()):,}")
-    print(f"  - Disc temporal params: {sum(p.numel() for p in dgan.disc_temporal.parameters()):,}")
-    
+
+    dgan = DGAN(
+        data_config  = data_cfg,
+        model_config = model_cfg,
+        preprocessor = preprocessor,
+        device       = device,
+    )
+
+    print(f"\nModel initialized:")
+    print(f"  Static dim:          {dgan.static_dim}")
+    print(f"  Temporal dim:        {dgan.temporal_dim}")
+    print(f"  Generator params:    {sum(p.numel() for p in dgan.generator.parameters()):,}")
+    print(f"  Disc static params:  {sum(p.numel() for p in dgan.disc_static.parameters()):,}")
+    print(f"  Disc temporal params:{sum(p.numel() for p in dgan.disc_temporal.parameters()):,}")
+    print(f"  min_visits enforced: {dgan.generator.min_visits}")
+    print(f"  noise_ar_rho:        {dgan.generator.noise_ar_rho}")
+
     # =========================================================================
-    # 5. TRAINING
+    # 6. TRAINING
     # =========================================================================
-    logger.info("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("STARTING TRAINING")
-    logger.info("="*80 + "\n")
-    
+    print("=" * 80 + "\n")
+
     dgan.fit(tensors_dict=tensors, epochs=model_cfg.epochs)
-    
-    print("\n" + "="*80)
+
+    print("\n" + "=" * 80)
     print("TRAINING COMPLETE")
-    print("="*80)
-    
+    print("=" * 80)
+
     # =========================================================================
-    # 6. SALVA MODELLO
+    # 7. SALVA MODELLO
     # =========================================================================
     model_path = "checkpoints/dgan_final.pt"
     Path("checkpoints").mkdir(exist_ok=True)
     dgan.save(model_path)
     logger.info(f"✓ Model saved: {model_path}")
-    
+
     # =========================================================================
-    # 7. GENERA DATI SINTETICI
+    # 8. GENERA DATI SINTETICI
     # =========================================================================
-    logger.info("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("GENERATING SYNTHETIC DATA")
-    logger.info("="*80 + "\n")
-    
-    n_synthetic = df_train[data_cfg.patient_id_col].nunique()  # stesso numero di pazienti
-    
-    df_synthetic = dgan.generate(n_samples=n_synthetic,
-        temperature=0.5,  # temperatura bassa per output più discreto
-        return_dataframe=True
+    print("=" * 80 + "\n")
+
+    n_synthetic = df_train[data_cfg.patient_id_col].nunique()
+
+    df_synthetic = dgan.generate(
+        n_samples        = n_synthetic,
+        temperature      = 0.5,
+        return_dataframe = True,
     )
-    
-    print(f"Generated {len(df_synthetic)} rows, {df_synthetic[data_cfg.patient_id_col].nunique()} patients")
-    
-    # Verifica che NON ci siano missing nell'output
+
+    print(f"Generated {len(df_synthetic)} rows, "
+          f"{df_synthetic[data_cfg.patient_id_col].nunique()} patients")
+
+    # Verifica n_visits >= min_visits
+    synth_nv = df_synthetic.groupby(data_cfg.patient_id_col).size()
+    below_min = (synth_nv < data_cfg.min_visits).sum()
+    if below_min > 0:
+        logger.warning(
+            f"⚠ {below_min} pazienti sintetici hanno meno di "
+            f"min_visits={data_cfg.min_visits} visite."
+        )
+    else:
+        print(f"  ✓ Tutti i pazienti hanno >= {data_cfg.min_visits} visita/e")
+    print(f"  n_visits sintetici: min={synth_nv.min()}  "
+          f"median={synth_nv.median():.0f}  max={synth_nv.max()}")
+
+    # Verifica che t_FUP sia presente nell'output
+    if data_cfg.fup_col in df_synthetic.columns:
+        fup_synth = df_synthetic.groupby(data_cfg.patient_id_col)[data_cfg.fup_col].first()
+        print(f"  t_FUP sintetico: min={fup_synth.min():.1f}  "
+              f"mean={fup_synth.mean():.1f}  max={fup_synth.max():.1f}")
+    else:
+        logger.warning(f"⚠ Colonna {data_cfg.fup_col} non trovata nel DataFrame sintetico.")
+
+    # =========================================================================
+    # 9. VALIDAZIONE
+    # =========================================================================
     from utils.check_data import check_missing, basic_validation
 
     check_missing(df_synthetic, data_cfg, timestr)
-    
-    logger.info("\n" + "="*80)
+
+    print("\n" + "=" * 80)
     print("VALIDATION SUMMARY")
-    logger.info("="*80)
-    
+    print("=" * 80)
     basic_validation(df_train, df_synthetic, data_cfg)
 
-    # Visualizza loss history
+    # =========================================================================
+    # 10. PLOT
+    # =========================================================================
     from utils.plots import plot_training_history, plot_training_history2
-    
-    plot_training_history(dgan, timestr)
 
+    plot_training_history(dgan, timestr)
     plot_training_history2(dgan, timestr, config_path=config_path)
-    
-    logger.info("\n" + "="*80)
+
+    print("\n" + "=" * 80)
     print("✓ PIPELINE COMPLETE")
-    logger.info("="*80)
+    print("=" * 80)
 
 
 def test_loading():
     """Test caricamento modello salvato"""
-    logger.info("\n" + "="*80)
-    logger.info("TESTING MODEL LOADING")
-    logger.info("="*80 + "\n")
-    
-    # Ricarica config
+    print("\n" + "=" * 80)
+    print("TESTING MODEL LOADING")
+    print("=" * 80 + "\n")
+
     config_path = "config/data_config.json"
-    time_cfg, variables, model_cfg = load_config(config_path)
+    time_cfg, variables, model_cfg, prep_cfg = load_config(config_path)
     data_cfg = build_data_config(time_cfg, variables)
-    
-    # Ricarica preprocessor
-    #embedding_configs = {"CENTRE": 6}
-    #preprocessor = Preprocessor(data_cfg, embedding_configs=embedding_configs)
-    preprocessor = Preprocessor(data_cfg)
-    
-    # Carica modello
+
+    embedding_configs = {"CENTRE": 12}
+    preprocessor = Preprocessor(
+        data_cfg,
+        embedding_configs = embedding_configs,
+        log_vars          = prep_cfg.log_vars,
+        mice_max_iter     = prep_cfg.mice_max_iter,
+        knn_neighbors     = prep_cfg.knn_neighbors,
+        clip_z            = prep_cfg.clip_z,
+    )
+
     dgan_loaded = DGAN.load(
         "checkpoints/dgan_final.pt",
         data_cfg,
         model_cfg,
         preprocessor,
-        device="cpu"
+        device="cpu",
     )
-    
-    # Genera nuovi dati
+
     df_new = dgan_loaded.generate(n_samples=100, temperature=0.6, return_dataframe=True)
     Path("output").mkdir(exist_ok=True)
     df_new.to_excel(f"output/exp_{timestr}/test_data.xlsx", index=False)
-    print(f"✓ Saved synthetic data: output/test_data.xlsx")
+    print(f"✓ Saved synthetic data: output/exp_{timestr}/test_data.xlsx")
     logger.info(f"✓ Generated {len(df_new)} rows with loaded model")
-    
+
     return df_new
 
 
 if __name__ == "__main__":
-    # Training pipeline completo
     main()
-    
-    # Test loading (opzionale)
     # test_loading()

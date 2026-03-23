@@ -1,107 +1,68 @@
 """
-model/discriminator.py  [v6 — discriminatore temporale configurabile]
+model/discriminator.py  [gretel-style]
 ================================================================================
-Novità rispetto a v5:
+Discriminatori semplificati: input densi con valid_flag per il pooling.
 
-  DISCRIMINATORE TEMPORALE — arch configurabile via JSON:
-    "temporal_discriminator": {
-      "arch": "cnn",   # "cnn" (default, raccomandato) | "gru" (retrocompat)
-      ...
-    }
-
-  CNN (raccomandato per T_avg ≤ 10):
-    3 blocchi Conv1D dilatati con dilation 1→2→4:
-      Layer 1: receptive field = 3 step
-      Layer 2: receptive field = 5 step
-      Layer 3: receptive field = 7 step  → copre T_avg=7 esatto
-    2-3x più veloce del GRU, completamente parallelizzabile.
-    Cattura pattern locali (es. "ALP decresce in 2 step") meglio del GRU.
-
-  GRU (retrocompatibilità v5):
-    Identico alla versione precedente, attivato con arch="gru".
-
-  TemporalDiscriminator è ora una factory function che istanzia
-  CNNTemporalDiscriminator o GRUTemporalDiscriminator in base ad arch.
+Cambiamenti rispetto alla versione precedente:
+  - prepare_discriminator_inputs: niente masking inline, usa valid_flag
+  - StaticDiscriminator: invariato (MLP residuale + spectral norm)
+  - TemporalDiscriminator: CNN dilatata con attention pooling via valid_flag
+  - GRU opzionale per retrocompatibilità
 ================================================================================
 """
 
+import warnings
 import torch
 import torch.nn as nn
 from typing import Optional, Dict
 
 
 # ==================================================================
-# HELPER: prepara input concatenati per i discriminatori
+# HELPER: prepara input concatenati
 # ==================================================================
 
 def prepare_discriminator_inputs(batch: Dict, preprocessor) -> Dict:
     """
-    Concatena tutte le feature in tensori flat per i discriminatori.
+    Concatena le feature in tensori flat [B,D] (static) e [B,T,D] (temporal).
+    Non applica maschere inline: il valid_flag viene passato separatamente
+    e usato solo nel pooling del discriminatore temporale.
 
-    [v4] followup_norm broadcastato su tutti gli step temporali.
-    [v6] invariato — compatibile con generatori GRU e Transformer.
+    [gretel] followup_norm broadcastato su T come feature temporale globale.
     """
-    static_parts      = []
-    static_mask_parts = []
+    static_parts = []
 
     if "static_cont" in batch and batch["static_cont"] is not None:
-        sc = batch["static_cont"]
-        if "static_cont_mask" in batch and batch["static_cont_mask"] is not None:
-            sc = sc * batch["static_cont_mask"]
-            static_mask_parts.append(batch["static_cont_mask"])
-        static_parts.append(sc)
+        static_parts.append(batch["static_cont"])
 
     if "static_cat" in batch and batch["static_cat"] is not None:
-        if torch.is_tensor(batch["static_cat"]):
-            static_parts.append(batch["static_cat"])
-            if "static_cat_mask" in batch and batch["static_cat_mask"] is not None:
-                static_mask_parts.append(batch["static_cat_mask"])
-        elif isinstance(batch["static_cat"], dict):
-            for name, scat in batch["static_cat"].items():
-                if ("static_cat_mask" in batch
-                        and batch["static_cat_mask"] is not None
-                        and name in batch["static_cat_mask"]):
-                    mask = batch["static_cat_mask"][name]
-                    scat = scat * mask
-                    static_mask_parts.append(mask)
-                static_parts.append(scat)
+        sc = batch["static_cat"]
+        if torch.is_tensor(sc):
+            static_parts.append(sc)
+        elif isinstance(sc, dict):
+            for t in sc.values():
+                static_parts.append(t)
         else:
-            raise TypeError(f"static_cat must be Tensor or Dict, got {type(batch['static_cat'])}")
+            raise TypeError(f"static_cat must be Tensor or Dict, got {type(sc)}")
 
     if "static_cat_embed" in batch and batch["static_cat_embed"]:
         for var_name, payload in batch["static_cat_embed"].items():
-            if isinstance(payload, dict):
-                raise TypeError(f"static_cat_embed['{var_name}'] is a dict, expected Tensor")
-            vec = (
-                preprocessor.embeddings[var_name](payload)
-                if payload.dim() == 1 else payload
-            )
-            if var_name in (batch.get("static_cat_embed_mask") or {}):
-                mask = batch["static_cat_embed_mask"][var_name]
-                vec  = vec * mask.unsqueeze(-1)
-                static_mask_parts.append(mask.unsqueeze(-1).expand_as(vec))
-            else:
-                ones_mask = torch.ones(vec.shape[0], device=vec.device)
-                static_mask_parts.append(ones_mask.unsqueeze(-1).expand_as(vec))
+            vec = (preprocessor.embeddings[var_name](payload)
+                   if payload.dim() == 1 else payload)
             static_parts.append(vec)
 
-    static      = torch.cat(static_parts, dim=-1)
-    static_mask = torch.cat(static_mask_parts, dim=-1) if static_mask_parts else None
+    if not static_parts:
+        raise ValueError(
+            "Nessuna feature statica trovata nel batch. "
+            "Il batch deve contenere almeno uno tra: static_cont, static_cat, static_cat_embed. "
+            "Verifica che la configurazione abbia variabili statiche definite."
+        )
+    static = torch.cat(static_parts, dim=-1)
 
     # ── Temporal ─────────────────────────────────────────────────
     temporal_cont = batch["temporal_cont"]
     B, T, _       = temporal_cont.shape
 
-    if "temporal_cont_mask" in batch and batch["temporal_cont_mask"] is not None:
-        temporal_cont = temporal_cont * batch["temporal_cont_mask"]
-
-    temporal_parts      = [temporal_cont]
-    temporal_mask_parts = []
-
-    if "temporal_cont_mask" in batch and batch["temporal_cont_mask"] is not None:
-        temporal_mask_parts.append(batch["temporal_cont_mask"])
-    else:
-        temporal_mask_parts.append(torch.ones_like(temporal_cont))
+    temporal_parts = [temporal_cont]
 
     temp_cat_order = [
         v.name for v in preprocessor.vars
@@ -110,50 +71,38 @@ def prepare_discriminator_inputs(batch: Dict, preprocessor) -> Dict:
     for name in temp_cat_order:
         if "temporal_cat" not in batch or name not in batch["temporal_cat"]:
             raise KeyError(f"Missing temporal_cat '{name}' in batch")
-        cat_ohe = batch["temporal_cat"][name]
-        n_cat   = cat_ohe.shape[-1]
-        temporal_parts.append(cat_ohe)
-        if (
-            "temporal_cat_mask" in batch
-            and batch["temporal_cat_mask"] is not None
-            and name in batch["temporal_cat_mask"]
-        ):
-            mask = batch["temporal_cat_mask"][name]
-            temporal_mask_parts.append(mask.unsqueeze(-1).expand(-1, -1, n_cat))
-        else:
-            temporal_mask_parts.append(
-                torch.ones(B, T, n_cat, device=cat_ohe.device, dtype=cat_ohe.dtype)
-            )
+        temporal_parts.append(batch["temporal_cat"][name])
 
+    # followup_norm broadcastato
     if "followup_norm" in batch and batch["followup_norm"] is not None:
         fn = batch["followup_norm"]
-        fn_expanded = fn.unsqueeze(-1).unsqueeze(-1).expand(B, T, 1) if fn.dim() == 1 \
-                      else fn.expand(B, T, 1)
-        temporal_parts.append(fn_expanded)
-        temporal_mask_parts.append(torch.ones(B, T, 1, device=fn.device))
+        fn_expanded = fn.view(B, 1, 1).expand(B, T, 1)
     else:
         fn_expanded = torch.full((B, T, 1), 0.5, device=temporal_cont.device)
-        temporal_parts.append(fn_expanded)
-        temporal_mask_parts.append(torch.ones(B, T, 1, device=temporal_cont.device))
+    temporal_parts.append(fn_expanded)
 
-    temporal      = torch.cat(temporal_parts,      dim=-1)
-    temporal_mask = torch.cat(temporal_mask_parts, dim=-1)
+    temporal = torch.cat(temporal_parts, dim=-1)
 
-    vm = batch["visit_mask"]
-    if vm.dim() == 3:
-        vm = vm.squeeze(-1)
+    # valid_flag: bool [B,T] — True = step reale, False = padding
+    if "valid_flag" in batch:
+        vf = batch["valid_flag"]
+        if vf.dtype != torch.bool:
+            vf = vf.bool()
+        if vf.dim() == 3:
+            vf = vf.squeeze(-1)
+    else:
+        # fallback: tutte valide (no padding)
+        vf = torch.ones(B, T, dtype=torch.bool, device=temporal_cont.device)
 
     return {
-        "static":        static,
-        "temporal":      temporal,
-        "visit_mask":    vm,
-        "temporal_mask": temporal_mask,
-        "static_mask":   static_mask,
+        "static":     static,
+        "temporal":   temporal,
+        "valid_flag": vf,
     }
 
 
 # ==================================================================
-# STATIC DISCRIMINATOR — Residual MLP con Feature Matching
+# STATIC DISCRIMINATOR
 # ==================================================================
 
 class _ResBlock(nn.Module):
@@ -172,12 +121,7 @@ class _ResBlock(nn.Module):
 
 
 class StaticDiscriminator(nn.Module):
-    """
-    Residual MLP con Spectral Norm e Feature Matching.
-
-    get_features(x) → [B, hidden]: usato per feature matching loss.
-    auxiliary_loss: cross-entropy per variabili con embedding (CENTRE).
-    """
+    """Residual MLP con Spectral Norm e Feature Matching."""
 
     def __init__(
         self,
@@ -192,8 +136,9 @@ class StaticDiscriminator(nn.Module):
             nn.utils.spectral_norm(nn.Linear(input_dim, hidden)),
             nn.LeakyReLU(0.2),
         )
-        self.res_blocks = nn.ModuleList([_ResBlock(hidden, dropout) for _ in range(static_layers)])
-        self.head       = nn.utils.spectral_norm(nn.Linear(hidden, 1))
+        self.res_blocks = nn.ModuleList(
+            [_ResBlock(hidden, dropout) for _ in range(static_layers)])
+        self.head = nn.utils.spectral_norm(nn.Linear(hidden, 1))
 
         self.aux_heads = nn.ModuleDict()
         if embed_var_categories:
@@ -213,7 +158,9 @@ class StaticDiscriminator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.get_features(x))
 
-    def auxiliary_loss(self, x_real: torch.Tensor, targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def auxiliary_loss(
+        self, x_real: torch.Tensor, targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
         if not self.aux_heads:
             return torch.tensor(0.0, device=x_real.device)
         losses = []
@@ -226,11 +173,10 @@ class StaticDiscriminator(nn.Module):
 
 
 # ==================================================================
-# CNN TEMPORAL DISCRIMINATOR
+# CNN TEMPORAL DISCRIMINATOR  [gretel-style]
 # ==================================================================
 
 class _TransposedConv(nn.Module):
-    """Wrapper [B,T,C] → Conv1d([B,C,T]) → [B,T,C]"""
     def __init__(self, conv):
         super().__init__()
         self.conv = conv
@@ -240,27 +186,16 @@ class _TransposedConv(nn.Module):
 
 
 class _DilatedCNNBlock(nn.Module):
-    """
-    Residual block Conv1D dilatato con Spectral Norm.
-
-    Con kernel=3 e dilation=2^i:
-      i=0 → RF=3, i=1 → RF=5, i=2 → RF=7 (copre T_avg=7 con 3 layer)
-    """
     def __init__(self, channels: int, kernel_size: int, dilation: int, dropout: float):
         super().__init__()
         pad = dilation * (kernel_size - 1) // 2
         self.block = nn.Sequential(
             nn.LayerNorm(channels),
-            _TransposedConv(
-                nn.utils.spectral_norm(
-                    nn.Conv1d(channels, channels, kernel_size, dilation=dilation, padding=pad)
-                )
-            ),
+            _TransposedConv(nn.utils.spectral_norm(
+                nn.Conv1d(channels, channels, kernel_size, dilation=dilation, padding=pad))),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
-            _TransposedConv(
-                nn.utils.spectral_norm(nn.Conv1d(channels, channels, 1))
-            ),
+            _TransposedConv(nn.utils.spectral_norm(nn.Conv1d(channels, channels, 1))),
         )
 
     def forward(self, x):
@@ -269,30 +204,20 @@ class _DilatedCNNBlock(nn.Module):
 
 class CNNTemporalDiscriminator(nn.Module):
     """
-    Discriminatore temporale CNN con dilatazioni esponenziali.
-
-    Architettura:
-      [B,T,D] → input_proj → [B,T,C]
-      → DilatedBlock(d=1) → DilatedBlock(d=2) → DilatedBlock(d=4)
-      → masked mean pooling → [B,C]
-      → concat [static] → MLP → score [B,1]
-
-    Vantaggi su T=7:
-      - Completamente parallelizzabile: 2-3x più veloce del GRU
-      - Nessuno stato nascosto: training più stabile in WGAN
-      - Receptive field = T_avg = 7 con soli 3 layer
+    CNN dilatata con attention pooling guidato da valid_flag.
+    Input: [B,T,temporal_dim] + valid_flag [B,T] bool.
     """
 
     def __init__(
         self,
-        static_dim:    int,
-        temporal_dim:  int,
-        hidden_dim:    int   = 64,
-        kernel_size:   int   = 3,
-        n_layers:      int   = 3,
-        dilation_base: int   = 2,
-        mlp_layers:    int   = 2,
-        dropout:       float = 0.1,
+        static_dim:   int,
+        temporal_dim: int,
+        hidden_dim:   int   = 64,
+        kernel_size:  int   = 3,
+        n_layers:     int   = 3,
+        dilation_base: int  = 2,
+        mlp_layers:   int   = 2,
+        dropout:      float = 0.1,
     ):
         super().__init__()
         self.input_proj = nn.Sequential(
@@ -303,18 +228,11 @@ class CNNTemporalDiscriminator(nn.Module):
             _DilatedCNNBlock(hidden_dim, kernel_size, dilation_base ** i, dropout)
             for i in range(n_layers)
         ])
-
-        # ── Attention pooling (NUOVO) ─────────────────────────
         self.attn = nn.Linear(hidden_dim, 1)
 
-        mlp  = []
-        d_in = hidden_dim + static_dim
-
+        mlp, d_in = [], hidden_dim + static_dim
         for _ in range(mlp_layers):
-            mlp.extend([
-                nn.utils.spectral_norm(nn.Linear(d_in, hidden_dim)),
-                nn.LeakyReLU(0.2),
-            ])
+            mlp += [nn.utils.spectral_norm(nn.Linear(d_in, hidden_dim)), nn.LeakyReLU(0.2)]
             if dropout > 0:
                 mlp.append(nn.Dropout(dropout))
             d_in = hidden_dim
@@ -323,123 +241,26 @@ class CNNTemporalDiscriminator(nn.Module):
 
     def forward(
         self,
-        static:        torch.Tensor,
-        temporal:      torch.Tensor,
-        visit_mask:    torch.Tensor,
-        temporal_mask: Optional[torch.Tensor] = None,
+        static:     torch.Tensor,   # [B, static_dim]
+        temporal:   torch.Tensor,   # [B, T, temporal_dim]
+        valid_flag: torch.Tensor,   # [B, T] bool
     ) -> torch.Tensor:
-        vm  = visit_mask.squeeze(-1) if visit_mask.dim() == 3 else visit_mask
-        x   = self.input_proj(temporal)
-        for block in self.cnn_blocks:
-            x = block(x)
-        '''
-        n_valid = vm.sum(dim=1, keepdim=True).clamp(min=1.0)
-        h       = (x * vm.unsqueeze(-1)).sum(dim=1) / n_valid
-        return self.mlp(torch.cat([static, h], dim=-1))
-        '''
-        # ── attention pooling (sostituisce mean pooling)
-        scores = self.attn(x).squeeze(-1)            # [B, T]
-
-        scores = scores.masked_fill(vm == 0, -1e9)   # ignora padding
-
-        weights = torch.softmax(scores, dim=1)       # [B, T]
-
-        h = (weights.unsqueeze(-1) * x).sum(dim=1)   # [B, hidden_dim]
-
-        # ── concat static + temporal summary
-        out = torch.cat([static, h], dim=-1)
-
-        return self.mlp(out)
-
-
-class CNNTemporalDiscriminator1(nn.Module):
-    """
-    Discriminatore temporale CNN con dilatazioni esponenziali
-    + attention pooling (più sensibile ai pattern longitudinali).
-    """
-
-    def __init__(
-        self,
-        static_dim:    int,
-        temporal_dim:  int,
-        hidden_dim:    int   = 64,
-        kernel_size:   int   = 3,
-        n_layers:      int   = 3,
-        dilation_base: int   = 2,
-        mlp_layers:    int   = 2,
-        dropout:       float = 0.1,
-    ):
-        super().__init__()
-
-        # ── Input projection ─────────────────────────────────
-        self.input_proj = nn.Sequential(
-            nn.utils.spectral_norm(nn.Linear(temporal_dim, hidden_dim)),
-            nn.LeakyReLU(0.2),
-        )
-
-        # ── CNN dilatata ─────────────────────────────────────
-        self.cnn_blocks = nn.ModuleList([
-            _DilatedCNNBlock(hidden_dim, kernel_size, dilation_base ** i, dropout)
-            for i in range(n_layers)
-        ])
-
-        # ── Attention pooling (NUOVO) ─────────────────────────
-        self.attn = nn.Linear(hidden_dim, 1)
-
-        # ── MLP finale ───────────────────────────────────────
-        mlp  = []
-        d_in = hidden_dim + static_dim
-
-        for _ in range(mlp_layers):
-            mlp.extend([
-                nn.utils.spectral_norm(nn.Linear(d_in, hidden_dim)),
-                nn.LeakyReLU(0.2),
-            ])
-
-            if dropout > 0:
-                mlp.append(nn.Dropout(dropout))
-
-            d_in = hidden_dim
-
-        mlp.append(nn.utils.spectral_norm(nn.Linear(d_in, 1)))
-        self.mlp = nn.Sequential(*mlp)
-
-    def forward(
-        self,
-        static:        torch.Tensor,
-        temporal:      torch.Tensor,
-        visit_mask:    torch.Tensor,
-        temporal_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-
-        vm = visit_mask.squeeze(-1) if visit_mask.dim() == 3 else visit_mask
-
-        # ── input projection
         x = self.input_proj(temporal)
-
-        # ── dilated CNN
         for block in self.cnn_blocks:
             x = block(x)
 
-        # ── attention pooling (sostituisce mean pooling)
-        scores = self.attn(x).squeeze(-1)            # [B, T]
+        # Attention pooling: ignora step di padding via valid_flag
+        scores = self.attn(x).squeeze(-1)                        # [B,T]
+        scores = scores.masked_fill(~valid_flag, -1e9)
+        weights = torch.softmax(scores, dim=1)                   # [B,T]
+        h = (weights.unsqueeze(-1) * x).sum(dim=1)              # [B, H]
 
-        scores = scores.masked_fill(vm == 0, -1e9)   # ignora padding
+        return self.mlp(torch.cat([static, h], dim=-1))
 
-        weights = torch.softmax(scores, dim=1)       # [B, T]
-
-        h = (weights.unsqueeze(-1) * x).sum(dim=1)   # [B, hidden_dim]
-
-        # ── concat static + temporal summary
-        out = torch.cat([static, h], dim=-1)
-
-        return self.mlp(out)
-
-# ==================================================================
-# GRU TEMPORAL DISCRIMINATOR  (retrocompatibilità v5)
-# ==================================================================
 
 class GRUTemporalDiscriminator(nn.Module):
+    """GRU-based discriminatore (retrocompatibilità)."""
+
     def __init__(
         self,
         static_dim:     int,
@@ -451,7 +272,7 @@ class GRUTemporalDiscriminator(nn.Module):
         dropout:        float = 0.1,
     ):
         super().__init__()
-        self.gru  = nn.GRU(
+        self.gru = nn.GRU(
             input_size  = temporal_dim,
             hidden_size = gru_hidden_dim,
             num_layers  = gru_layers,
@@ -459,27 +280,24 @@ class GRUTemporalDiscriminator(nn.Module):
             dropout     = dropout if gru_layers > 1 else 0.0,
         )
         self.attn = nn.Linear(gru_hidden_dim, 1)
-        mlp       = []
-        d         = gru_hidden_dim + static_dim
+        mlp, d = [], gru_hidden_dim + static_dim
         for _ in range(mlp_layers):
-            mlp.extend([
-                nn.utils.spectral_norm(nn.Linear(d, mlp_hidden_dim)),
-                nn.LeakyReLU(0.2),
-            ])
+            mlp += [nn.utils.spectral_norm(nn.Linear(d, mlp_hidden_dim)), nn.LeakyReLU(0.2)]
             if dropout > 0:
                 mlp.append(nn.Dropout(dropout))
             d = mlp_hidden_dim
         mlp.append(nn.utils.spectral_norm(nn.Linear(d, 1)))
         self.mlp = nn.Sequential(*mlp)
 
-    def forward(self, static, temporal, visit_mask, temporal_mask=None):
+    def forward(self, static, temporal, valid_flag):
         h_seq, _ = self.gru(temporal)
-        vm       = visit_mask.squeeze(-1) if visit_mask.dim() == 3 else visit_mask
-        logits   = self.attn(h_seq).squeeze(-1)
-        masked   = logits.masked_fill(vm == 0, float("-inf"))
-        all_pad  = (vm.sum(dim=1) == 0).unsqueeze(-1)
-        safe     = torch.where(all_pad.expand_as(masked), torch.zeros_like(masked), masked)
-        weights  = torch.softmax(safe, dim=1)
+        scores   = self.attn(h_seq).squeeze(-1)
+        scores   = scores.masked_fill(~valid_flag, float("-inf"))
+        # Gestione batch con tutti padding (non dovrebbe accadere post-imputation)
+        all_pad  = (~valid_flag).all(dim=1, keepdim=True)
+        scores   = torch.where(all_pad.expand_as(scores),
+                               torch.zeros_like(scores), scores)
+        weights  = torch.softmax(scores, dim=1)
         h        = (weights.unsqueeze(-1) * h_seq).sum(dim=1)
         return self.mlp(torch.cat([static, h], dim=-1))
 
@@ -491,43 +309,35 @@ class GRUTemporalDiscriminator(nn.Module):
 def TemporalDiscriminator(
     static_dim:   int,
     temporal_dim: int,
-    model_config=None,
+    model_config  = None,
     **kwargs,
 ):
-    """
-    Factory: restituisce CNNTemporalDiscriminator o GRUTemporalDiscriminator
-    in base a model_config.temporal_discriminator.arch.
-
-    Se model_config è None, usa kwargs (retrocompat diretta).
-    """
-    td = getattr(model_config, "temporal_discriminator", None) if model_config else None
+    td   = getattr(model_config, "temporal_discriminator", None) if model_config else None
     arch = getattr(td, "arch", kwargs.pop("arch", "cnn")).lower()
 
-    def _get(key, default):
+    def _g(key, default):
         return getattr(td, key, kwargs.pop(key, default)) if td else kwargs.pop(key, default)
 
     if arch == "cnn":
         return CNNTemporalDiscriminator(
             static_dim    = static_dim,
             temporal_dim  = temporal_dim,
-            hidden_dim    = _get("hidden_dim",    64),
-            kernel_size   = _get("kernel_size",    3),
-            n_layers      = _get("n_layers",       3),
-            dilation_base = _get("dilation_base",  2),
-            mlp_layers    = _get("mlp_layers",     2),
-            dropout       = _get("dropout",       0.1),
+            hidden_dim    = _g("hidden_dim",    64),
+            kernel_size   = _g("kernel_size",    3),
+            n_layers      = _g("n_layers",       3),
+            dilation_base = _g("dilation_base",  2),
+            mlp_layers    = _g("mlp_layers",     2),
+            dropout       = _g("dropout",       0.1),
         )
     elif arch == "gru":
         return GRUTemporalDiscriminator(
             static_dim     = static_dim,
             temporal_dim   = temporal_dim,
-            mlp_hidden_dim = _get("mlp_hidden_dim", 128),
-            gru_hidden_dim = _get("gru_hidden_dim",  64),
-            gru_layers     = _get("gru_layers",       2),
-            mlp_layers     = _get("mlp_layers",       2),
-            dropout        = _get("dropout",         0.1),
+            mlp_hidden_dim = _g("mlp_hidden_dim", 128),
+            gru_hidden_dim = _g("gru_hidden_dim",  64),
+            gru_layers     = _g("gru_layers",       2),
+            mlp_layers     = _g("mlp_layers",       2),
+            dropout        = _g("dropout",         0.1),
         )
     else:
-        raise ValueError(
-            f"temporal_discriminator.arch deve essere 'cnn' o 'gru'. Ricevuto: '{arch}'"
-        )
+        raise ValueError(f"arch deve essere 'cnn' o 'gru'. Ricevuto: '{arch}'")

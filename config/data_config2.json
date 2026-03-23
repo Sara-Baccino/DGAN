@@ -1,0 +1,170 @@
+{
+  "time": {
+    "max_visits": 9,
+    "visit_column": "MONTHS_FROM_BASELINE",
+    "patient_id": "RECORD_ID",
+    "fup_column": "t_FUP",
+    "min_visits": 2
+  },
+
+  "preprocessing": {
+    "mice_max_iter": 5,
+    "knn_neighbors": 5,
+    "log_vars": ["ALP", "ALT", "AST", "BIL", "GGT", "CRE", "TRIGVAL"],
+    "clip_z": 4.0
+  },
+
+  "baseline": {
+    "continuous": [
+      {"name": "AGE",        "type": "float"},
+      {"name": "HEIGHT",     "type": "float"},
+      {"name": "WEIGHT",     "type": "float"},
+      {"name": "TAUDCADOSE", "type": "float"},
+      {"name": "t_FUP",      "type": "float"},
+      {"name": "INRPTVAL",   "type": "float"},
+      {"name": "CRE",        "type": "float"},
+      {"name": "SOD",        "type": "float"},
+      {"name": "TCHVAL",     "type": "float"},
+      {"name": "HDLVAL",     "type": "float"},
+      {"name": "LDLVAL",     "type": "float"},
+      {"name": "TRIGVAL",    "type": "float"},
+      {"name": "GLUCVAL",    "type": "float"},
+      {"name": "WBCVAL",     "type": "float"},
+      {"name": "NEUTVAL",    "type": "float"},
+      {"name": "LINFVAL",    "type": "float"},
+      {"name": "VITDVAL",    "type": "float"},
+      {"name": "t_DEATH",    "type": "float"},
+      {"name": "t_TRANSP",   "type": "float"},
+      {"name": "t_HEPC",     "type": "float"},
+      {"name": "t_VARB",     "type": "float"},
+      {"name": "t_ENCP",     "type": "float"},
+      {"name": "t_ASCT",     "type": "float"},
+      {"name": "t_ESOVAR",   "type": "float"}
+    ],
+
+    "categorical": {
+      "SEX":            {"type": "int", "mapping": {"1": 1, "2": 2}},
+      "ETHNICC":        {"type": "int", "mapping": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}},
+      "CENTRE": {
+        "type": "string",
+        "mapping": {
+          "PBC0001": 1,  "PBC0002": 2,  "PBC0003": 3,  "PBC0004": 4,  "PBC0005": 5,
+          "PBC0006": 6,  "PBC0007": 7,  "PBC0008": 8,  "PBC0011": 9,  "PBC0014": 10,
+          "PBC0015": 11, "PBC0016": 12, "PBC0019": 13, "PBC0022": 14, "PBC0023": 15,
+          "PBC0024": 16, "PBC0025": 17, "PBC0026": 18, "PBC0027": 19, "PBC0029": 20,
+          "PBC0031": 21, "PBC0032": 22, "PBC0033": 23, "PBC0035": 24, "PBC0038": 25,
+          "PBC0039": 26, "PBC0041": 27, "PBC0043": 28, "PBC0044": 29, "PBC0045": 30,
+          "PBC0046": 31, "PBC0047": 32, "PBC0050": 33, "PBC0052": 34, "PBC0053": 35,
+          "PBC0055": 36, "PBC0058": 37, "PBC0062": 38, "PBC0063": 39, "PBC0065": 40,
+          "PBC0067": 41, "PBC0068": 42, "PBC0070": 43, "PBC0071": 44, "PBC0074": 45,
+          "PBC0075": 46, "PBC0084": 47, "PBC0087": 48, "PBC0088": 49
+        }
+      },
+      "ALCOHOL":           {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
+      "SMOKING":           {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
+      "Risk_Level_Label":  {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
+      "INRPT":             {"type": "int", "mapping": {"1": 1, "2": 2}},
+      "DEATH":             {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "TRANSP":            {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "WDRAWYN":           {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "DEATHRYN":          {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "HEPC":              {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "ESOVAR":            {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "ASCT":              {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "VARB":              {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "ENCP":              {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMBND":             {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMBIND":            {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMBOS":             {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMBOD":             {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMBPD":             {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMDAI":             {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMDMET":            {"type": "int", "mapping": {"0": 1, "1": 2}},
+      "CMDCV":             {"type": "int", "mapping": {"0": 1, "1": 2}}
+    }
+  },
+
+  "followup": {
+    "continuous": [
+      {"name": "ALB", "type": "float"},
+      {"name": "ALP", "type": "float"},
+      {"name": "ALT", "type": "float"},
+      {"name": "AST", "type": "float"},
+      {"name": "BIL", "type": "float"},
+      {"name": "GGT", "type": "float"},
+      {"name": "PLC", "type": "float"}
+    ]
+  },
+
+  "outcomes": ["DEATH", "TRANSP"],
+
+  "model": {
+    "z_static_dim":   64,
+    "z_temporal_dim": 48,
+    "hidden":         64,
+
+    "epochs":     600,
+    "patience":   450,
+    "batch_size":  128,
+    "lr_g":    1e-4,
+    "lr_d_s":  1e-4,
+    "lr_d_t":  5e-5,
+
+    "optimizer_betas":       [0.5, 0.9],
+    "dataloader_drop_last":  true,
+
+    "generator": {
+      "arch":          "gru",
+      "hidden_dim":    64,
+      "n_layers":        2,
+      "bidirectional": true,
+      "dropout":       0.2,
+      "z_static_dim":   64,
+      "z_temporal_dim": 48
+    },
+
+    "static_discriminator": {
+      "static_layers":  4,
+      "mlp_hidden_dim": 128,
+      "dropout":        0.1
+    },
+
+    "temporal_discriminator": {
+      "arch":         "cnn",
+      "hidden_dim":   96,
+      "kernel_size":    3,
+      "n_layers":       4,
+      "dilation_base":  2,
+      "mlp_layers":     3,
+      "dropout":       0.1
+    },
+
+    "noise_std":     0.1,
+    "noise_ar_rho":  0,
+    "grad_clip":     3.5,
+    "use_dp":        false,
+
+    "critic_steps":          5,
+    "critic_steps_temporal": 3,
+
+    "gumbel_temperature_start": 0.85,
+    "temperature_min":          0.5,
+
+    "lambda_gp_s": 12,
+    "lambda_gp_t": 12,
+
+    "alpha_irr":        0.4,
+    "lambda_aux":       0.2,
+    "lambda_fup":       1.5,
+    "lambda_nv":        1.0,
+    "lambda_static_cat": 5,
+    "lambda_fm":         0.5,
+    "lambda_var":       7,
+    "lambda_interval":  10,
+
+    "ema_decay": 0.999,              
+    "instance_noise_start": 0.05,    
+    "instance_noise_end": 0.0,       
+    "lambda_scat_warmup_epochs": 30 
+  }
+}

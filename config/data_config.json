@@ -137,76 +137,79 @@
   "outcomes": ["DEATH", "TRANSP"],
 
   "model": {
-    "z_static_dim": 96,
-    "z_temporal_dim": 48,
+    "z_static_dim": 64,
+    "z_temporal_dim": 32,
     "hidden": 128,
-    "epochs": 500,
-    "patience": 300,
-    "batch_size": 128,
+    "epochs": 250,
+    "patience": 100,
+    "batch_size": 64,
     "lr_g": 0.0001,
-    "lr_d_s": 0.0001,
-    "lr_d_t": 0.00005,
+    "lr_d_s": 0.0003,
+    "lr_d_t": 0.0001,
 
     "generator": {
       "arch": "gru",
-      "hidden_dim": 128,
+      "hidden_dim": 64,
       "n_layers": 2,
       "bidirectional": true,
-      "dropout": 0.1,
-      "z_static_dim": 96,
-      "z_temporal_dim": 48
+      "dropout": 0.2,
+      "z_static_dim": 64,
+      "z_temporal_dim": 32
     },
 
     "static_discriminator": {
-      "static_layers": 4,
+      "static_layers": 2,
       "mlp_hidden_dim": 128,
-      "dropout": 0.05
+      "dropout": 0.2
     },
 
     "temporal_discriminator": {
       "arch": "cnn",
-      "hidden_dim": 96,
+      "hidden_dim": 64,
       "kernel_size": 3,
-      "n_layers": 4,
+      "n_layers": 2,
       "dilation_base": 2,
       "mlp_layers": 3,
       "dropout": 0.1
     },
 
     "noise_std": 0.1,
-    "grad_clip": 3.5,
+    "grad_clip": 3,
     "use_dp": false,
     "force_full_mask": false,
     "regular": true,
 
-    "critic_steps": 3,
+    "critic_steps": 2,
     "critic_steps_temporal": 1,
 
     "gumbel_temperature_start": 1.0,
     "temperature_min": 0.5,
 
-    "lambda_gp": 4,
+    "lambda_gp": 15,
     "lambda_gp_s": 4,
-    "lambda_gp_t": 2,
+    "lambda_gp_t": 15,
 
     "alpha_irr": 1,
     "lambda_aux": 0.2,
 
     "lambda_freq_gen": 0,
-    "lambda_freq_disc": 0.1,
+    "lambda_freq_disc": 0,
     "freq_weight_power": 1,
 
-    "lambda_fm": 1,
-    "lambda_nv": 2,
+    "lambda_fm": 0,
+    "lambda_nv": 0,
     "lambda_fc": 0,
     "lambda_fup": 2,
-    "lambda_static_cat": 0,
-    "lambda_sc_var": 5.0,
-    "lambda_ivi": 6,
+    "lambda_static_cat": 2,
+    "lambda_sc_var": 0,
+    "lambda_ivi": 2,
     "lambda_coverage": 0,
-    "lambda_uniformity": 0,
+    "lambda_uniformity": 1,
 
     "n_visits_sharpness": 10,
-    "fixed_visits": null
+    "fixed_visits": null,
+
+    "warmup_mask_frac":   0.30,
+    "finetune_mask_frac": 0.10
   }
 }

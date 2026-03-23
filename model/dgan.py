@@ -1,59 +1,54 @@
 """
-model/dgan.py  [v9]
+model/dgan.py  [v2-fully-parametrized]
 ================================================================================
-Modifiche rispetto a v8:
+Rispetto alla versione precedente:
 
-  1. StructuredTemporalNoise integrato:
-     DGAN._generate_fake() usa generator.sample_noise() invece di
-     torch.randn(...) per z_temporal. I parametri rho, sigma_* del
-     noise_model sono nell'optimizer del generatore e vengono logghati.
+  [NUOVO] lambda_var — loss sulla varianza delle feature continue temporali:
+    Per ogni feature continua temporale, penalizza la differenza di std
+    tra dati reali e fake, calcolata solo sugli step valid_flag=True.
+    Questo forza il modello a riprodurre l'eterogeneità tra pazienti, non
+    solo la media. Critico per PBC dove la varianza inter-paziente è alta.
 
-  2. Curriculum learning sulla visit_mask:
-     DGAN.fit() calcola curriculum_p ad ogni epoca e chiama
-     generator.set_curriculum_p(p). Schedule:
-       - Epoche [0, warmup_mask]:        p=0.0 (sempre real n_visits)
-       - Epoche [warmup_mask, T-fine]:   p cresce linearmente da 0 a 1
-       - Epoche [T-fine, T]:             p=1.0 (sempre pred n_visits)
-     Controllato da:
-       warmup_mask_frac:  frazione epoche con p=0 (default 0.20)
-       finetune_mask_frac: frazione epoche con p=1 (default 0.15)
+  [NUOVO] Stampe di training più informative:
+    - Media e std delle prime feature continue (biomarker principali)
+    - Confronto real vs fake per followup_norm e n_visits
+    - Percentuale di pazienti con n_visits > 1
 
-  3. Logging arricchito:
-     Ogni N epoche stampa i parametri del noise_model:
-       rho, w_global, w_ar, w_episod, curriculum_p
+  [NUOVO] Tutti i parametri da model_config (zero hardcoded):
+    - optimizer_betas letti da model_config.optimizer_betas
+    - dataloader_drop_last da model_config.dataloader_drop_last
+    - noise_ar_rho dal generator (model_config.noise_ar_rho)
 
-  4. z_static_dim coerente:
-     sample_noise() usa model_config.z_static_dim (non più da data_config).
+  [NUOVO] Campionamento rumore AR via generator.sample_noise():
+    Il generatore ora ha sample_noise() che produce z_t AR se noise_ar_rho > 0.
+    Usato in _generate_fake() invece di torch.randn diretto.
 
-  5. Tutto il resto invariato rispetto a v8.
+  [NUOVO] Gestione errori espliciti:
+    - Errore se DataLoader è vuoto
+    - Warning se batch troppo piccolo per WGAN-GP
+    - Warning se le loss divergono (NaN/Inf)
+
+  [INVARIATO]
+    - WGAN-GP come loss dominante
+    - Loss ausiliarie: irr, fup, nv, scat, fm
+    - Early stopping
+    - Save/Load
 ================================================================================
 """
 
+import warnings
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, List
 import numpy as np
 import logging
 
-from model.generator     import HierarchicalGenerator
+from model.generator    import DGANGenerator
 from model.discriminator import (
     StaticDiscriminator, TemporalDiscriminator,
     prepare_discriminator_inputs,
-)
-from utils.losses import (
-    wgan_discriminator_loss, wgan_generator_loss,
-    gradient_penalty, irreversibility_loss,
-    compute_category_weights,
-    categorical_frequency_loss_generator,
-    categorical_frequency_loss_discriminator,
-    followup_norm_loss,
-    feature_matching_loss,
-    n_visits_supervision_loss,
-    static_cat_marginal_loss,
-    static_cont_dist_loss,
-    inter_visit_interval_loss,
-    inter_visit_uniformity_loss,
 )
 
 try:
@@ -61,10 +56,186 @@ try:
     OPACUS_AVAILABLE = True
 except ImportError:
     OPACUS_AVAILABLE = False
-    logging.warning("Opacus not available — DP disabled.")
 
 logger = logging.getLogger(__name__)
 
+
+# ==================================================================
+# LOSS UTILITIES
+# ==================================================================
+
+def _wgan_d_loss(real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+    return fake.mean() - real.mean()
+
+def _wgan_g_loss(fake_s: torch.Tensor, fake_t: torch.Tensor) -> torch.Tensor:
+    return -(fake_s.mean() + fake_t.mean())
+
+def _gradient_penalty(
+    disc_fn, real: torch.Tensor, fake: torch.Tensor, device
+) -> torch.Tensor:
+    B    = real.shape[0]
+    eps  = torch.rand(B, *([1] * (real.dim() - 1)), device=device)
+    interp = (eps * real + (1 - eps) * fake).requires_grad_(True)
+    out    = disc_fn(interp)
+    grads  = torch.autograd.grad(
+        out, interp,
+        grad_outputs=torch.ones_like(out),
+        create_graph=True, retain_graph=True)[0]
+    return ((grads.norm(2, dim=1) - 1) ** 2).mean()
+
+def _dist_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Penalizza differenza di media e deviazione standard (distribuzione)."""
+    loss  = (pred.mean() - target.mean()).pow(2)
+    loss += (pred.std()  - target.std() ).pow(2).clamp(min=1e-6)
+    return loss
+
+def _var_loss(
+    fake_cont:    torch.Tensor,   # [B, T, n_cont]
+    real_cont:    torch.Tensor,   # [B, T, n_cont]
+    fake_valid:   torch.Tensor,   # [B, T] bool
+    real_valid:   torch.Tensor,   # [B, T] bool
+) -> torch.Tensor:
+    """
+    Penalizza la differenza di deviazione standard per ogni feature continua
+    temporale, calcolata solo sugli step validi (non padding).
+    Forza il generatore a riprodurre la varianza inter-paziente e intra-paziente.
+    """
+    n_cont = fake_cont.shape[-1]
+    if n_cont == 0:
+        return torch.tensor(0.0, device=fake_cont.device)
+
+    losses = []
+    for j in range(n_cont):
+        f_vals = fake_cont[:, :, j][fake_valid]   # valori flat fake validi
+        r_vals = real_cont[:, :, j][real_valid]   # valori flat real validi
+
+        if len(f_vals) < 2 or len(r_vals) < 2:
+            continue
+
+        # Std complessiva (inter + intra paziente combinata)
+        loss_j = (f_vals.std() - r_vals.std()).pow(2)
+
+        # Std intra-paziente (per ogni paziente, media della std)
+        f_std_intra = torch.stack([
+            fake_cont[b, :, j][fake_valid[b]].std()
+            for b in range(fake_cont.shape[0])
+            if fake_valid[b].sum() > 1
+        ]) if any(fake_valid[b].sum() > 1 for b in range(fake_cont.shape[0])) \
+          else torch.zeros(1, device=fake_cont.device)
+
+        r_std_intra = torch.stack([
+            real_cont[b, :, j][real_valid[b]].std()
+            for b in range(real_cont.shape[0])
+            if real_valid[b].sum() > 1
+        ]) if any(real_valid[b].sum() > 1 for b in range(real_cont.shape[0])) \
+          else torch.zeros(1, device=real_cont.device)
+
+        if len(f_std_intra) > 0 and len(r_std_intra) > 0:
+            loss_j = loss_j + (f_std_intra.mean() - r_std_intra.mean()).pow(2)
+
+        losses.append(loss_j)
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=fake_cont.device)
+
+def _irr_loss(irr_states: torch.Tensor, valid_flag: torch.Tensor) -> torch.Tensor:
+    """Penalizza transizioni 1→0 (irreversibili devono solo crescere)."""
+    diff = irr_states[:, 1:] - irr_states[:, :-1]
+    vf   = valid_flag[:, 1:].float()
+    return (torch.clamp(-diff, min=0) * vf).mean()
+
+def _interval_loss(
+    fake_times: torch.Tensor,   # [B, T] visit_times (normalizzati [0,1])
+    real_times: torch.Tensor,   # [B, T] visit_times (normalizzati [0,1])
+    fake_valid: torch.Tensor,   # [B, T] bool
+    real_valid: torch.Tensor,   # [B, T] bool
+) -> torch.Tensor:
+    """
+    Penalizza la differenza di distribuzione degli intervalli inter-visita.
+    Opera sui tempi normalizzati [0,1] per essere scale-invariante.
+
+    Strategia:
+      1. Calcola delta[b,t] = time[b,t] - time[b,t-1] per ogni paziente
+      2. Confronta media e std degli intervalli fake vs reali
+      3. Penalizza anche se la std degli intervalli fake è troppo piccola
+         (il generatore tende a collassare su intervalli uniformi corti)
+
+    Questa loss è il fix diretto al problema delle traiettorie piatte:
+    forza il modello a imparare la distribuzione degli intervalli reali
+    (es. ~10 mesi in PBC) invece di comprimerli tutti verso 0.
+    """
+    def _get_intervals(times, valid):
+        intervals = []
+        B = times.shape[0]
+        for b in range(B):
+            idx = valid[b].nonzero(as_tuple=True)[0]
+            if len(idx) < 2:
+                continue
+            t = times[b, idx]         # tempi delle visite valide
+            d = t[1:] - t[:-1]        # intervalli
+            d = d.clamp(min=0.0)      # no intervalli negativi
+            if d.numel() > 0:
+                intervals.append(d)
+        if not intervals:
+            return None
+        return torch.cat(intervals)
+
+    f_iv = _get_intervals(fake_times, fake_valid)
+    r_iv = _get_intervals(real_times, real_valid)
+
+    if f_iv is None or r_iv is None or len(f_iv) < 2 or len(r_iv) < 2:
+        return torch.tensor(0.0, device=fake_times.device)
+
+    # Differenza di media
+    loss = (f_iv.mean() - r_iv.mean()).pow(2)
+
+    # Differenza di std (cruciale: il generatore tende a std troppo bassa)
+    f_std = f_iv.std().clamp(min=1e-6)
+    r_std = r_iv.std().clamp(min=1e-6)
+    loss  = loss + (f_std - r_std).pow(2)
+
+    # Penalità asimmetrica se gli intervalli fake sono sistematicamente
+    # più corti di quelli reali (il problema diagnosticato nel report)
+    if f_iv.mean() < r_iv.mean() * 0.5:
+        undershoot = (r_iv.mean() - f_iv.mean()) / (r_iv.mean() + 1e-8)
+        loss = loss + undershoot.pow(2)
+
+    return loss
+
+
+def _scat_marginal_loss(
+    fake_soft: Dict[str, torch.Tensor],
+    target_probs: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    losses = []
+    for name, soft in fake_soft.items():
+        if name not in target_probs:
+            continue
+        pred_p = soft.mean(dim=0)
+        tgt_p  = target_probs[name]
+        losses.append(F.kl_div(
+            pred_p.clamp(min=1e-8).log(),
+            tgt_p.clamp(min=1e-8),
+            reduction="sum",
+        ))
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0)
+
+
+def _check_finite(loss: torch.Tensor, name: str) -> torch.Tensor:
+    """Controlla NaN/Inf nelle loss e restituisce 0 con warning."""
+    if not torch.isfinite(loss):
+        warnings.warn(
+            f"Loss '{name}' non è finita ({loss.item():.4f}). "
+            f"Verrà sostituita con 0. Controlla lr, lambda, o la stabilità del training.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return torch.zeros_like(loss)
+    return loss
+
+
+# ==================================================================
+# DGAN
+# ==================================================================
 
 class DGAN:
 
@@ -74,145 +245,175 @@ class DGAN:
         self.preprocessor = preprocessor
         self.device       = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.static_dim   = self._calculate_static_dim()
-        self.temporal_dim = (
-            data_config.n_temp_cont
-            + sum(
-                2 if v.irreversible else len(v.mapping)
-                for v in preprocessor.vars
-                if not v.static and v.kind == "categorical"
-            )
-            + 1   # visit time feature
-        )
         self.max_len          = data_config.max_len
         self.irreversible_idx = data_config.irreversible_idx
+
+        self.static_dim   = self._calc_static_dim()
+        self.temporal_dim = self._calc_temporal_dim()
 
         self.embed_var_categories: Dict[str, int] = {}
         for var_name in preprocessor.embedding_configs:
             var = next((v for v in data_config.static_cat if v.name == var_name), None)
-            if var is not None:
+            if var:
                 self.embed_var_categories[var_name] = len(var.mapping)
+
+        # ── Lambda: tutti da model_config ─────────────────────────────
+        mc = model_config
+        self.lambda_gp_s  = float(mc.lambda_gp_s)
+        self.lambda_gp_t  = float(mc.lambda_gp_t)
+        self.lambda_irr   = float(mc.alpha_irr)
+        self.lambda_fup   = float(mc.lambda_fup)
+        self.lambda_nv    = float(mc.lambda_nv)
+        self.lambda_scat  = float(mc.lambda_static_cat)
+        self.lambda_fm    = float(mc.lambda_fm)
+        self.lambda_var      = float(mc.lambda_var)   # varianza feature continue
+        self.lambda_interval = float(getattr(mc, "lambda_interval", 2.0))  # intervalli inter-visita
+        self.lambda_aux   = float(mc.lambda_aux)
+
+        self.current_temperature = float(mc.gumbel_temperature_start)
+        self.temperature_min     = float(mc.temperature_min)
+
+        # ── EMA generatore ────────────────────────────────────────────
+        self.ema_decay = float(mc.ema_decay)
+        self.ema_generator = None   # inizializzato in _build_model dopo che il generatore esiste
+
+        # ── Instance noise sulle OHE reali (anti-collapse) ────────────
+        self.instance_noise_start = float(mc.instance_noise_start)
+        self.instance_noise_end   = float(mc.instance_noise_end)
+        self._current_epoch       = 0   # tracciato in fit()
+
+        # ── Lambda_scat warmup ────────────────────────────────────────
+        self.lambda_scat_warmup_epochs = int(mc.lambda_scat_warmup_epochs)
+
+        self.target_probs_static: Dict[str, torch.Tensor] = {}
 
         self._build_model()
 
-        self.privacy_engine        = None
-        self.current_temperature   = model_config.gumbel_temperature_start
-        self.temperature_min       = model_config.temperature_min
-        self.teacher_forcing_prob  = 1.0
-        self.teacher_forcing_decay = 0.995
-        self.alpha_irr_start = 0.1
-        self.alpha_irr_max   = model_config.alpha_irr
-        self.alpha_irr       = self.alpha_irr_start
-
-        self.lambda_aux        = getattr(model_config, "lambda_aux",        0.2)
-        self.lambda_gp_s       = getattr(model_config, "lambda_gp_s",       4.0)
-        self.lambda_gp_t       = getattr(model_config, "lambda_gp_t",       3.0)
-        self.lambda_freq_gen   = getattr(model_config, "lambda_freq_gen",    0.15)
-        self.lambda_freq_disc  = getattr(model_config, "lambda_freq_disc",   0.05)
-        self.freq_weight_power = getattr(model_config, "freq_weight_power",  1.0)
-        self.cat_weights: Dict[str, torch.Tensor] = {}
-        self.lambda_fm         = getattr(model_config, "lambda_fm",          0.0)
-        self.lambda_fup        = getattr(model_config, "lambda_fup",         2.0) or 2.0
-        self.lambda_nv         = getattr(model_config, "lambda_nv",          2.0) or 2.0
-        self.lambda_coverage   = getattr(model_config, "lambda_coverage",    5.0) or 5.0
-        self.lambda_static_cat = getattr(model_config, "lambda_static_cat", 12.0) or 12.0
-        self.lambda_ivi        = getattr(model_config, "lambda_ivi",         18.0) or 18.0
-        self.lambda_uniformity = getattr(model_config, "lambda_uniformity",   5.0) or 5.0
-
-        # [v9] Curriculum schedule per la visit_mask
-        self.warmup_mask_frac   = getattr(model_config, "warmup_mask_frac",   0.20)
-        self.finetune_mask_frac = getattr(model_config, "finetune_mask_frac", 0.15)
-        self._current_curriculum_p = 0.0
-
-        self.target_probs_static: Dict[str, torch.Tensor] = {}
-        self.real_intervals: Optional[torch.Tensor] = None
-        self._warned_no_soft = False
-
-        self.loss_history = {
-            "generator":[], "disc_static":[], "disc_temporal":[],
-            "irreversibility":[], "gp_static":[], "gp_temporal":[],
-            "aux_embed":[], "alpha_irr":[], "epsilon":[],
-            "freq_gen":[], "freq_disc":[], "mean_n_visits":[],
-            "nv_loss":[], "fm_loss":[], "fup_loss":[],
-            "static_cat_loss":[], "ivi_loss":[], "coverage_loss":[],
-            "uniformity_loss":[], "curriculum_p":[],
-            "noise_rho":[], "noise_w_global":[], "noise_w_ar":[], "noise_w_episod":[],
+        self.loss_history: Dict[str, List] = {
+            "generator":     [], "disc_static": [], "disc_temporal": [],
+            "gp_static":     [], "gp_temporal": [],
+            "irr_loss":      [], "fup_loss":    [], "nv_loss":       [],
+            "scat_loss":     [], "fm_loss":     [], "aux_loss":      [],
+            "var_loss":      [],
+            "interval_loss": [],   # distribuzione intervalli inter-visita
+            "mean_n_visits": [],
+            # Statistiche per monitoring clinico
+            "fake_cont_mean": [], "real_cont_mean": [],
+            "fake_cont_std":  [], "real_cont_std":  [],
         }
 
-    def _calculate_static_dim(self) -> int:
+    # ─────────────────────────────────────────────────────────────────
+
+    def _calc_static_dim(self) -> int:
         dim = self.data_config.n_static_cont
         for i, k in enumerate(self.data_config.n_static_cat):
-            if self.data_config.static_cat[i].name not in self.preprocessor.embedding_configs:
+            name = self.data_config.static_cat[i].name
+            if name not in self.preprocessor.embedding_configs:
                 dim += k
-        for var_name, embed_dim in self.preprocessor.embedding_configs.items():
-            var = next((v for v in self.data_config.static_cat if v.name == var_name), None)
-            if var and var.static:
-                dim += embed_dim
+            else:
+                dim += self.preprocessor.embedding_configs[name]
+        return dim
+
+    def _calc_temporal_dim(self) -> int:
+        dim = self.data_config.n_temp_cont
+        for v in self.preprocessor.vars:
+            if v.static or v.kind != "categorical":
+                continue
+            dim += 2 if v.irreversible else len(v.mapping)
+        dim += 1   # followup_norm
         return dim
 
     def _build_model(self):
-        self.generator = HierarchicalGenerator(
-            data_config=self.data_config, preprocessor=self.preprocessor,
-            z_static_dim=self.model_config.z_static_dim,
-            z_temporal_dim=self.model_config.z_temporal_dim,
-            hidden_dim=self.model_config.generator.hidden_dim,
-            gru_layers=self.model_config.generator.gru_layers,
-            dropout=self.model_config.generator.dropout,
-            n_visits_sharpness=getattr(self.model_config, "n_visits_sharpness", 10.0),
-            n_transformer_layers=self.model_config.generator.n_transformer_layers,
-            n_heads=self.model_config.generator.n_heads,
-            pe_frequencies=self.model_config.generator.pe_frequencies,
+        mc = self.model_config
+
+        self.generator = DGANGenerator(
+            data_config    = self.data_config,
+            preprocessor   = self.preprocessor,
+            z_static_dim   = mc.z_static_dim,
+            z_temporal_dim = mc.z_temporal_dim,
+            hidden_dim     = mc.generator.hidden_dim,
+            n_layers       = mc.generator.n_layers,
+            dropout        = mc.generator.dropout,
+            noise_ar_rho   = mc.noise_ar_rho,
+            min_visits     = self.data_config.min_visits,   # da DataConfig
         ).to(self.device)
 
         self.disc_static = StaticDiscriminator(
-            input_dim=self.static_dim,
-            hidden=self.model_config.static_discriminator.mlp_hidden_dim,
-            static_layers=self.model_config.static_discriminator.static_layers,
-            dropout=self.model_config.static_discriminator.dropout,
-            embed_var_categories=self.embed_var_categories,
+            input_dim            = self.static_dim,
+            hidden               = mc.static_discriminator.mlp_hidden_dim,
+            static_layers        = mc.static_discriminator.static_layers,
+            dropout              = mc.static_discriminator.dropout,
+            embed_var_categories = self.embed_var_categories,
         ).to(self.device)
 
         self.disc_temporal = TemporalDiscriminator(
-            static_dim=self.static_dim, temporal_dim=self.temporal_dim,
-            model_config=self.model_config,
+            static_dim   = self.static_dim,
+            temporal_dim = self.temporal_dim,
+            model_config = mc,
         ).to(self.device)
-
-        # ── Optimizer a gruppi [v8+v9] ────────────────────────────────
-        # noise_model: parametri con lr standard (ottimizzati end-to-end)
-        # followup_head, n_visits_head: lr * 0.1 (protetti)
-        # time_encoder: lr * 2.0 (amplificato)
-        fup_params  = list(self.generator.followup_head.parameters())
-        nv_params   = list(self.generator.n_visits_head.parameters())
-        te_params   = list(self.generator.time_encoder.parameters())
-        nm_params   = list(self.generator.noise_model.parameters())   # [v9]
-
-        fup_ids = {id(p) for p in fup_params}
-        nv_ids  = {id(p) for p in nv_params}
-        te_ids  = {id(p) for p in te_params}
-        nm_ids  = {id(p) for p in nm_params}
-
-        other_params = [p for p in self.generator.parameters()
-                        if id(p) not in fup_ids | nv_ids | te_ids | nm_ids]
 
         if self.preprocessor.embeddings:
             self.preprocessor.embeddings = self.preprocessor.embeddings.to(self.device)
-            other_params += list(self.preprocessor.embeddings.parameters())
 
-        lr_g = self.model_config.lr_g
-        self.opt_gen = torch.optim.Adam([
-            {"params": other_params, "lr": lr_g},
-            {"params": fup_params,   "lr": lr_g * 0.1},   # protetto
-            {"params": nv_params,    "lr": lr_g * 0.1},   # protetto
-            {"params": te_params,    "lr": lr_g * 2.0},   # amplificato
-            {"params": nm_params,    "lr": lr_g * 0.5},   # noise model: lr moderato
-        ], betas=(0.5, 0.9))
+        # Optimizer con betas dal config
+        b1, b2 = mc.optimizer_beta1, mc.optimizer_beta2
 
-        lr_d_t = getattr(self.model_config, "lr_d_t",
-                         self.model_config.lr_d_s * 0.3)
+        self.opt_gen = torch.optim.Adam(
+            list(self.generator.parameters())
+            + (list(self.preprocessor.embeddings.parameters())
+               if self.preprocessor.embeddings else []),
+            lr=mc.lr_g, betas=(b1, b2),
+        )
         self.opt_disc_static = torch.optim.Adam(
-            self.disc_static.parameters(),   lr=self.model_config.lr_d_s, betas=(0.5, 0.9))
+            self.disc_static.parameters(), lr=mc.lr_d_s, betas=(b1, b2))
         self.opt_disc_temporal = torch.optim.Adam(
-            self.disc_temporal.parameters(), lr=lr_d_t, betas=(0.5, 0.9))
+            self.disc_temporal.parameters(), lr=mc.lr_d_t, betas=(b1, b2))
+
+        # ── EMA generatore: deepcopy iniziale, poi aggiornato ogni gen step ──
+        if self.ema_decay > 0.0:
+            import copy as _copy
+            self.ema_generator = _copy.deepcopy(self.generator)
+            for p in self.ema_generator.parameters():
+                p.requires_grad_(False)
+        else:
+            self.ema_generator = None
+
+    # ─────────────────────────────────────────────────────────────────
+
+    def _update_ema(self):
+        """Aggiorna i pesi dell'EMA generatore con un passo esponenziale."""
+        if self.ema_generator is None:
+            return
+        decay = self.ema_decay
+        for ema_p, gen_p in zip(self.ema_generator.parameters(),
+                                 self.generator.parameters()):
+            ema_p.data.mul_(decay).add_(gen_p.data, alpha=1.0 - decay)
+
+    def _instance_noise_strength(self) -> float:
+        """
+        Restituisce la forza corrente del rumore di istanza sulle OHE reali.
+        Decade linearmente da instance_noise_start → instance_noise_end
+        nel corso delle epoche configurate.
+        """
+        if self.instance_noise_start <= 0:
+            return 0.0
+        total_epochs = self.model_config.epochs
+        frac = min(self._current_epoch / max(total_epochs, 1), 1.0)
+        return self.instance_noise_start + frac * (self.instance_noise_end - self.instance_noise_start)
+
+    def _effective_lambda_scat(self) -> float:
+        """
+        Lambda_scat con warmup coseno nelle prime lambda_scat_warmup_epochs epoche.
+        Nelle prime epoche il segnale GAN è instabile: un warmup graduale di
+        lambda_scat evita che la loss categorica domini troppo presto.
+        """
+        if self.lambda_scat_warmup_epochs <= 0:
+            return self.lambda_scat
+        import math as _math
+        t = min(self._current_epoch / max(self.lambda_scat_warmup_epochs, 1), 1.0)
+        # cosine warmup: sale da 0 → lambda_scat
+        scale = (1.0 - _math.cos(_math.pi * t)) / 2.0
+        return self.lambda_scat * scale
 
     def set_train(self):
         self.generator.train()
@@ -224,7 +425,7 @@ class DGAN:
         self.disc_static.eval()
         self.disc_temporal.eval()
 
-    def _move(self, batch):
+    def _move(self, batch: Dict) -> Dict:
         out = {}
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
@@ -235,7 +436,7 @@ class DGAN:
                 out[k] = v
         return out
 
-    def _extract_real_irr(self, batch):
+    def _extract_real_irr(self, batch: Dict) -> Optional[torch.Tensor]:
         if not self.irreversible_idx:
             return None
         return torch.stack([
@@ -243,409 +444,404 @@ class DGAN:
             for idx in self.irreversible_idx
         ], dim=-1)
 
-    def _extract_fake_irr(self, fake_cat_dict):
+    def _extract_fake_irr(self, fake_cat: Dict) -> torch.Tensor:
         return torch.stack([
-            fake_cat_dict[self.data_config.temporal_cat[idx].name][:, :, 1]
+            fake_cat[self.data_config.temporal_cat[idx].name][:, :, 1]
             for idx in self.irreversible_idx
         ], dim=-1)
 
-    def _build_embed_targets(self, batch):
+    def _build_embed_targets(self, batch: Dict) -> Dict:
         targets = {}
-        if "static_cat_embed" not in batch or not batch["static_cat_embed"]:
-            return targets
         for var_name in self.embed_var_categories:
-            if var_name in batch["static_cat_embed"]:
-                payload = batch["static_cat_embed"][var_name]
-                if payload.dim() == 1:
-                    targets[var_name] = payload
+            embed = batch.get("static_cat_embed", {})
+            if var_name in embed:
+                p = embed[var_name]
+                if p.dim() == 1:
+                    targets[var_name] = p
         return targets
 
-    def _generate_fake(self, batch_size, use_tf=False, real_irr=None, real_batch=None):
-        """
-        [v9] Usa generator.sample_noise() per z_temporal strutturato.
-        """
-        # [v9] Campiona z_static e z_temporal strutturato dal noise_model
-        z_s = torch.randn(batch_size, self.model_config.z_static_dim, device=self.device)
-        z_t = self.generator.noise_model(batch_size, self.max_len, self.device)
+    # ─────────────────────────────────────────────────────────────────
 
-        fixed_visits = None
-        if real_batch is not None and "n_visits" in real_batch:
-            fixed_visits = real_batch["n_visits"].to(self.device)
+    def _generate_fake(
+        self,
+        batch_size: int,
+        real_irr:   Optional[torch.Tensor] = None,
+    ):
+        # Usa sample_noise() del generatore (supporta AR se configurato)
+        z_s, z_t = self.generator.sample_noise(batch_size, torch.device(self.device))
 
-        fake_out = self.generator(
-            z_s, z_t, temperature=self.current_temperature,
-            teacher_forcing=use_tf, real_irr=real_irr,
-            hard_mask=False, fixed_visits=fixed_visits,
+        fake_out  = self.generator(
+            z_s, z_t,
+            temperature = self.current_temperature,
+            real_irr    = real_irr,
         )
         fake_disc = prepare_discriminator_inputs(fake_out, self.preprocessor)
-        self._last_fake_cat = {k: v.detach() for k, v in fake_out["temporal_cat"].items()}
         return fake_out, fake_disc
 
-    def _train_discriminators(self, real_disc, embed_targets, batch_size,
-                               real_cat_dict, update_static=True, update_temporal=True):
+    # ─────────────────────────────────────────────────────────────────
+
+    def _train_discriminators(
+        self,
+        real_disc:     Dict,
+        embed_targets: Dict,
+        batch_size:    int,
+        update_static:   bool = True,
+        update_temporal: bool = True,
+    ):
+        if batch_size < 2:
+            warnings.warn(
+                f"Batch size = {batch_size} è troppo piccolo per il gradient penalty. "
+                f"Aumenta batch_size nel config (raccomandato >= 16).",
+                UserWarning,
+            )
+
         with torch.no_grad():
             _, fake_disc = self._generate_fake(batch_size)
 
-        real_s = real_disc["static"].detach()
-        real_t = real_disc["temporal"].detach()
-        fake_s = fake_disc["static"].detach()
-        fake_t = fake_disc["temporal"].detach()
+        real_s  = real_disc["static"].detach()
+        real_t  = real_disc["temporal"].detach()
+        fake_s  = fake_disc["static"].detach()
+        fake_t  = fake_disc["temporal"].detach()
+        real_vf = real_disc["valid_flag"]
+        fake_vf = fake_disc["valid_flag"]
 
-        # Static discriminator
+        # ── Instance noise sulle OHE reali (anti-collapse categoriche) ─
+        # Aggiunge U(0, ε) ai vettori reali prima del discriminatore.
+        # ε decade linearmente da instance_noise_start → 0 nel training.
+        # Rompe l'asimmetria discriminatore (OHE reali perfette vs soft fake).
+        noise_eps = self._instance_noise_strength()
+        if noise_eps > 0.0:
+            real_s = real_s + noise_eps * torch.rand_like(real_s)
+            real_t = real_t + noise_eps * torch.rand_like(real_t)
+
+        # ── Static discriminator ──────────────────────────────────────
         d_real_s = self.disc_static(real_s)
         d_fake_s = self.disc_static(fake_s)
-        gp_s     = gradient_penalty(lambda x: self.disc_static(x), real_s, fake_s, self.device)
+        gp_s     = _gradient_penalty(
+            lambda x: self.disc_static(x), real_s, fake_s, self.device)
         aux_loss = self.disc_static.auxiliary_loss(real_s, embed_targets)
-        loss_d_s = (wgan_discriminator_loss(d_real_s, d_fake_s)
+        loss_d_s = (_wgan_d_loss(d_real_s, d_fake_s)
                     + self.lambda_gp_s * gp_s
                     + self.lambda_aux  * aux_loss)
+        loss_d_s = _check_finite(loss_d_s, "disc_static")
+
         if update_static:
             self.opt_disc_static.zero_grad()
             loss_d_s.backward()
             if self.model_config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(self.disc_static.parameters(), self.model_config.grad_clip)
+                nn.utils.clip_grad_norm_(
+                    self.disc_static.parameters(), self.model_config.grad_clip)
             self.opt_disc_static.step()
 
-        # Temporal discriminator
-        d_real_t = self.disc_temporal(real_s, real_t, real_disc["visit_mask"], real_disc["temporal_mask"])
-        d_fake_t = self.disc_temporal(fake_s, fake_t, fake_disc["visit_mask"], fake_disc["temporal_mask"])
-        gp_t     = gradient_penalty(
-            lambda x: self.disc_temporal(real_s, x, real_disc["visit_mask"], real_disc["temporal_mask"]),
-            real_t, fake_t, self.device)
+        # ── Temporal discriminator ────────────────────────────────────
+        d_real_t = self.disc_temporal(real_s, real_t, real_vf)
+        d_fake_t = self.disc_temporal(fake_s, fake_t, fake_vf)
+        gp_t     = _gradient_penalty(
+            lambda x: self.disc_temporal(real_s, x, real_vf), real_t, fake_t, self.device)
+        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t) + self.lambda_gp_t * gp_t
+        loss_d_t = _check_finite(loss_d_t, "disc_temporal")
 
-        freq_loss_disc = torch.tensor(0.0, device=self.device)
-        if self.lambda_freq_disc > 0 and self.cat_weights:
-            freq_loss_disc = categorical_frequency_loss_discriminator(
-                real_cat_dict=real_cat_dict, fake_cat_dict=self._last_fake_cat,
-                cat_weights=self.cat_weights, visit_mask=real_disc["visit_mask"])
-
-        loss_d_t = (wgan_discriminator_loss(d_real_t, d_fake_t)
-                    + self.lambda_gp_t     * gp_t
-                    + self.lambda_freq_disc * freq_loss_disc)
         if update_temporal:
             self.opt_disc_temporal.zero_grad()
             loss_d_t.backward()
             if self.model_config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(self.disc_temporal.parameters(), self.model_config.grad_clip)
+                nn.utils.clip_grad_norm_(
+                    self.disc_temporal.parameters(), self.model_config.grad_clip)
             self.opt_disc_temporal.step()
 
-        return (loss_d_s.item(), loss_d_t.item(), gp_s.item(), gp_t.item(),
-                aux_loss.item(), freq_loss_disc.item())
+        return (loss_d_s.item(), loss_d_t.item(),
+                gp_s.item(),   gp_t.item(),
+                aux_loss.item())
 
-    def _train_generator(self, real_disc, batch_size, real_irr, real_cat_dict, real_batch=None):
+    # ─────────────────────────────────────────────────────────────────
+
+    def _train_generator(
+        self,
+        real_disc:  Dict,
+        batch_size: int,
+        real_irr:   Optional[torch.Tensor],
+        real_batch: Optional[Dict],
+    ):
         self.opt_gen.zero_grad()
-        use_tf = (real_irr is not None and torch.rand(1).item() < self.teacher_forcing_prob)
-        fake_out, fake_disc = self._generate_fake(
-            batch_size, use_tf=use_tf, real_irr=real_irr, real_batch=real_batch)
 
+        fake_out, fake_disc = self._generate_fake(batch_size, real_irr=real_irr)
+
+        # ── WGAN generator loss (dominante) ───────────────────────────
         d_fake_s = self.disc_static(fake_disc["static"])
         d_fake_t = self.disc_temporal(
-            fake_disc["static"], fake_disc["temporal"],
-            fake_disc["visit_mask"], fake_disc["temporal_mask"])
-        loss_g = wgan_generator_loss(d_fake_s, d_fake_t)
+            fake_disc["static"], fake_disc["temporal"], fake_disc["valid_flag"])
+        loss_g = _wgan_g_loss(d_fake_s, d_fake_t)
+        loss_g = _check_finite(loss_g, "generator")
 
+        # ── Irreversibilità ───────────────────────────────────────────
         irr_loss = torch.tensor(0.0, device=self.device)
         if self.irreversible_idx:
             irr_states = self._extract_fake_irr(fake_out["temporal_cat"])
-            irr_loss   = irreversibility_loss(irr_states, fake_disc["visit_mask"])
+            for k in range(irr_states.shape[-1]):
+                irr_loss = irr_loss + _irr_loss(irr_states[..., k], fake_out["valid_flag"])
+            irr_loss = _check_finite(irr_loss, "irr_loss")
 
-        freq_loss_gen = torch.tensor(0.0, device=self.device)
-        if self.lambda_freq_gen > 0 and self.cat_weights:
-            freq_loss_gen = categorical_frequency_loss_generator(
-                fake_cat_dict=fake_out["temporal_cat"],
-                cat_weights=self.cat_weights,
-                visit_mask=fake_disc["visit_mask"])
+        # ── Followup supervision ──────────────────────────────────────
+        fup_loss = torch.tensor(0.0, device=self.device)
+        if self.lambda_fup > 0 and real_batch is not None and "followup_norm" in real_batch:
+            fup_loss = _dist_loss(
+                fake_out["followup_norm"],
+                real_batch["followup_norm"].to(self.device))
+            fup_loss = _check_finite(fup_loss, "fup_loss")
 
+        # ── N_visits supervision ──────────────────────────────────────
+        nv_loss = torch.tensor(0.0, device=self.device)
+        if self.lambda_nv > 0 and real_batch is not None and "n_visits" in real_batch:
+            nv_loss = _dist_loss(
+                fake_out["n_visits_pred"],
+                real_batch["n_visits"].float().to(self.device))
+            nv_loss = _check_finite(nv_loss, "nv_loss")
+
+        # ── Static categorical marginal ───────────────────────────────
+        eff_lambda_scat = self._effective_lambda_scat()
+        scat_loss = torch.tensor(0.0, device=self.device)
+        fake_soft = fake_out.get("static_cat_soft") or {}
+        if eff_lambda_scat > 0 and self.target_probs_static and fake_soft:
+            scat_loss = _scat_marginal_loss(fake_soft, self.target_probs_static)
+            scat_loss = _check_finite(scat_loss, "scat_loss")
+
+        # ── Feature matching ──────────────────────────────────────────
         fm_loss = torch.tensor(0.0, device=self.device)
         if self.lambda_fm > 0 and hasattr(self.disc_static, "get_features"):
             feat_real = self.disc_static.get_features(real_disc["static"]).detach()
             feat_fake = self.disc_static.get_features(fake_disc["static"])
-            fm_loss   = feature_matching_loss(feat_real, feat_fake)
+            fm_loss   = F.mse_loss(feat_fake, feat_real)
+            fm_loss   = _check_finite(fm_loss, "fm_loss")
 
-        fup_loss = torch.tensor(0.0, device=self.device)
-        if self.lambda_fup > 0 and real_batch is not None and "followup_norm" in real_batch:
-            fup_loss = followup_norm_loss(
-                fake_out["followup_norm"], real_batch["followup_norm"].to(self.device))
-
-        nv_loss = torch.tensor(0.0, device=self.device)
-        if self.lambda_nv > 0 and real_batch is not None and "n_visits" in real_batch:
-            nv_loss = n_visits_supervision_loss(
-                fake_out["n_visits_pred"], real_batch["n_visits"].to(self.device))
-
-        # Coverage loss (sanity check: con v8 TimeEncoder sarà ~0)
-        coverage_loss = torch.tensor(0.0, device=self.device)
-        if self.lambda_coverage > 0 and fake_out.get("visit_times_months") is not None:
-            vm_c     = fake_out["visit_mask"].squeeze(-1)
-            t_months = fake_out["visit_times_months"]
-            B_c      = vm_c.shape[0]
-            last_idx = (vm_c * torch.arange(
-                vm_c.shape[1], dtype=torch.float32, device=self.device
-            ).unsqueeze(0)).argmax(dim=1)
-            t_last_m  = t_months[torch.arange(B_c, device=self.device), last_idx]
-            gtm       = float(getattr(self.preprocessor, "global_time_max", 400.0) or 400.0)
-            d3_fup_m  = (fake_out["followup_norm"].detach() * gtm).clamp(min=1.0)
-            has_multi = (vm_c.sum(dim=1) > 1).float()
-            rel_err   = ((t_last_m - d3_fup_m) / d3_fup_m) ** 2
-            coverage_loss = (rel_err * has_multi).mean()
-
-        # IVI loss
-        ivi_loss = torch.tensor(0.0, device=self.device)
-        if self.lambda_ivi > 0 and self.real_intervals is not None \
-                and fake_out.get("delta_months") is not None:
-            ivi_loss = inter_visit_interval_loss(
-                visit_times=fake_out["delta_months"],
-                visit_mask=fake_out["visit_mask"],
-                real_intervals=self.real_intervals)
-
-        # Uniformity loss
-        uniformity_loss = torch.tensor(0.0, device=self.device)
-        if self.lambda_uniformity > 0 and fake_out.get("delta_months") is not None:
-            uniformity_loss = inter_visit_uniformity_loss(
-                delta_months=fake_out["delta_months"],
-                visit_mask=fake_out["visit_mask"])
-
-        # Static cat loss: Focal CE + KL pesata
-        scat_loss      = torch.tensor(0.0, device=self.device)
-        fake_scat_soft = fake_out.get("static_cat_soft") or {}
-        fake_scat_hard = fake_out.get("static_cat")      or {}
-        if self.lambda_static_cat > 0 and self.target_probs_static:
-            scat_terms = []
-            for var_name, target_p in self.target_probs_static.items():
-                src    = fake_scat_soft if var_name in fake_scat_soft else fake_scat_hard
-                if var_name not in src:
-                    continue
-                soft_p        = src[var_name].float()
-                fake_marginal = soft_p.mean(dim=0)
-                fake_marginal = fake_marginal / fake_marginal.sum().clamp(min=1e-8)
-                target_p_dev  = target_p.to(self.device).float()
-
-                inv_freq    = (1.0 / target_p_dev.clamp(min=0.05)).clamp(max=20.0)
-                inv_freq    = inv_freq / inv_freq.mean()
-                kl          = target_p_dev * (
-                    torch.log(target_p_dev.clamp(min=1e-8))
-                    - torch.log(fake_marginal.clamp(min=1e-8)))
-                kl_weighted = (kl * inv_freq).sum()
-
-                log_soft      = torch.log(soft_p.clamp(min=1e-8))
-                p_t           = (target_p_dev.unsqueeze(0) * soft_p).sum(dim=-1).clamp(min=1e-8)
-                focal_weight  = (1.0 - p_t) ** 2
-                ce_per_sample = -(target_p_dev.unsqueeze(0) * log_soft).sum(dim=-1)
-                focal_ce_loss = (focal_weight * ce_per_sample).mean()
-
-                scat_terms.append(0.7 * kl_weighted + 0.3 * focal_ce_loss)
-            if scat_terms:
-                scat_loss = torch.stack(scat_terms).mean()
-
-        sc_var_loss   = torch.tensor(0.0, device=self.device)
-        lambda_sc_var = getattr(self.model_config, "lambda_sc_var", 1.0) or 1.0
-        if (lambda_sc_var > 0
-                and fake_out.get("static_cont") is not None
+        # ── Varianza feature continue temporali [NUOVO] ───────────────
+        var_loss = torch.tensor(0.0, device=self.device)
+        if (self.lambda_var > 0
                 and real_batch is not None
-                and "static_cont" in real_batch):
-            sc_var_loss = static_cont_dist_loss(
-                fake_out["static_cont"].float(),
-                real_batch["static_cont"].float().to(self.device))
+                and "temporal_cont" in real_batch
+                and fake_out["temporal_cont"].shape[-1] > 0):
+            var_loss = _var_loss(
+                fake_out["temporal_cont"],
+                real_batch["temporal_cont"].to(self.device),
+                fake_out["valid_flag"],
+                real_batch["valid_flag"].to(self.device),
+            )
+            var_loss = _check_finite(var_loss, "var_loss")
 
+        # ── Intervalli inter-visita ──────────────────────────────────
+        interval_loss = torch.tensor(0.0, device=self.device)
+        if (self.lambda_interval > 0
+                and real_batch is not None
+                and "visit_time" in real_batch):
+            interval_loss = _interval_loss(
+                fake_out["visit_times"],
+                real_batch["visit_time"].to(self.device),
+                fake_out["valid_flag"],
+                real_batch["valid_flag"].to(self.device),
+            )
+            interval_loss = _check_finite(interval_loss, "interval_loss")
+
+        # ── Total ─────────────────────────────────────────────────────
         total = (loss_g
-                 + self.alpha_irr        * irr_loss
-                 + self.lambda_freq_gen  * freq_loss_gen
-                 + self.lambda_fm        * fm_loss
-                 + self.lambda_fup       * fup_loss
-                 + self.lambda_nv        * nv_loss
-                 + self.lambda_coverage  * coverage_loss
-                 + self.lambda_static_cat * scat_loss
-                 + lambda_sc_var         * sc_var_loss
-                 + self.lambda_ivi       * ivi_loss
-                 + self.lambda_uniformity * uniformity_loss)
+                 + self.lambda_irr      * irr_loss
+                 + self.lambda_fup      * fup_loss
+                 + self.lambda_nv       * nv_loss
+                 + eff_lambda_scat      * scat_loss
+                 + self.lambda_fm       * fm_loss
+                 + self.lambda_var      * var_loss
+                 + self.lambda_interval * interval_loss)
+
+        total = _check_finite(total, "total_generator")
         total.backward()
 
-        all_gen_params = list(self.generator.parameters())
+        all_params = list(self.generator.parameters())
         if self.preprocessor.embeddings:
-            all_gen_params += list(self.preprocessor.embeddings.parameters())
+            all_params += list(self.preprocessor.embeddings.parameters())
         if self.model_config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(all_gen_params, self.model_config.grad_clip)
+            nn.utils.clip_grad_norm_(all_params, self.model_config.grad_clip)
         self.opt_gen.step()
 
-        mean_nv = float(fake_out["n_visits"].mean().item())
-        return (loss_g.item(), irr_loss.item(), freq_loss_gen.item(), mean_nv,
-                nv_loss.item(), coverage_loss.item(), fm_loss.item(),
-                scat_loss.item(), fup_loss.item(), ivi_loss.item(),
-                uniformity_loss.item())
+        # Aggiorna EMA generatore (se configurato)
+        self._update_ema()
 
-    def _compute_curriculum_p(self, epoch: int, total_epochs: int) -> float:
-        """
-        Schedule lineare per il curriculum learning della visit_mask.
+        mean_nv = float(fake_out["n_visits"].detach().mean())
 
-        Phase 1 [0, warmup_end):         p=0.0  → usa sempre real n_visits
-        Phase 2 [warmup_end, fine_start): p cresce linearmente 0→1
-        Phase 3 [fine_start, total):      p=1.0  → usa sempre pred n_visits
-        """
-        warmup_end  = int(total_epochs * self.warmup_mask_frac)
-        fine_start  = int(total_epochs * (1.0 - self.finetune_mask_frac))
-
-        if epoch < warmup_end:
-            return 0.0
-        elif epoch >= fine_start:
-            return 1.0
+        # Stats per monitoring (prime 3 feature continue)
+        stats = {}
+        if fake_out["temporal_cont"].shape[-1] > 0:
+            vf_f = fake_out["valid_flag"]
+            stats["fake_cont_mean"] = float(
+                fake_out["temporal_cont"][:, :, :3][vf_f.unsqueeze(-1).expand_as(
+                    fake_out["temporal_cont"][:, :, :3])].mean())
+            stats["fake_cont_std"]  = float(
+                fake_out["temporal_cont"][:, :, :3][vf_f.unsqueeze(-1).expand_as(
+                    fake_out["temporal_cont"][:, :, :3])].std())
         else:
-            window = max(fine_start - warmup_end, 1)
-            return float(epoch - warmup_end) / window
+            stats["fake_cont_mean"] = 0.0
+            stats["fake_cont_std"]  = 0.0
 
-    def _update_alpha_irr(self, epoch, total_epochs):
-        warmup_end = int(total_epochs * 0.30)
-        if epoch < warmup_end:
-            t = epoch / max(warmup_end - 1, 1)
-            self.alpha_irr = self.alpha_irr_start + t * (self.alpha_irr_max - self.alpha_irr_start)
-        else:
-            self.alpha_irr = self.alpha_irr_max
+        return (loss_g.item(), irr_loss.item(), fup_loss.item(),
+                nv_loss.item(), scat_loss.item(), fm_loss.item(),
+                var_loss.item(), interval_loss.item(), mean_nv, stats)
+
+    # ─────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _build_loader(tensors_dict, batch_size, use_dp):
+    def _build_loader(tensors_dict: Dict, batch_size: int,
+                      use_dp: bool, drop_last: bool):
         tensors, keys = [], []
-        for k in ["static_cont","static_cat","temporal_cont","visit_mask","visit_time",
-                  "followup_norm","n_visits","static_cont_mask","static_cat_mask",
-                  "temporal_cont_mask"]:
+
+        for k in ["static_cont", "static_cat", "temporal_cont",
+                  "valid_flag", "visit_time", "followup_norm", "n_visits"]:
             if k in tensors_dict and tensors_dict[k] is not None:
-                tensors.append(tensors_dict[k]); keys.append(k)
+                tensors.append(tensors_dict[k])
+                keys.append(k)
+
         for name, t in tensors_dict.get("temporal_cat", {}).items():
             tensors.append(t); keys.append(f"tcat::{name}")
-        for name, t in tensors_dict.get("temporal_cat_mask", {}).items():
-            tensors.append(t); keys.append(f"tcatm::{name}")
+
         for name, t in tensors_dict.get("static_cat_embed", {}).items():
             tensors.append(t); keys.append(f"sce::{name}")
-        for name, t in tensors_dict.get("static_cat_embed_mask", {}).items():
-            tensors.append(t); keys.append(f"scem::{name}")
-        return (DataLoader(TensorDataset(*tensors), batch_size=batch_size,
-                           shuffle=True, drop_last=not use_dp), keys)
+
+        if len(tensors) == 0:
+            raise ValueError(
+                "tensors_dict è vuoto o non contiene tensori validi. "
+                "Verifica che fit_transform sia stato chiamato correttamente."
+            )
+
+        loader = DataLoader(
+            TensorDataset(*tensors),
+            batch_size = batch_size,
+            shuffle    = True,
+            drop_last  = drop_last,
+        )
+
+        if len(loader) == 0:
+            raise ValueError(
+                f"Il DataLoader è vuoto. Il dataset ha "
+                f"{len(tensors[0])} campioni e batch_size={batch_size}. "
+                f"Riduci batch_size o aumenta il dataset."
+            )
+
+        return loader, keys
 
     @staticmethod
-    def _reconstruct_batch(batch_tuple, keys):
+    def _reconstruct_batch(batch_tuple, keys: List[str]) -> Dict:
         batch = {}
         for tensor, key in zip(batch_tuple, keys):
-            if   key.startswith("tcat::"):   batch.setdefault("temporal_cat",{})[key[6:]]      = tensor
-            elif key.startswith("tcatm::"):  batch.setdefault("temporal_cat_mask",{})[key[7:]] = tensor
-            elif key.startswith("sce::"):    batch.setdefault("static_cat_embed",{})[key[5:]]  = tensor
-            elif key.startswith("scem::"):   batch.setdefault("static_cat_embed_mask",{})[key[6:]] = tensor
-            else: batch[key] = tensor
+            if key.startswith("tcat::"):
+                batch.setdefault("temporal_cat",   {})[key[6:]] = tensor
+            elif key.startswith("sce::"):
+                batch.setdefault("static_cat_embed", {})[key[5:]] = tensor
+            else:
+                batch[key] = tensor
         return batch
 
-    def fit(self, tensors_dict, epochs=None):
+    # ─────────────────────────────────────────────────────────────────
+    # FIT
+    # ─────────────────────────────────────────────────────────────────
+
+    def fit(self, tensors_dict: Dict, epochs: int = None):
         self.set_train()
         epochs = epochs or self.model_config.epochs
-        print("Inizio addestramento DGAN [v9]")
+
+        print(f"\n{'='*70}")
+        print(f"  DGAN [gretel-style v2]  —  {epochs} epoche")
+        print(f"  Device: {self.device}  |  batch_size: {self.model_config.batch_size}")
+        print(f"  z_s={self.model_config.z_static_dim}  z_t={self.model_config.z_temporal_dim}  "
+              f"noise_ar_rho={self.model_config.noise_ar_rho}  min_visits={self.data_config.min_visits}")
+        print(f"  ema_decay={self.ema_decay}  "
+              f"instance_noise=[{self.instance_noise_start}->{self.instance_noise_end}]  "
+              f"scat_warmup_ep={self.lambda_scat_warmup_epochs}")
+        print(f"  λ_gp_s={self.lambda_gp_s}  λ_gp_t={self.lambda_gp_t}  "
+              f"λ_fup={self.lambda_fup}  λ_nv={self.lambda_nv}  "
+              f"λ_var={self.lambda_var}  λ_scat={self.lambda_scat}  "
+              f"λ_interval={self.lambda_interval}")
+        print(f"{'='*70}\n")
+
         loader, keys = self._build_loader(
-            tensors_dict, self.model_config.batch_size, self.model_config.use_dp)
+            tensors_dict,
+            self.model_config.batch_size,
+            self.model_config.use_dp,
+            self.model_config.dataloader_drop_last,
+        )
 
         if self.model_config.use_dp and OPACUS_AVAILABLE:
             self.privacy_engine = PrivacyEngine()
-            self.disc_static, self.opt_disc_static, loader = self.privacy_engine.make_private(
-                module=self.disc_static, optimizer=self.opt_disc_static, data_loader=loader,
-                noise_multiplier=self.model_config.noise_std,
-                max_grad_norm=self.model_config.grad_clip)
+            self.disc_static, self.opt_disc_static, loader = (
+                self.privacy_engine.make_private(
+                    module           = self.disc_static,
+                    optimizer        = self.opt_disc_static,
+                    data_loader      = loader,
+                    noise_multiplier = self.model_config.noise_std,
+                    max_grad_norm    = self.model_config.grad_clip))
+        elif self.model_config.use_dp and not OPACUS_AVAILABLE:
+            warnings.warn(
+                "use_dp=true ma Opacus non è installato. "
+                "Training senza privacy differenziale.",
+                UserWarning,
+            )
 
-        # Categorical frequency weights
-        if self.lambda_freq_gen > 0 or self.lambda_freq_disc > 0:
-            print("Calcolo pesi per categorical frequency regularization...")
-            full_visit_mask = tensors_dict.get("visit_mask")
-            if full_visit_mask is not None:
-                self.cat_weights = compute_category_weights(
-                    real_cat_dict=dict(tensors_dict.get("temporal_cat", {})),
-                    visit_mask=full_visit_mask,
-                    smoothing=1e-3, power=self.freq_weight_power)
-                print(f"  -> Pesi calcolati per {len(self.cat_weights)} variabili.")
-
-        # Static cat target probs
-        if self.lambda_static_cat > 0:
+        # ── Target probs statiche ────────────────────────────────────
+        scat_tensor = tensors_dict.get("static_cat")
+        if self.lambda_scat > 0 and scat_tensor is not None:
             print("Calcolo distribuzione marginale categoriche statiche...")
-            scat_tensor = tensors_dict.get("static_cat")
-            if scat_tensor is not None and hasattr(self.data_config, "static_cat"):
-                offset = 0
-                for var in self.data_config.static_cat:
-                    if var.name in self.preprocessor.embedding_configs:
-                        continue
-                    n   = var.n_categories
-                    ohe = scat_tensor[:, offset: offset + n].float()
-                    freq= ohe.mean(dim=0)
-                    self.target_probs_static[var.name] = (
-                        freq / freq.sum().clamp(min=1e-8)).to(self.device)
-                    offset += n
+            offset = 0
+            for var in self.data_config.static_cat:
+                if var.name in self.preprocessor.embedding_configs:
+                    continue
+                n   = var.n_categories
+                ohe = scat_tensor[:, offset:offset + n].float()
+                freq = ohe.mean(dim=0)
+                self.target_probs_static[var.name] = (
+                    freq / freq.sum().clamp(min=1e-8)).to(self.device)
+                offset += n
 
-            if self.target_probs_static:
-                print(f"  -> Distribuzione calcolata per {len(self.target_probs_static)} variabili.")
-                for var in self.data_config.static_cat:
-                    if var.name not in self.target_probs_static:
-                        continue
-                    head = dict(self.generator.static_cat_heads).get(var.name)
-                    if head is None:
-                        continue
+                head = dict(self.generator.static_cat_heads).get(var.name)
+                if head is not None:
                     p         = self.target_probs_static[var.name].cpu()
                     log_prior = torch.log(p.clamp(min=1e-6)) - torch.log(p.clamp(min=1e-6)).mean()
                     last_layer = head
                     if isinstance(head, nn.Sequential):
                         for m in reversed(list(head.modules())):
-                            if isinstance(m, nn.Linear): last_layer = m; break
+                            if isinstance(m, nn.Linear):
+                                last_layer = m; break
                     with torch.no_grad():
-                        if hasattr(last_layer,'bias') and last_layer.bias is not None:
+                        if hasattr(last_layer, "bias") and last_layer.bias is not None:
                             last_layer.bias.data.copy_(log_prior.to(last_layer.bias.device))
+            print(f"  -> {len(self.target_probs_static)} variabili")
 
-        # Followup warm start
-        if "followup_norm" in tensors_dict and tensors_dict["followup_norm"] is not None:
-            fn_all  = tensors_dict["followup_norm"].float()
-            fn_mean = float(fn_all.mean().clamp(0.02, 0.98))
-            fn_logit= float(torch.log(torch.tensor(fn_mean / (1.0 - fn_mean))))
+        # ── Warm-start followup ──────────────────────────────────────
+        fn_all = tensors_dict.get("followup_norm")
+        if fn_all is not None:
+            fn_mean  = float(fn_all.float().mean().clamp(0.02, 0.98))
+            fn_logit = float(np.log(fn_mean / (1.0 - fn_mean)))
             with torch.no_grad():
                 self.generator.followup_head[-2].bias.fill_(fn_logit)
-            print(f"  -> followup_head warm start: mean={fn_mean:.3f}  logit={fn_logit:.3f}")
+            print(f"  followup warm-start: mean={fn_mean:.3f}  logit={fn_logit:.3f}")
 
-        # n_visits warm start
-        if "n_visits" in tensors_dict and tensors_dict["n_visits"] is not None:
-            nv_all   = tensors_dict["n_visits"].float()
-            nv_median= float(nv_all.median())
-            target   = max(nv_median - 1.0, 0.1)
-            nv_bias  = float(torch.log(torch.tensor(target).exp() - 1.0 + 1e-6))
+        # ── Warm-start n_visits ──────────────────────────────────────
+        nv_all = tensors_dict.get("n_visits")
+        if nv_all is not None:
+            nv_med = float(nv_all.float().median())
+            # Rispetta il vincolo min_visits
+            min_v  = self.data_config.min_visits
+            nv_med = max(nv_med, float(min_v))
+            target  = max(nv_med - 1.0, 0.1)
+            nv_bias = float(np.log(np.exp(target) - 1.0 + 1e-6))
             with torch.no_grad():
                 self.generator.n_visits_head[-1].bias.fill_(nv_bias)
-            print(f"  -> n_visits_head warm start: median={nv_median:.1f}  bias={nv_bias:.3f}")
+            print(f"  n_visits warm-start: median={nv_med:.1f}  min_visits={min_v}")
 
-        # Real intervals per IVI loss
-        if (self.lambda_ivi > 0
-                and "visit_time" in tensors_dict
-                and "visit_mask"  in tensors_dict):
-            gtm    = float(getattr(self.preprocessor, "global_time_max", 400.0) or 400.0)
-            vt_all = tensors_dict["visit_time"].float()
-            vm_all = tensors_dict["visit_mask"].float()
-            if vm_all.dim() == 3: vm_all = vm_all.squeeze(-1)
+        # Stats reali per monitoring
+        real_cont_all = tensors_dict.get("temporal_cont")
+        real_vf_all   = tensors_dict.get("valid_flag")
 
-            if "followup_norm" in tensors_dict and tensors_dict["followup_norm"] is not None:
-                fup_months = tensors_dict["followup_norm"].float().clamp(0.001, 1.0) * gtm
-                dt_real    = (vt_all[:, 1:] - vt_all[:, :-1]) * vm_all[:, 1:] * fup_months.unsqueeze(1)
-            else:
-                dt_real = (vt_all[:, 1:] - vt_all[:, :-1]) * vm_all[:, 1:] * gtm
-
-            valid_dt = dt_real[dt_real > 0.1]
-            if len(valid_dt) > 0:
-                self.real_intervals = valid_dt.detach().cpu()
-                print(f"  -> real_intervals: n={len(valid_dt)}, "
-                      f"mean={float(valid_dt.mean()):.2f} mo  "
-                      f"median={float(valid_dt.median()):.2f} mo")
-
-        print(f"\n  Curriculum schedule:")
-        warmup_end = int(epochs * self.warmup_mask_frac)
-        fine_start = int(epochs * (1.0 - self.finetune_mask_frac))
-        print(f"    Epoche   0-{warmup_end}: p=0.0 (real n_visits)")
-        print(f"    Epoche {warmup_end}-{fine_start}: p cresce 0→1 (mix)")
-        print(f"    Epoche {fine_start}-{epochs}: p=1.0 (pred n_visits)")
-
-        best_disc_loss, patience_counter = float("inf"), 0
+        critic_steps   = self.model_config.critic_steps
+        critic_steps_t = self.model_config.critic_steps_temporal
+        best_loss, patience_counter = float("inf"), 0
 
         for epoch in range(epochs):
-            self._update_alpha_irr(epoch, epochs)
-
-            # [v9] Aggiorna curriculum_p e lo segnala al generator
-            curriculum_p = self._compute_curriculum_p(epoch, epochs)
-            self._current_curriculum_p = curriculum_p
-            self.generator.set_curriculum_p(curriculum_p)
-
+            self._current_epoch = epoch   # usato da instance_noise e scat_warmup
             batch_losses = []
 
             for batch_tuple in loader:
@@ -653,124 +849,123 @@ class DGAN:
                 batch = self._move(batch)
                 B     = batch["temporal_cont"].shape[0]
 
-                real_disc           = prepare_discriminator_inputs(batch, self.preprocessor)
-                real_irr            = self._extract_real_irr(batch) if self.irreversible_idx else None
-                embed_targets       = self._build_embed_targets(batch)
-                real_cat_dict_batch = dict(batch.get("temporal_cat", {}))
+                real_disc     = prepare_discriminator_inputs(batch, self.preprocessor)
+                real_irr      = self._extract_real_irr(batch)
+                embed_targets = self._build_embed_targets(batch)
 
-                lds_list, ldt_list, gps_list, gpt_list, aux_list, fdisc_list = [], [], [], [], [], []
-                critic_steps_s = self.model_config.critic_steps
-                critic_steps_t = getattr(self.model_config, "critic_steps_temporal", critic_steps_s)
-                n_steps        = max(critic_steps_s, critic_steps_t)
+                n_steps = max(critic_steps, critic_steps_t)
+                ld_s_list, ld_t_list, gp_s_list, gp_t_list, aux_list = [], [], [], [], []
 
                 for step_idx in range(n_steps):
-                    lds, ldt, gps, gpt, aux, fdisc = self._train_discriminators(
+                    ld_s, ld_t, gp_s, gp_t, aux = self._train_discriminators(
                         real_disc, embed_targets, B,
-                        real_cat_dict=real_cat_dict_batch,
-                        update_static=(step_idx  < critic_steps_s),
-                        update_temporal=(step_idx < critic_steps_t),
+                        update_static   = (step_idx < critic_steps),
+                        update_temporal = (step_idx < critic_steps_t),
                     )
-                    lds_list.append(lds); ldt_list.append(ldt)
-                    gps_list.append(gps); gpt_list.append(gpt)
-                    aux_list.append(aux); fdisc_list.append(fdisc)
+                    ld_s_list.append(ld_s); ld_t_list.append(ld_t)
+                    gp_s_list.append(gp_s); gp_t_list.append(gp_t)
+                    aux_list.append(aux)
 
-                (lg, lirr, lfreq_gen, mean_nv, lnv, lcov, lfm,
-                 lscat, lfup, livi, lunif) = self._train_generator(
-                    real_disc, B, real_irr,
-                    real_cat_dict=real_cat_dict_batch, real_batch=batch)
+                (lg, l_irr, l_fup, l_nv, l_scat,
+                 l_fm, l_var, l_iv, mean_nv, stats) = self._train_generator(
+                    real_disc, B, real_irr, real_batch=batch)
 
                 batch_losses.append({
-                    "generator":       lg,
-                    "disc_static":     float(np.mean(lds_list)),
-                    "disc_temporal":   float(np.mean(ldt_list)),
-                    "irreversibility": lirr,
-                    "gp_static":       float(np.mean(gps_list)),
-                    "gp_temporal":     float(np.mean(gpt_list)),
-                    "aux_embed":       float(np.mean(aux_list)),
-                    "freq_gen":        lfreq_gen,
-                    "freq_disc":       float(np.mean(fdisc_list)),
-                    "mean_n_visits":   mean_nv,
-                    "nv_loss":         lnv,
-                    "coverage_loss":   lcov,
-                    "fm_loss":         lfm,
-                    "static_cat_loss": lscat,
-                    "fup_loss":        lfup,
-                    "ivi_loss":        livi,
-                    "uniformity_loss": lunif,
+                    "generator":     lg,
+                    "disc_static":   float(np.mean(ld_s_list)),
+                    "disc_temporal": float(np.mean(ld_t_list)),
+                    "gp_static":     float(np.mean(gp_s_list)),
+                    "gp_temporal":   float(np.mean(gp_t_list)),
+                    "aux_loss":      float(np.mean(aux_list)),
+                    "irr_loss":      l_irr,
+                    "fup_loss":      l_fup,
+                    "nv_loss":       l_nv,
+                    "scat_loss":     l_scat,
+                    "fm_loss":       l_fm,
+                    "var_loss":      l_var,
+                    "interval_loss": l_iv,
+                    "mean_n_visits": mean_nv,
+                    "fake_cont_mean": stats["fake_cont_mean"],
+                    "fake_cont_std":  stats["fake_cont_std"],
                 })
 
             avg = {k: float(np.mean([b[k] for b in batch_losses]))
                    for k in batch_losses[0]}
             for k, v in avg.items():
-                self.loss_history[k].append(v)
-            self.loss_history["alpha_irr"].append(self.alpha_irr)
-            self.loss_history["curriculum_p"].append(curriculum_p)
+                if k in self.loss_history:
+                    self.loss_history[k].append(v)
 
-            # [v9] Log parametri noise model
-            noise_stats = self.generator.noise_model.get_stats()
-            self.loss_history["noise_rho"].append(noise_stats["rho"])
-            self.loss_history["noise_w_global"].append(noise_stats["w_global"])
-            self.loss_history["noise_w_ar"].append(noise_stats["w_ar"])
-            self.loss_history["noise_w_episod"].append(noise_stats["w_episod"])
+            # Stats reali globali per confronto
+            real_cont_mean = 0.0
+            real_cont_std  = 0.0
+            if real_cont_all is not None and real_vf_all is not None:
+                vf_flat  = real_vf_all.bool()
+                rc_slice = real_cont_all[:, :, :3]
+                vf_exp   = vf_flat.unsqueeze(-1).expand_as(rc_slice)
+                vals     = rc_slice[vf_exp]
+                if len(vals) > 1:
+                    real_cont_mean = float(vals.mean())
+                    real_cont_std  = float(vals.std())
 
             self.current_temperature = max(
                 self.temperature_min, self.current_temperature * 0.995)
-            self.teacher_forcing_prob = max(
-                0.0, self.teacher_forcing_prob * self.teacher_forcing_decay)
 
-            if self.privacy_engine:
-                try:
-                    self.loss_history["epsilon"].append(
-                        self.privacy_engine.get_epsilon(delta=1e-5))
-                except Exception:
-                    pass
-
-            # Log ogni epoca con info curriculum + noise_model ogni 20 epoche
+            # ── Stampa ─────────────────────────────────────────────────
             print(
-                f"[Epoch {epoch+1}/{epochs}]  G={avg['generator']:.3f}  "
-                f"D_s={avg['disc_static']:.3f}  D_t={avg['disc_temporal']:.3f}  "
-                f"| IVI={avg['ivi_loss']:.4f}  Cov={avg['coverage_loss']:.4f}  "
-                f"Unif={avg['uniformity_loss']:.4f}  Fup={avg['fup_loss']:.4f}  "
-                f"| Nv={avg['mean_n_visits']:.1f}  NvL={avg['nv_loss']:.3f}  "
-                f"| Scat={avg['static_cat_loss']:.4f}  Fm={avg['fm_loss']:.4f}  "
-                f"| Fgen={avg['freq_gen']:.4f}  Irr={avg['irreversibility']:.4f}  "
-                f"T={self.current_temperature:.3f}  Cur={curriculum_p:.2f}", flush=True)
-
-            if (epoch + 1) % 20 == 0:
-                print(
-                    f"  [Noise]  rho={noise_stats['rho']:.3f}  "
-                    f"w_global={noise_stats['w_global']:.3f}  "
-                    f"w_ar={noise_stats['w_ar']:.3f}  "
-                    f"w_episod={noise_stats['w_episod']:.3f}", flush=True)
+                f"[Ep {epoch+1:4d}/{epochs}]  "
+                f"G={avg['generator']:+7.3f}  "
+                f"D_s={avg['disc_static']:+7.3f}  D_t={avg['disc_temporal']:+7.3f}  "
+                f"GP_s={avg['gp_static']:5.3f}  GP_t={avg['gp_temporal']:5.3f} |"
+                f"Nv_fake={avg['mean_n_visits']:5.1f}  NvL={avg['nv_loss']:.4f}  "
+                f"| Fup={avg['fup_loss']:.4f}  Scat={avg['scat_loss']:.4f}  "
+                f"VarL={avg['var_loss']:.4f}  IvL={avg['interval_loss']:.4f}"
+            )
+            print(
+                f"              "
+                f"Cont(fake) μ={avg['fake_cont_mean']:+.3f} σ={avg['fake_cont_std']:.3f}  "
+                #f"Cont(real) μ={real_cont_mean:+.3f} σ={real_cont_std:.3f}  "
+                f"| T={self.current_temperature:.3f}",
+                flush=True,
+            )
 
             disc_loss = avg["disc_static"] + avg["disc_temporal"]
-            if disc_loss < best_disc_loss:
-                best_disc_loss = disc_loss; patience_counter = 0
+            if disc_loss < best_loss:
+                best_loss = disc_loss; patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= self.model_config.patience:
-                    print(f"Early stopping — epoch {epoch+1}"); break
+                    print(f"\nEarly stopping — epoch {epoch+1} "
+                          f"(best disc_loss={best_loss:.4f})")
+                    break
+
+    # ─────────────────────────────────────────────────────────────────
+    # GENERATE
+    # ─────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def generate(self, n_samples, temperature=0.5, return_dataframe=True):
+    def generate(self, n_samples: int, temperature: float = 0.5,
+                 return_dataframe: bool = True):
         self.set_eval()
+        # Se EMA è attiva, usa l'EMA generator per generare (più stabile)
+        gen = self.ema_generator if self.ema_generator is not None else self.generator
+        if self.ema_generator is not None:
+            self.ema_generator.eval()
         all_outputs, remaining = [], n_samples
+
         while remaining > 0:
-            bs  = min(self.model_config.batch_size, remaining)
-            z_s = torch.randn(bs, self.model_config.z_static_dim, device=self.device)
-            z_t = self.generator.noise_model(bs, self.max_len, self.device)
-            out = self.generator(
-                z_s, z_t, temperature=temperature, teacher_forcing=False,
-                fixed_visits=None, hard_mask=True)
+            bs       = min(self.model_config.batch_size, remaining)
+            z_s, z_t = gen.sample_noise(bs, torch.device(self.device))
+            out      = gen(z_s, z_t, temperature=temperature)
+
             all_outputs.append({
                 k: (v.cpu().numpy() if torch.is_tensor(v)
-                    else {n: t.cpu().numpy() for n, t in v.items()} if isinstance(v, dict)
-                    else v)
+                    else {n: t.cpu().numpy() for n, t in v.items()}
+                    if isinstance(v, dict) else v)
                 for k, v in out.items() if v is not None
             })
             remaining -= bs
 
-        final = {}
+        final: Dict = {}
         for k in all_outputs[0]:
             if isinstance(all_outputs[0][k], dict):
                 final[k] = {
@@ -780,45 +975,53 @@ class DGAN:
             elif isinstance(all_outputs[0][k], np.ndarray):
                 final[k] = np.concatenate([o[k] for o in all_outputs], axis=0)[:n_samples]
 
+        if "valid_flag" not in final:
+            vf_arrays = [o["valid_flag"] for o in all_outputs if "valid_flag" in o]
+            if vf_arrays:
+                final["valid_flag"] = np.concatenate(vf_arrays, axis=0)[:n_samples]
+
         if "static_cat_embed" in final and final["static_cat_embed"]:
-            decoded = self.preprocessor.decode_embeddings(
-                {n: torch.tensor(v, device=self.device)
-                 for n, v in final["static_cat_embed"].items()})
+            decoded = self.preprocessor.decode_embeddings({
+                n: torch.tensor(v, device=self.device)
+                for n, v in final["static_cat_embed"].items()})
             final["static_cat_embed_decoded"] = {
                 n: idx.cpu().numpy() for n, idx in decoded.items()}
             del final["static_cat_embed"]
 
-        if return_dataframe:
-            synth = {
-                "temporal_cont": torch.tensor(final["temporal_cont"]),
-                "temporal_cat":  {n: torch.tensor(v) for n, v in final["temporal_cat"].items()},
-                "visit_mask":    torch.tensor(final["visit_mask"]),
-                "visit_times":   torch.tensor(final["visit_times"]),
-            }
-            if "followup_norm"           in final:
-                synth["followup_norm"]            = torch.tensor(final["followup_norm"])
-            if "static_cont"             in final:
-                synth["static_cont"]              = torch.tensor(final["static_cont"])
-            if "static_cat_embed_decoded" in final:
-                synth["static_cat_embed_decoded"] = {
-                    n: torch.tensor(v)
-                    for n, v in final["static_cat_embed_decoded"].items()}
-            if "static_cat" in final and final["static_cat"]:
-                static_cat_var_names = [
-                    v.name for v in self.data_config.static_cat
-                    if v.name not in self.preprocessor.embedding_configs]
-                arrays = [final["static_cat"][k]
-                          for k in static_cat_var_names if k in final["static_cat"]]
-                if arrays:
-                    synth["static_cat"] = torch.from_numpy(
-                        np.concatenate(arrays, axis=1)).float()
+        if not return_dataframe:
             self.set_train()
-            return self.preprocessor.inverse_transform(synth, complete_followup=False)
+            return final
+
+        synth = {
+            "temporal_cont": torch.tensor(final["temporal_cont"]),
+            "temporal_cat":  {n: torch.tensor(v) for n, v in final["temporal_cat"].items()},
+            "valid_flag":    torch.tensor(final["valid_flag"]),
+            "visit_times":   torch.tensor(final["visit_times"]),
+        }
+        if "followup_norm" in final:
+            synth["followup_norm"] = torch.tensor(final["followup_norm"])
+        if "static_cont" in final:
+            synth["static_cont"]   = torch.tensor(final["static_cont"])
+        if "static_cat_embed_decoded" in final:
+            synth["static_cat_embed_decoded"] = {
+                n: torch.tensor(v) for n, v in final["static_cat_embed_decoded"].items()}
+        if "static_cat" in final and final["static_cat"]:
+            sc_names = [v.name for v in self.data_config.static_cat
+                        if v.name not in self.preprocessor.embedding_configs]
+            arrays   = [final["static_cat"][k] for k in sc_names
+                        if k in final["static_cat"]]
+            if arrays:
+                synth["static_cat"] = torch.from_numpy(
+                    np.concatenate(arrays, axis=1)).float()
 
         self.set_train()
-        return final
+        return self.preprocessor.inverse_transform(synth)
 
-    def save(self, filepath):
+    # ─────────────────────────────────────────────────────────────────
+    # SAVE / LOAD
+    # ─────────────────────────────────────────────────────────────────
+
+    def save(self, filepath: str):
         state = {
             "generator_state":         self.generator.state_dict(),
             "disc_static_state":       self.disc_static.state_dict(),
@@ -837,11 +1040,14 @@ class DGAN:
             state["embedding_state"] = {
                 name: layer.state_dict()
                 for name, layer in self.preprocessor.embeddings.items()}
+        if self.ema_generator is not None:
+            state["ema_generator_state"] = self.ema_generator.state_dict()
         torch.save(state, filepath)
         logger.info(f"Model saved → {filepath}")
+        print(f"  Modello salvato → {filepath}")
 
     @classmethod
-    def load(cls, filepath, data_config, model_config, preprocessor, device=None):
+    def load(cls, filepath: str, data_config, model_config, preprocessor, device=None):
         state = torch.load(filepath, map_location=device or "cpu")
         dgan  = cls(data_config, model_config, preprocessor, device=device)
         dgan.generator.load_state_dict(state["generator_state"])
@@ -850,15 +1056,18 @@ class DGAN:
         dgan.opt_gen.load_state_dict(state["opt_gen_state"])
         dgan.opt_disc_static.load_state_dict(state["opt_disc_static_state"])
         dgan.opt_disc_temporal.load_state_dict(state["opt_disc_temporal_state"])
-        dgan.loss_history                     = state["loss_history"]
-        dgan.current_temperature              = state["current_temperature"]
-        dgan.preprocessor.embedding_configs   = state["embedding_configs"]
-        dgan.preprocessor.scalers_cont        = state["scalers_cont"]
-        dgan.preprocessor.inverse_maps        = state["inverse_maps"]
-        dgan.preprocessor.global_time_max     = state["global_time_max"]
+        dgan.loss_history                   = state["loss_history"]
+        dgan.current_temperature            = state["current_temperature"]
+        dgan.preprocessor.embedding_configs = state["embedding_configs"]
+        dgan.preprocessor.scalers_cont      = state["scalers_cont"]
+        dgan.preprocessor.inverse_maps      = state["inverse_maps"]
+        dgan.preprocessor.global_time_max   = state["global_time_max"]
         if "embedding_state" in state:
             for name, emb_state in state["embedding_state"].items():
                 if name in dgan.preprocessor.embeddings:
                     dgan.preprocessor.embeddings[name].load_state_dict(emb_state)
+        if "ema_generator_state" in state and dgan.ema_generator is not None:
+            dgan.ema_generator.load_state_dict(state["ema_generator_state"])
         logger.info(f"Model loaded ← {filepath}")
+        print(f"  Modello caricato ← {filepath}")
         return dgan
