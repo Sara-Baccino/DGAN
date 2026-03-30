@@ -219,6 +219,19 @@ def _scat_marginal_loss(
         ))
     return torch.stack(losses).mean() if losses else torch.tensor(0.0)
 
+def _categorical_entropy_loss(fake_logits, eps=1e-8):
+    """
+    Entropia media per-sample.
+    Penalizza distribuzioni troppo deterministiche.
+    """
+
+    soft = F.softmax(fake_logits, dim=-1)
+    log_soft = torch.log(soft.clamp(min=eps))
+
+    entropy = -(soft * log_soft).sum(dim=-1)
+
+    return entropy.mean()
+
 
 def _check_finite(loss: torch.Tensor, name: str) -> torch.Tensor:
     """Controlla NaN/Inf nelle loss e restituisce 0 con warning."""
@@ -269,6 +282,7 @@ class DGAN:
         self.lambda_var      = float(mc.lambda_var)   # varianza feature continue
         self.lambda_interval = float(getattr(mc, "lambda_interval", 2.0))  # intervalli inter-visita
         self.lambda_aux   = float(mc.lambda_aux)
+        self.lambda_delta = float(getattr(mc, "lambda_delta", 1.5))
 
         self.current_temperature = float(mc.gumbel_temperature_start)
         self.temperature_min     = float(mc.temperature_min)
@@ -294,7 +308,7 @@ class DGAN:
             "gp_static":     [], "gp_temporal": [],
             "irr_loss":      [], "fup_loss":    [], "nv_loss":       [],
             "scat_loss":     [], "fm_loss":     [], "aux_loss":      [],
-            "var_loss":      [],
+            "var_loss":      [],    #"entropy": [],
             "interval_loss": [],   # distribuzione intervalli inter-visita
             "mean_n_visits": [],
             # Statistiche per monitoring clinico
@@ -392,14 +406,37 @@ class DGAN:
     def _instance_noise_strength(self) -> float:
         """
         Restituisce la forza corrente del rumore di istanza sulle OHE reali.
-        Decade linearmente da instance_noise_start → instance_noise_end
+        Decade esponenzialmente da instance_noise_start → instance_noise_end
         nel corso delle epoche configurate.
         """
         if self.instance_noise_start <= 0:
             return 0.0
+        #total_epochs = self.model_config.epochs
+        #frac = min(self._current_epoch / max(total_epochs, 1), 1.0)
+        #return self.instance_noise_start + frac * (self.instance_noise_end - self.instance_noise_start)
+        
         total_epochs = self.model_config.epochs
-        frac = min(self._current_epoch / max(total_epochs, 1), 1.0)
-        return self.instance_noise_start + frac * (self.instance_noise_end - self.instance_noise_start)
+        t = self._current_epoch / max(total_epochs, 1)
+        # decay esponenziale (molto meglio del lineare)
+        return self.instance_noise_start * (0.1 ** t)
+    
+    def _gp_lambda(self):
+        t = self._current_epoch / max(self.model_config.epochs, 1)
+
+        # forte all’inizio → poi cala
+        scale = 1.0 - 0.7 * t   # da 1 → 0.3
+
+        return (self.lambda_gp_s * scale, self.lambda_gp_t * scale)
+    
+    def _current_max_len(self):
+        t = self._current_epoch / max(self.model_config.epochs, 1)
+
+        if t < 0.3:
+            return int(self.max_len * 0.4)
+        elif t < 0.6:
+            return int(self.max_len * 0.7)
+        else:
+            return self.max_len
 
     def _effective_lambda_scat(self) -> float:
         """
@@ -414,6 +451,39 @@ class DGAN:
         # cosine warmup: sale da 0 → lambda_scat
         scale = (1.0 - _math.cos(_math.pi * t)) / 2.0
         return self.lambda_scat * scale
+
+    def _delta_loss(self, fake_cont, real_cont, fake_valid, real_valid):
+        losses = []
+        n_cont = fake_cont.shape[-1]
+
+        for j in range(n_cont):
+            f_deltas = []
+            r_deltas = []
+
+            for b in range(fake_cont.shape[0]):
+                f_idx = fake_valid[b].nonzero(as_tuple=True)[0]
+                r_idx = real_valid[b].nonzero(as_tuple=True)[0]
+
+                if len(f_idx) > 1:
+                    f_vals = fake_cont[b, f_idx, j]
+                    f_deltas.append(f_vals[1:] - f_vals[:-1])
+
+                if len(r_idx) > 1:
+                    r_vals = real_cont[b, r_idx, j]
+                    r_deltas.append(r_vals[1:] - r_vals[:-1])
+
+            if not f_deltas or not r_deltas:
+                continue
+
+            f_d = torch.cat(f_deltas)
+            r_d = torch.cat(r_deltas)
+
+            loss_j = (f_d.mean() - r_d.mean()).pow(2)
+            loss_j += (f_d.std() - r_d.std()).pow(2)
+
+            losses.append(loss_j)
+
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=fake_cont.device)
 
     def set_train(self):
         self.generator.train()
@@ -517,11 +587,11 @@ class DGAN:
         # ── Static discriminator ──────────────────────────────────────
         d_real_s = self.disc_static(real_s)
         d_fake_s = self.disc_static(fake_s)
-        gp_s     = _gradient_penalty(
-            lambda x: self.disc_static(x), real_s, fake_s, self.device)
+        lambda_gp_s, lambda_gp_t = self._gp_lambda()
+        gp_s     = _gradient_penalty(lambda x: self.disc_static(x), real_s, fake_s, self.device)
         aux_loss = self.disc_static.auxiliary_loss(real_s, embed_targets)
         loss_d_s = (_wgan_d_loss(d_real_s, d_fake_s)
-                    + self.lambda_gp_s * gp_s
+                    + self.lambda_gp_s * gp_s   #+ self.lambda_gp_s * gp_s
                     + self.lambda_aux  * aux_loss)
         loss_d_s = _check_finite(loss_d_s, "disc_static")
 
@@ -538,7 +608,7 @@ class DGAN:
         d_fake_t = self.disc_temporal(fake_s, fake_t, fake_vf)
         gp_t     = _gradient_penalty(
             lambda x: self.disc_temporal(real_s, x, real_vf), real_t, fake_t, self.device)
-        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t) + self.lambda_gp_t * gp_t
+        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t) + self.lambda_gp_t * gp_t   #+ self.lambda_gp_t * gp_t
         loss_d_t = _check_finite(loss_d_t, "disc_temporal")
 
         if update_temporal:
@@ -604,6 +674,7 @@ class DGAN:
         if eff_lambda_scat > 0 and self.target_probs_static and fake_soft:
             scat_loss = _scat_marginal_loss(fake_soft, self.target_probs_static)
             scat_loss = _check_finite(scat_loss, "scat_loss")
+            #entropy_loss = _categorical_entropy_loss(fake_soft)
 
         # ── Feature matching ──────────────────────────────────────────
         fm_loss = torch.tensor(0.0, device=self.device)
@@ -639,6 +710,17 @@ class DGAN:
                 real_batch["valid_flag"].to(self.device),
             )
             interval_loss = _check_finite(interval_loss, "interval_loss")
+        
+        # - Delta loss (varianza intra-paziente)
+        delta_loss = torch.tensor(0.0, device=self.device)
+
+        if self.lambda_delta > 0:
+            delta_loss = self._delta_loss(
+                fake_out["temporal_cont"],
+                real_batch["temporal_cont"].to(self.device),
+                fake_out["valid_flag"],
+                real_batch["valid_flag"].to(self.device),
+            )
 
         # ── Total ─────────────────────────────────────────────────────
         total = (loss_g
@@ -648,6 +730,7 @@ class DGAN:
                  + eff_lambda_scat      * scat_loss
                  + self.lambda_fm       * fm_loss
                  + self.lambda_var      * var_loss
+                 + self.lambda_delta * delta_loss
                  + self.lambda_interval * interval_loss)
 
         total = _check_finite(total, "total_generator")
@@ -847,6 +930,17 @@ class DGAN:
             for batch_tuple in loader:
                 batch = self._reconstruct_batch(batch_tuple, keys)
                 batch = self._move(batch)
+                '''# curriculum length
+                curr_len = self._current_max_len()
+
+                batch["temporal_cont"] = batch["temporal_cont"][:, :curr_len]
+                batch["valid_flag"]    = batch["valid_flag"][:, :curr_len]
+                batch["visit_time"]    = batch["visit_time"][:, :curr_len]
+
+                if "temporal_cat" in batch:
+                    for k in batch["temporal_cat"]:
+                        batch["temporal_cat"][k] = batch["temporal_cat"][k][:, :curr_len]
+                '''
                 B     = batch["temporal_cont"].shape[0]
 
                 real_disc     = prepare_discriminator_inputs(batch, self.preprocessor)

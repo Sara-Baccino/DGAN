@@ -13,7 +13,7 @@ from model.dgan import DGAN
 
 from datetime import datetime
 # timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "4"
+timestr = "3"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -171,8 +171,8 @@ def main():
     print("GENERATING SYNTHETIC DATA")
     print("=" * 80 + "\n")
 
-    n_synthetic = df_train[data_cfg.patient_id_col].nunique()
-
+    #n_synthetic = df_train[data_cfg.patient_id_col].nunique()
+    n_synthetic = 729
     df_synthetic = dgan.generate(
         n_samples        = n_synthetic,
         temperature      = 0.5,

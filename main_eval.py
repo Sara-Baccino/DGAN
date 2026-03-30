@@ -149,7 +149,8 @@ def apply_custom_imputation(df, num_vars, cat_vars):
         
         for col in cat_vars:
             # Arrotondiamo sempre per le categoriche
-            vals_rounded = imputed_df[col].round().astype(int)
+            vals = imputed_df[col]
+            vals_rounded = np.floor(vals + 0.5).astype(int)     #imputed_df[col].round().astype(int)
             
             if col in storage_mappers:
                 # Ripristiniamo le stringhe originali ('PBC0001', ecc.)
@@ -202,7 +203,7 @@ def main(
     time_col    = data_cfg.time_col
     patient_col = data_cfg.patient_id_col
     fup_col     = data_cfg.fup_col
-    max_len     = getattr(time_cfg, "max_visits", 10)
+    max_len     = getattr(time_cfg, "max_visits", 9)
 
     # Ordiniamo per paziente e tempo e prendiamo solo le prime max_len visite
     print(f"     Troncamento dataset reale a max {max_len} visite...")
@@ -348,7 +349,7 @@ def main(
 
     # ── 4. Distribuzioni numeriche ────────────────────────────────────
     print("[4/14] Distribuzioni numeriche...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Distribuzioni Numeriche (KDE)")
     pdf.add_note(
         "Real = imputato (MICE/KNN). "
@@ -360,7 +361,7 @@ def main(
     # ── 5. Distribuzioni categoriche ──────────────────────────────────
     if cat_ok:
         print("[5/14] Distribuzioni categoriche...")
-        pdf.add_page()
+        #pdf.add_page()
         pdf.section("Distribuzioni Categoriche (Frequenze)")
         pdf.add_note(
             "Barre affiancate. "
@@ -373,7 +374,7 @@ def main(
 
     # ── 6. Correlazioni ───────────────────────────────────────────────
     print("[6/14] Matrici di correlazione...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Matrici di Correlazione")
     pdf.add_note(
         "Sinistra=reale, Centro=sintetico, Destra=|differenza|. "
@@ -391,7 +392,7 @@ def main(
 
     # ── 7. PCA ────────────────────────────────────────────────────────
     print("[7/14] PCA...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Analisi Multivariata (PCA Shared Space)")
     pdf.add_note("PCA fittato sui reali; sintetici proiettati. Croci=centroidi.")
     img = plot_pca_shared_space(real, synth, num_ok, plot_dir)
@@ -400,7 +401,7 @@ def main(
 
     # ── 8. UMAP ───────────────────────────────────────────────────────
     print("[8/14] UMAP...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Analisi Multivariata -- UMAP Projection")
     pdf.add_note(
         "UMAP proietta in 2D preservando struttura locale. "
@@ -415,7 +416,7 @@ def main(
 
     # ── 9. Traiettorie ────────────────────────────────────────────────
     print("[9/14] Traiettorie temporali...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Traiettorie Temporali (Media +/- 95% CI)")
     pdf.add_note(
         "Curva media interpolata su griglia comune. "
@@ -432,7 +433,7 @@ def main(
 
     # ── 10. Variable-by-visit ─────────────────────────────────────────
     print("[10/14] Variable-by-visit...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Variabili Temporali per Bin di Visita")
     pdf.add_note(
         "Visite in bin di tempo equidistanti. "
@@ -446,7 +447,7 @@ def main(
 
     # ── 11. Dinamiche longitudinali ───────────────────────────────────
     print("[11/14] Dinamiche longitudinali...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Analisi Dinamiche Longitudinali")
     pdf.add_metrics_table(long_metrics, "METRICHE DI SIMILARITA' LONGITUDINALE")
     pdf.add_note(
@@ -482,7 +483,7 @@ def main(
 
     var_imgs = plot_variance_grid(real, synth, temp_ok, patient_col, plot_dir)
     if var_imgs:
-        pdf.add_page()
+        #pdf.add_page()
         pdf.set_font("Arial", "B", 11)
         pdf.cell(0, 8, "Varianza Intra-paziente", ln=True)
         pdf.add_note("KDE varianza intra-paziente per ogni variabile temporale.")
@@ -491,7 +492,7 @@ def main(
 
     ac_imgs = plot_autocorrelation_grid(real, synth, temp_ok, time_col, patient_col, plot_dir)
     if ac_imgs:
-        pdf.add_page()
+        #pdf.add_page()
         pdf.set_font("Arial", "B", 11)
         pdf.cell(0, 8, "Autocorrelazione Lag-1", ln=True)
         pdf.add_note("KDE autocorrelazione tra visite consecutive per paziente.")
@@ -500,7 +501,7 @@ def main(
 
     # ── 12. Timing per posizione ──────────────────────────────────────
     print("[12/14] Timing per posizione di visita...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Timing per Posizione di Visita  [componente TFS]")
     pdf.add_note(
         "Distribuzione tempo assoluto di visita per posizione sequenziale. "
@@ -516,7 +517,7 @@ def main(
         pdf.image(pos_imgs[0], w=190)
         pdf.ln(4)
         if len(pos_imgs) > 1:
-            pdf.add_page()
+            #pdf.add_page()
             pdf.set_font("Arial", "B", 11)
             pdf.cell(0, 8, "KDE per posizione di visita", ln=True)
             pdf.add_note(
@@ -527,7 +528,7 @@ def main(
 
     # ── 13. Last visit vs t_FUP ───────────────────────────────────────
     print(f"[13/14] Last-visit vs {fup_col}...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section(f"Last Visit vs {fup_col}: Allineamento Temporale  [componente TFS]")
     pdf.add_note(
         f"Coverage = last_visit / {fup_col}: ideale = 1.0. "
@@ -553,7 +554,7 @@ def main(
 
     # ── 14. Kaplan-Meier ──────────────────────────────────────────────
     print("[14/14] KM overall + log-rank...")
-    pdf.add_page()
+    #pdf.add_page()
     pdf.section("Kaplan-Meier Overall (non stratificato) + Log-rank Test")
     pdf.add_note(
         f"KM per Real vs Synthetic usando {fup_col}. "
@@ -570,7 +571,7 @@ def main(
 
     img = plot_km_responder(real_raw, synth, time_col, patient_col, plot_dir)
     if img:
-        pdf.add_page()
+        #pdf.add_page()
         pdf.set_font("Arial", "B", 11)
         pdf.cell(0, 8, "Kaplan-Meier: Risposta POISE (ALP<=2 e BIL<=1 a mese 12)", ln=True)
         pdf.add_note(
@@ -588,7 +589,7 @@ def main(
 
 # ======================================================
 if __name__ == "__main__":
-    OUTPUT_PATH = "output/exp_5"
+    OUTPUT_PATH = "output/exp_3"
     CONFIG_PATH = "config/data_config2.json"
 
     main(

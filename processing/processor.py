@@ -51,7 +51,7 @@ from config.config_loader import DataConfig
 
 _logger = logging.getLogger(__name__)
 
-MAP_MISSING = "__MISSING__"
+MAP_MISSING = 0 #"__MISSING__"
 
 
 class Preprocessor:
@@ -132,6 +132,9 @@ class Preprocessor:
         df            = df.reset_index(drop=True)
         df            = self._force_types(df)
         df            = self._impute(df)
+        cat_cols = [v.name for v in self.vars if v.kind == "categorical" and v.name in df.columns]
+        assert not df[cat_cols].isna().any().any(), "Ci sono ancora NaN nelle categoriche dopo imputazione"
+
         df            = self._encode_categoricals(df)
         padded        = self._long_to_padded(df)
         padded        = self._fit_scalers(padded)
@@ -286,10 +289,20 @@ class Preprocessor:
             if v.kind == "continuous":
                 df[v.name] = pd.to_numeric(df[v.name], errors="coerce")
             else:
-                col = df[v.name].astype(str)
-                col = col.where(~col.str.lower().isin(_STR_NANS), other=MAP_MISSING)
-                col = col.fillna(MAP_MISSING)
-                df[v.name] = col
+                #col = df[v.name].astype(str)
+                #col = col.where(~col.str.lower().isin(_STR_NANS), other=MAP_MISSING)
+                #col = col.fillna(MAP_MISSING)
+                #df[v.name] = col.astype(int)
+                # categoriche → converti prima a float, poi sostituisci missing e cast a int
+                if v.dtype == "int":
+                    # converti numeriche → int, missing a 0
+                    #col = pd.to_numeric(df[v.name], errors="coerce")    #.fillna(MAP_MISSING)
+                    #df[v.name] = col.astype(int)
+                    df[v.name] = pd.to_numeric(df[v.name], errors="coerce").astype("Int64")
+
+                else:  # stringhe
+                    df[v.name] = df[v.name].astype(str).str.strip().replace({"nan": np.nan, "None": np.nan, "": np.nan})
+                    #col = col.where(~col.str.lower().isin(_STR_NANS), other=str(MAP_MISSING))
         return df
 
     # ==================================================================
@@ -311,6 +324,7 @@ class Preprocessor:
         _validate_dataframe).
         """
         df = df.copy()
+        df = df.replace({pd.NA: np.nan})
 
         # ── 1. Temporali continue — MICE ──────────────────────────────
         temp_cont_names = [v.name for v in self.vars
@@ -322,7 +336,7 @@ class Preprocessor:
             if np.isnan(tc_data).any():
                 try:
                     imputer = IterativeImputer(
-                        max_iter=self.mice_max_iter, random_state=0, min_value=-np.inf)
+                        max_iter=self.mice_max_iter, tol=1e-2, random_state=0, min_value=-np.inf)
                     imputer.fit(tc_data)
                     self._mice_temporal = imputer
                     df[temp_cont_names] = imputer.transform(tc_data).astype(np.float32)
@@ -365,9 +379,11 @@ class Preprocessor:
         stat_cat_names = [v.name for v in self.vars
                           if v.static and v.kind == "categorical"
                           and v.name in df.columns]
+        #for col in stat_cat_names:
+        #    print(col, df[col].dtype, df[col].isna().sum())
         if stat_cat_names:
-            n_missing = sum(
-                (df[n] == MAP_MISSING).sum() for n in stat_cat_names)
+            #n_missing = sum((df[n] == MAP_MISSING).sum() for n in stat_cat_names)
+            n_missing = sum(df[n].isna().sum() for n in stat_cat_names)
             if n_missing > 0:
                 try:
                     df = self._knn_impute_cat(df, stat_cat_names, key="static")
@@ -378,17 +394,22 @@ class Preprocessor:
                         UserWarning,
                     )
                     for col in stat_cat_names:
-                        mode = df[col][df[col] != MAP_MISSING].mode()
-                        if len(mode) > 0:
-                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+                        #mode = df[col][df[col] != MAP_MISSING].mode()
+                        if df[col].isna().any():
+                            mode = df[col].dropna().mode()
+                            if len(mode) > 0:
+                                #df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+                                df[col] = df[col].fillna(mode.iloc[0])
+                            else:
+                                raise ValueError(f"{col} completamente NaN anche dopo KNN")
 
         # ── 4. Categoriche temporali — KNN ────────────────────────────
         temp_cat_names = [v.name for v in self.vars
                           if not v.static and v.kind == "categorical"
                           and v.name in df.columns]
         if temp_cat_names:
-            n_missing = sum(
-                (df[n] == MAP_MISSING).sum() for n in temp_cat_names)
+            #n_missing = sum((df[n] == MAP_MISSING).sum() for n in temp_cat_names)
+            n_missing = sum(df[n].isna().sum() for n in temp_cat_names)
             if n_missing > 0:
                 try:
                     df = self._knn_impute_cat(df, temp_cat_names, key="temporal")
@@ -399,9 +420,13 @@ class Preprocessor:
                         UserWarning,
                     )
                     for col in temp_cat_names:
-                        mode = df[col][df[col] != MAP_MISSING].mode()
+                        #mode = df[col][df[col] != MAP_MISSING].mode()
+                        mode = df[col].dropna().mode()
                         if len(mode) > 0:
-                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+                            #df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+                            df[col] = df[col].fillna(mode.iloc[0])
+                        else:
+                            raise ValueError(f"{col} completamente NaN anche dopo KNN")
 
         return df
 
@@ -418,8 +443,10 @@ class Preprocessor:
         num_df = pd.DataFrame(index=df.index)
 
         for name in cat_names:
-            col  = df[name]
-            uniq = [v for v in col.unique() if v != MAP_MISSING]
+            col = df[name].astype(object)
+            col = col.where(pd.notna(col), np.nan)
+            #uniq = [v for v in col.unique() if v != MAP_MISSING]
+            uniq = [v for v in col.dropna().unique()]
             if not uniq:
                 warnings.warn(
                     f"Variabile categorica '{name}': tutti i valori sono missing. "
@@ -461,8 +488,9 @@ class Preprocessor:
         arr_rounded = np.round(arr).astype(int).clip(1, None)
         for j, name in enumerate(cat_names):
             codes = arr_rounded[:, j]
-            inv   = {i + 1: u for i, u in enumerate(
-                [v for v in df[name].unique() if v != MAP_MISSING])}
+            #inv   = {i + 1: u for i, u in enumerate(
+            #    [v for v in df[name].unique() if v != MAP_MISSING])}
+            inv = {i + 1: u for i, u in enumerate([v for v in df[name].dropna().unique()])}
             if not inv:
                 continue
             df[name] = [inv.get(c, inv[min(inv)]) for c in codes]
@@ -476,12 +504,22 @@ class Preprocessor:
     def _encode_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
         """Dopo l'imputazione non ci sono più MAP_MISSING → encoding diretto."""
         df = df.copy()
+        
         for v in self.vars:
+            if df[v.name].isna().any():
+                raise ValueError(f"{v.name} contiene ancora NaN dopo imputazione")
+            
             if v.kind != "categorical" or v.name not in df.columns:
                 continue
+            # prepara mapping coerente
+            if v.dtype == "int":
+                v.mapping = {int(k): int(vv) for k, vv in v.mapping.items()}
+            else:  # stringhe
+                v.mapping = {str(k): int(vv) for k, vv in v.mapping.items()}
+
             # Controlla valori fuori mapping
             known = set(v.mapping.keys())
-            unknown = set(df[v.name].unique()) - known - {MAP_MISSING}
+            unknown = set(df[v.name].unique()) - known #- {MAP_MISSING}
             if unknown:
                 warnings.warn(
                     f"Variable '{v.name}': valori non nel mapping: {unknown}. "
@@ -489,9 +527,7 @@ class Preprocessor:
                     UserWarning,
                 )
             self.inverse_maps[v.name] = {val: key for key, val in v.mapping.items()}
-            df[v.name] = df[v.name].map(
-                lambda x, m=v.mapping: m.get(x, 1)
-            ).astype(int)
+            df[v.name] = df[v.name].map(lambda x, m=v.mapping: m.get(x, 1)).astype(int)
         return df
 
     # ==================================================================
