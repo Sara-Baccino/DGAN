@@ -1,15 +1,15 @@
 **1. Panoramica**
 
 DoppelGANger (DGAN) è un modello generativo basato su GAN progettato per produrre dati longitudinali sintetici con caratteristiche statiche (baseline) e temporali (follow-up).
-L’obiettivo principale è generare sequenze realistiche di variabili cliniche o altre serie temporali di pazienti, preservando le relazioni tra le variabili statiche e temporali, anche quando alcune variabili sono irreversibili (ad esempio eventi clinici che una volta accaduti non possono tornare indietro).
+L’obiettivo principale è generare sequenze realistiche di variabili cliniche o altre serie temporali di pazienti, preservando le relazioni tra le variabili statiche e temporali.
 
-Il modello supporta anche Differential Privacy tramite Opacus, permettendo di generare dati sintetici rispettando la privacy dei pazienti reali.
+Il modello può supportare anche Differential Privacy tramite Opacus, permettendo di generare dati sintetici rispettando la privacy dei pazienti reali.
 
 **2. Struttura del modello**
 
 Il modello è composto da tre componenti principali:
-  - Generatore Gerarchico;
-  - Discriminatore Statico;
+  - Generatore Gerarchico
+  - Discriminatore Statico
   - Discriminatore Temporale
 
 
@@ -17,152 +17,73 @@ Il modello è composto da tre componenti principali:
 
 Il generatore crea sequenze sintetiche sia per le variabili statiche sia per quelle temporali:
 
-Statiche (baseline):
+**Statiche** (baseline): generate a partire dalla componente di rumore z_static  [B, z_s]. In particolare, vengono gestit 3 tipi di variabili:
 
-  -Variabili continue → passano attraverso una rete fully connected con ReLU.
-  
+  -Variabili continue → passano attraverso una rete fully connected.
   -Variabili categoriche → codificate tramite softmax (con Gumbel-Softmax per campionamento differenziabile).
-  
   -Variabili irreversibili → inizializzate come probabilità e aggiornate tramite una logica di hazard nel tempo.
 
+La fase statica funziona da inizializzazione per quella temporale. Infatti, il rumore $z_{static}$ passa attraverso 3 heads lineari:
+  -to_h0: Si crea lo stato interno iniziale h0 della rete GRU e rappresenta le informazioni di baseline del paziente;
+  -followup_head: Predice quanto durerà in totale la storia clinica del paziente ($t_{FUP}$), indipendentemente da quante visite farà;
+  -visit_times: Predice quante visite avrà quel paziente.
 
-Temporali (follow-up):
+**Temporali** (follow-up): generate a partire dalla componente di rumore z_temporal [B, T, z_t]. 
+Se configurato con noise_ar_rho > 0, questo rumore segue un processo AR(1), ovvero il rumore allo step $t$ è correlato a quello dello step $t-1$.
 
-Generazione step-by-step tramite un GRU, dove l’input ad ogni step include:
+La generazione temporale è autoregressiva step-by-step e avviene tramite GRU, eseguendo un loop sul range(T). L’input ad ogni step include:
 
-  -Rumore latente temporale (z_temporal)
-  
-  -Embedding delle feature statiche
-  
-  -Tempo normalizzato [0,1]
+  -Rumore latente temporale specifico per lo step corrente  (z_temporal, t)
+  -Valori delle analisi generate allo step precedente
+  -Intervallo di tempo passato dall'ultima visita (delta_prev)
 
-  -Stato delle variabili irreversibili
+Una volta che la GRU ha aggiornato il suo stato interno $h_t$, il modello usa diverse teste specializzate per trasformare quel vettore astratto in dati clinici:
 
+  -Variabili continue (temporal_cont_head)
+  -Intervalli di Tempo (interval_head), viene usato Softplus per garantire che delta_t>0
+  -Variabili categoriche, tramite Gumbel-Softmax
+  -Variabili irreversibili, tramite cummax su hazard
 
-Head separate per:
+Il tempo delle visite viene normalizzato in [0,1], dove 1 non coincide necessariamente con t_FUP e si ottiene con cumsum(delta).
+Il numero di visite è limitato da min_visits e max_visits.
+Viene applicata una valid_flag (maschera booleana) per mantenere consistenza tra lunghezze diverse delle sequenze, indicando quali visite sono di padding e quali sono reali.
 
-  -Variabili continue → sigmoid scaling
-  
-  -Variabili categoriche → Gumbel-Softmax
-  
-  -Variabili irreversibili → aggiornamento tramite hazard + teacher forcing opzionale
-
-Il mask viene applicato solo al livello di output per mantenere consistenza tra lunghezze diverse delle sequenze.
 
 **2.2 Discriminatori**
 
-Per addestrare il generatore, DGAN utilizza due discriminatori separati, entrambi basati su WGAN con gradient penalty:
+Per addestrare il generatore, DGAN utilizza due discriminatori separati, basati su WGAN con gradient penalty. 
+Entrambi i modelli integrano la Spectral Normalization per garantire la stabilità del training e il controllo della costante di Lipschitz.
 
-*Static Discriminator:*
-
-  Rete fully connected a più layer con LeakyReLU.
-  
-  Valuta la plausibilità delle feature statiche sintetiche rispetto a quelle reali.
+*Static Discriminator*: Valuta la plausibilità delle feature statiche sintetiche rispetto a quelle reali.
+Rete MLP Residua che prende in input un vettore concatenato $[B, D_{static}]$ contenente variabili continue, categoriche (one-hot) ed embedding.
+Include teste di classificazione multi-task che forzano il modello a ricostruire le classi originali delle variabili statiche, riducendo il rischio di mode collapse.  
 
 
-*Temporal Discriminator:*
+*Temporal Discriminator*: Analizza la dinamica delle visite nel tempo, integrando il contesto statico per validare la coerenza clinica.
 
-  GRU per processare sequenze temporali.
-  
-  Combina la rappresentazione temporale con le feature statiche.
-  
-  Applica masking per lunghezze diverse delle sequenze.
+Input: Tensore 3D $[B, T, D_{temp} + 1]$ dove $+1$ rappresenta il followup_norm (tempo totale di osservazione) broadcastato su ogni step
 
-Output finale → plausibilità della sequenza completa.
+Supporta due modalità configurabili tramite il parametro "arch":
+-CNN (Default): Rete neurale convoluzionale dilatata. Utilizza campi ricettivi esponenziali per catturare dipendenze a lungo termine senza l'instabilità delle reti ricorrenti.
+-GRU: Unità ricorrente per processare la sequenza in modo autoregressivo (per retrocompatibilità).
+
+Meccanismo di Attention Pooling guidato dal valid_flag. Il discriminatore calcola uno score di importanza per ogni visita e ignora attivamente i passi di padding, permettendo di gestire coorti con numero di visite altamente variabile.
+
 
 **3. Funzionamento del Training**
 
-Il training segue la logica tipica delle Wasserstein GAN con gradient penalty, con alcune modifiche per le sequenze temporali e le variabili irreversibili:
+Il modello viene addestrato seguendo lo schema WGAN-GP (Wasserstein GAN con Gradient Penalty), ottimizzato per la stabilità su dataset medici di piccole dimensioni.
 
-*Input:*
+#### Meccanismi di Stabilità
+- **Feature Matching (FM):** Oltre alla loss avversaria standard, il Generatore minimizza la distanza MSE tra le attivazioni intermedie del Discriminatore per dati reali e sintetici. 
+Questo forza la corrispondenza delle distribuzioni latenti profonde.
+- **GP Curriculum:** Il coefficiente di Gradient Penalty viene aumentato linearmente durante le prime epoche per permettere una fase di esplorazione iniziale senza instabilità dei gradienti.
+- **EMA (Exponential Moving Average):** Viene mantenuta una copia "slow" dei pesi del generatore (EMA Generator) per la fase di inferenza, riducendo le oscillazioni tipiche delle GAN.
 
-Batch di dati reali pre-elaborati dal preprocessor.
-
-Rumore latente z_static e z_temporal campionato da distribuzione normale.
-
-
-*Aggiornamento discriminatori:*
-
-Per ogni batch, il generatore produce dati sintetici.
-
-
-*Calcolo delle loss WGAN:*
-
-d_real vs d_fake per static e temporal discriminator.
-
-Applicazione del gradient penalty per stabilizzare il training.
-
-Backprop e aggiornamento dei pesi dei discriminatori.
-
-Ripetizione per più round per stabilizzare il training dei discriminatori rispetto al generatore.
-
-
-*Aggiornamento generatore:*
-
-Generazione di dati sintetici usando z_static e z_temporal.
-
-Loss del generatore: massimizzare il punteggio dei discriminatori (-(D_static + D_temporal)).
-
-Se presenti variabili irreversibili, viene calcolata anche la irreversibility loss, penalizzando i flip 1→0 nelle sequenze binarie.
-
-
-*Annealing della temperatura Gumbel-Softmax:*
-
-La temperatura τ parte da un valore iniziale e decresce esponenzialmente fino ad un valore minimo, per rendere le variabili categoriali quasi discrete alla fine del training.
-
-**Differential Privacy (opzionale):**
-
-Se attivato, Opacus aggiunge rumore ai gradienti dei discriminatori e limita la norma dei gradienti.
-
-Durante il training, viene monitorato ε per valutare la privacy.
-
-
-*Logging e tracciamento:*
-
-Loss generator e discriminatori salvati per ogni batch.
-
-Monitoraggio di ε se DP è attivo.
-
-Possibilità di generare plot dell’andamento delle loss nel tempo.
-
-**4. Generazione dei dati sintetici**
-
-Una volta addestrato, il modello genera dati sintetici con generate(n_samples):
-
-- Campiona rumore latente z_static e z_temporal.
-
-- Passa attraverso il generatore gerarchico.
-
-- Applica inverse transform per riportare i valori scalati e le one-hot categorical a valori interpretabili.
-
-- Restituisce dataset sintetico completo con:
-
-    -Feature statiche continue e categoriche
-    -Sequenze temporali continue e categoriali
-    -Possibilità di generare sequenze complete o tronche (simulando mancati follow-up)
-
-**5. Output del training**
-
-Dopo il training, il modello fornisce:
-
-DGAN.generate() → dataset sintetico completo
-
-*File salvati:*
-
-Modello PyTorch (.pt)
-
-Plot delle loss (generator, discriminatori, ε)
-
-Dataset sintetico in formato Excel o CSV
-
-
-
-
-
-Teacher forcing: permette di utilizzare i valori reali delle variabili irreversibili durante la generazione per stabilizzare il training.
-
-Hazard irreversible: gestisce le variabili irreversibili step-by-step, calcolando la probabilità di evento e aggiornando lo stato binario.
-
-Mask temporale: gestisce sequenze di lunghezza variabile, ma non è più necessario fornire un value-mask al generatore.
-
-
+#### Loss Funzionali Specifiche
+Il Generatore ottimizza una funzione di costo multi-obiettivo:
+1.  **Adversarial Loss:** WGAN-GP per la verosimiglianza globale.
+2.  **Variance Loss:** Penalizza discrepanze nella deviazione standard delle feature continue (fondamentale per biomarker come l'albumina).
+3.  **Delta/Interval Loss:** Assicura che la distribuzione temporale delle visite (intervalli Δt) rispecchi la frequenza clinica reale.
+4.  **Autocorrelation Loss:** Forza il modello a rispettare la "smoothness" temporale (es. impedisce salti bio-fisicamente impossibili tra due step adiacenti).
+5.  **Irreversibility Loss:** Vincola variabili come il decesso o la cirrosi a stati non regressivi.
