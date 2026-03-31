@@ -19,14 +19,14 @@ Il generatore crea sequenze sintetiche sia per le variabili statiche sia per que
 
 **Statiche** (baseline): generate a partire dalla componente di rumore z_static  [B, z_s]. In particolare, vengono gestit 3 tipi di variabili:
 
-  -Variabili continue → passano attraverso una rete fully connected.
-  -Variabili categoriche → codificate tramite softmax (con Gumbel-Softmax per campionamento differenziabile).
-  -Variabili irreversibili → inizializzate come probabilità e aggiornate tramite una logica di hazard nel tempo.
+    -Variabili continue → passano attraverso una rete fully connected.
+    -Variabili categoriche → codificate tramite softmax (con Gumbel-Softmax per campionamento differenziabile).
+    -Variabili irreversibili → inizializzate come probabilità e aggiornate tramite una logica di hazard nel tempo.
 
 La fase statica funziona da inizializzazione per quella temporale. Infatti, il rumore $z_{static}$ passa attraverso 3 heads lineari:
-  -to_h0: Si crea lo stato interno iniziale h0 della rete GRU e rappresenta le informazioni di baseline del paziente;
-  -followup_head: Predice quanto durerà in totale la storia clinica del paziente ($t_{FUP}$), indipendentemente da quante visite farà;
-  -visit_times: Predice quante visite avrà quel paziente.
+    -to_h0: Si crea lo stato interno iniziale h0 della rete GRU e rappresenta le informazioni di baseline del paziente;
+    -followup_head: Predice quanto durerà in totale la storia clinica del paziente ($t_{FUP}$), indipendentemente da quante visite farà;
+    -visit_times: Predice quante visite avrà quel paziente.
 
 **Temporali** (follow-up): generate a partire dalla componente di rumore z_temporal [B, T, z_t]. 
 Se configurato con noise_ar_rho > 0, questo rumore segue un processo AR(1), ovvero il rumore allo step $t$ è correlato a quello dello step $t-1$.
