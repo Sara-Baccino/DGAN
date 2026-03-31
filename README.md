@@ -24,18 +24,18 @@ Il generatore crea sequenze sintetiche sia per le variabili statiche sia per que
     -Variabili irreversibili → inizializzate come probabilità e aggiornate tramite una logica di hazard nel tempo.
 
 La fase statica funziona da inizializzazione per quella temporale. Infatti, il rumore $z_{static}$ passa attraverso 3 heads lineari:
-    -to_h0: Si crea lo stato interno iniziale h0 della rete GRU e rappresenta le informazioni di baseline del paziente;
-    -followup_head: Predice quanto durerà in totale la storia clinica del paziente ($t_{FUP}$), indipendentemente da quante visite farà;
-    -visit_times: Predice quante visite avrà quel paziente.
+    - to_h0: Si crea lo stato interno iniziale h0 della rete GRU e rappresenta le informazioni di baseline del paziente;
+    - followup_head: Predice quanto durerà in totale la storia clinica del paziente ($t_{FUP}$), indipendentemente da quante visite farà;
+    - visit_times: Predice quante visite avrà quel paziente.
 
 **Temporali** (follow-up): generate a partire dalla componente di rumore z_temporal [B, T, z_t]. 
 Se configurato con noise_ar_rho > 0, questo rumore segue un processo AR(1), ovvero il rumore allo step $t$ è correlato a quello dello step $t-1$.
 
 La generazione temporale è autoregressiva step-by-step e avviene tramite GRU, eseguendo un loop sul range(T). L’input ad ogni step include:
 
-  -Rumore latente temporale specifico per lo step corrente  (z_temporal, t)
-  -Valori delle analisi generate allo step precedente
-  -Intervallo di tempo passato dall'ultima visita (delta_prev)
+  - Rumore latente temporale specifico per lo step corrente  (z_temporal, t)
+  - Valori delle analisi generate allo step precedente
+  - Intervallo di tempo passato dall'ultima visita (delta_prev)
 
 Una volta che la GRU ha aggiornato il suo stato interno $h_t$, il modello usa diverse teste specializzate per trasformare quel vettore astratto in dati clinici:
 
@@ -64,8 +64,8 @@ Include teste di classificazione multi-task che forzano il modello a ricostruire
 Input: Tensore 3D $[B, T, D_{temp} + 1]$ dove $+1$ rappresenta il followup_norm (tempo totale di osservazione) broadcastato su ogni step
 
 Supporta due modalità configurabili tramite il parametro "arch":
--CNN (Default): Rete neurale convoluzionale dilatata. Utilizza campi ricettivi esponenziali per catturare dipendenze a lungo termine senza l'instabilità delle reti ricorrenti.
--GRU: Unità ricorrente per processare la sequenza in modo autoregressivo (per retrocompatibilità).
+- CNN (Default): Rete neurale convoluzionale dilatata. Utilizza campi ricettivi esponenziali per catturare dipendenze a lungo termine senza l'instabilità delle reti ricorrenti.
+- GRU: Unità ricorrente per processare la sequenza in modo autoregressivo (per retrocompatibilità).
 
 Meccanismo di Attention Pooling guidato dal valid_flag. Il discriminatore calcola uno score di importanza per ogni visita e ignora attivamente i passi di padding, permettendo di gestire coorti con numero di visite altamente variabile.
 
@@ -75,10 +75,10 @@ Meccanismo di Attention Pooling guidato dal valid_flag. Il discriminatore calcol
 Il modello viene addestrato seguendo lo schema WGAN-GP (Wasserstein GAN con Gradient Penalty), ottimizzato per la stabilità su dataset medici di piccole dimensioni.
 
 #### Meccanismi di Stabilità
-- **Feature Matching (FM):** Oltre alla loss avversaria standard, il Generatore minimizza la distanza MSE tra le attivazioni intermedie del Discriminatore per dati reali e sintetici. 
+  - **Feature Matching (FM):** Oltre alla loss avversaria standard, il Generatore minimizza la distanza MSE tra le attivazioni intermedie del Discriminatore per dati reali e sintetici. 
 Questo forza la corrispondenza delle distribuzioni latenti profonde.
-- **GP Curriculum:** Il coefficiente di Gradient Penalty viene aumentato linearmente durante le prime epoche per permettere una fase di esplorazione iniziale senza instabilità dei gradienti.
-- **EMA (Exponential Moving Average):** Viene mantenuta una copia "slow" dei pesi del generatore (EMA Generator) per la fase di inferenza, riducendo le oscillazioni tipiche delle GAN.
+  - **GP Curriculum:** Il coefficiente di Gradient Penalty viene aumentato linearmente durante le prime epoche per permettere una fase di esplorazione iniziale senza instabilità dei gradienti.
+  - **EMA (Exponential Moving Average):** Viene mantenuta una copia "slow" dei pesi del generatore (EMA Generator) per la fase di inferenza, riducendo le oscillazioni tipiche delle GAN.
 
 #### Loss Funzionali Specifiche
 Il Generatore ottimizza una funzione di costo multi-obiettivo:
