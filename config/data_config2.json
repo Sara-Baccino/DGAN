@@ -1,6 +1,6 @@
 {
   "time": {
-    "max_visits": 9,
+    "max_visits": 40,
     "visit_column": "MONTHS_FROM_BASELINE",
     "patient_id": "RECORD_ID",
     "fup_column": "t_FUP",
@@ -11,6 +11,7 @@
     "mice_max_iter": 10,
     "knn_neighbors": 5,
     "log_vars": ["ALP", "ALT", "AST", "BIL", "GGT", "CRE", "TRIGVAL"],
+    "emb_vars": {"CENTRE": 12},
     "clip_z": 4.0
   },
 
@@ -93,78 +94,7 @@
       {"name": "BIL", "type": "float"},
       {"name": "GGT", "type": "float"},
       {"name": "PLC", "type": "float"}
-    ]
-  },
-
-  "outcomes": ["DEATH", "TRANSP"],
-
-  "model": {
-    "z_static_dim":   64,
-    "z_temporal_dim": 32,
-    "hidden":         64,
-
-    "epochs":     120,
-    "patience":   50,
-    "batch_size":  64,
-    "lr_g":    1e-4,
-    "lr_d_s":  1e-4,
-    "lr_d_t":  5e-5,
-
-    "optimizer_betas":       [0.5, 0.9],
-    "dataloader_drop_last":  true,
-
-    "generator": {
-      "arch":          "gru",
-      "hidden_dim":    64,
-      "n_layers":        2,
-      "bidirectional": true,
-      "dropout":       0.2,
-      "z_static_dim":   64,
-      "z_temporal_dim": 32
-    },
-
-    "static_discriminator": {
-      "static_layers":  4,
-      "mlp_hidden_dim": 128,
-      "dropout":        0.1
-    },
-
-    "temporal_discriminator": {
-      "arch":         "cnn",
-      "hidden_dim":   96,
-      "kernel_size":    3,
-      "n_layers":       3,
-      "dilation_base":  2,
-      "mlp_layers":     3,
-      "dropout":       0.1
-    },
-
-    "noise_std":     0.1,
-    "noise_ar_rho":  0,
-    "grad_clip":     3.5,
-    "use_dp":        false,
-
-    "critic_steps":          5,
-    "critic_steps_temporal": 3,
-
-    "gumbel_temperature_start": 0.95,
-    "temperature_min":          0.5,
-
-    "lambda_gp_s": 12,
-    "lambda_gp_t": 12,
-
-    "alpha_irr":        0.4,
-    "lambda_aux":       0.2,
-    "lambda_fup":       1.5,
-    "lambda_nv":        1.0,
-    "lambda_static_cat": 1,
-    "lambda_fm":         0.2,
-    "lambda_var":       1,
-    "lambda_interval":  1,
-
-    "ema_decay": 0.999,              
-    "instance_noise_start": 0.5,    
-    "instance_noise_end": 0.0,       
-    "lambda_scat_warmup_epochs": 50 
+    ],
+  "categorical": {}
   }
 }

@@ -242,7 +242,7 @@ def compute_statistical_fidelity_score(dist_metrics: dict) -> StatisticalFidelit
     sfs.ks_raw     = _get("Avg Kolmogorov-Smirnov Distance ((lower) better)")
     sfs.cat_raw    = _get("Avg Categorical Overlap [0-1] ((higher) better)")
     sfs.corr_c_raw = _get("Correlation Distance - Continuous (MAE Pearson)")
-    sfs.corr_k_raw = _get("Correlation Distance - Categorical (MAE Cramér's V)")
+    sfs.corr_k_raw = _get("Correlation Distance - Categorical (MAE Cramer's V)")
     sfs.pca_c_raw  = _get("PCA Centroid Similarity [0-1] ((higher) better)")
     sfs.pca_o_raw  = _get("PCA Distribution Overlap [0-1] ((higher) better)")
 

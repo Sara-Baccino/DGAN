@@ -24,7 +24,7 @@ def calculate_similarity_metrics(
 ) -> dict:
     metrics = {}
 
-    ks_scores, wass_scores, wass_exp_scores, js_scores = [], [], [], []
+    ks_scores, wass_scores, wass_linear_scores, js_scores = [], [], [], []
 
     for v in num_vars:
         r = real[v].dropna().values
@@ -37,8 +37,14 @@ def calculate_similarity_metrics(
 
             w = wasserstein_distance(r, s)
             wass_scores.append(w)
-            scale = np.std(np.concatenate([r, s])) + 1e-9
-            wass_exp_scores.append(np.exp(-w / scale))
+            #versione esponenziale
+            #scale = np.std(np.concatenate([r, s])) + 1e-9
+            #wass_scores.append(np.exp(-w / scale))
+            #versione lineare
+            range_ = np.max(np.concatenate([r, s])) - np.min(np.concatenate([r, s])) + 1e-9
+            wass_linear = 1 - (w / range_)
+            wass_linear = np.clip(wass_linear, 0, 1)
+            wass_linear_scores.append(wass_linear)
 
             combined = np.concatenate([r, s])
             bins = np.histogram_bin_edges(combined, bins=50)
@@ -56,8 +62,8 @@ def calculate_similarity_metrics(
     metrics["Avg Wasserstein Distance ((lower) better)"] = (
         np.mean(wass_scores) if wass_scores else "N/A"
     )
-    metrics["Avg Wasserstein Exp Similarity [0-1] ((higher) better)"] = (
-        np.mean(wass_exp_scores) if wass_exp_scores else "N/A"
+    metrics["Avg Wasserstein Lin Similarity [0-1] ((higher) better)"] = (
+        np.mean(wass_linear_scores) if wass_linear_scores else "N/A"
     )
     metrics["Avg Jensen-Shannon Divergence [0-1] ((lower) better)"] = (
         np.mean(js_scores) if js_scores else "N/A"
@@ -91,7 +97,8 @@ def calculate_correlation_distance(
         return 0.0
     r_corr = real[num_vars].corr().fillna(0).values
     s_corr = synth[num_vars].corr().fillna(0).values
-    return float(np.mean(np.abs(r_corr - s_corr)))
+    mask = ~np.eye(len(r_corr), dtype=bool)
+    return float(np.mean(np.abs(r_corr[mask] - s_corr[mask])))
 
 
 def _cramers_v(x: pd.Series, y: pd.Series) -> float:
@@ -124,7 +131,7 @@ def _build_assoc_matrix(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
 def calculate_categorical_correlation_distance(
     real: pd.DataFrame, synth: pd.DataFrame, cat_vars: list[str]
 ) -> float | str:
-    """MAE between pairwise Cramér's V matrices (categorical vars)."""
+    """MAE between pairwise Cramer's V matrices (categorical vars)."""
     if not cat_vars or len(cat_vars) < 2:
         return "N/A"
     r_mat = _build_assoc_matrix(real, cat_vars)
@@ -158,7 +165,8 @@ def calculate_pca_overlap_score(
 
     centroid_dist = np.linalg.norm(Zr.mean(axis=0) - Zs.mean(axis=0))
     scale = np.sqrt(Zr.var(axis=0).sum())
-    centroid_sim = float(np.exp(-centroid_dist / (scale + 1e-9)))
+    #centroid_sim = float(np.exp(-centroid_dist / (scale + 1e-9)))
+    centroid_sim = 1 - (centroid_dist / (centroid_dist + scale))    #lineare
 
     d_sr, _ = NearestNeighbors(n_neighbors=1).fit(Zr).kneighbors(Zs)
     d_rr, _ = NearestNeighbors(n_neighbors=2).fit(Zr).kneighbors(Zr)
@@ -180,8 +188,8 @@ def privacy_metrics(
     s = synth[num_vars].dropna()
     n = min(len(r), len(s))
     scaler = StandardScaler()
-    r_s = scaler.fit_transform(r.iloc[:n])
-    s_s = scaler.transform(s.iloc[:n])
+    r_s = scaler.fit_transform( r.sample(n, random_state=42))
+    s_s = scaler.transform( s.sample(n, random_state=42))
     nn   = NearestNeighbors(n_neighbors=2).fit(r_s)
     dist, _ = nn.kneighbors(s_s)
     dcr  = dist[:, 0] / (dist[:, 1] + 1e-8)

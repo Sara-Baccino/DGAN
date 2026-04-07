@@ -313,7 +313,9 @@ def _ks_to_score(ks: float) -> float:
     Converte KS distance [0,1] in score [0,1].
     Curva esponenziale: KS=0 → 1.0, KS=0.3 → 0.41, KS=1 → 0.05.
     """
-    return float(np.exp(-3.0 * np.clip(ks, 0.0, 1.0)))
+    if np.isnan(ks):
+        return float("nan")
+    return float(np.clip(1.0 - ks, 0.0, 1.0))
 
 
 def compute_temporal_fidelity_score(

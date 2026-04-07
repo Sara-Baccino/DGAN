@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-# ======================================================
-# main_eval.py  [v3 — config-driven + SFS/LFS/TFS]
+# main_eval.py  
 # Entry point for synthetic data validation report.
 #
 # Struttura sezioni:
@@ -19,23 +17,60 @@
 #  13. Last Visit vs t_FUP
 #  14. Kaplan-Meier Overall + POISE
 #
-# Note metodologiche:
+# Attenzione:
 #   - real = imputato (MICE/KNN) dal Preprocessor, troncato a max_len
 #   - real_raw = solo per fup/TFS/KM (t_FUP non cambia con imputazione)
 #   - Metriche longitudinali su real troncato (confronto equo con synth)
-#   - Categoriche: cast int + decode via inverse_maps, barre affiancate
+#   - Categoriche: cast int + decode via inverse_maps
 # ======================================================
 
 import os
 import numpy as np
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from config.config_loader import load_config, build_data_config
+from sklearn.experimental import enable_iterative_imputer  # Necessario per MICE
+from sklearn.impute import IterativeImputer, KNNImputer
 
-from eval.config import make_plot_dir
-from eval.report_pdf import ReportPDF
+from processing.processor import Preprocessor
+
+from eval.report_pdf import make_plot_dir, ReportPDF, plot_scores_dashboard
+'''
+from eval.metrics import (
+    calculate_similarity_metrics,
+    calculate_correlation_distance,
+    calculate_categorical_correlation_distance,
+    calculate_pca_overlap_score,
+    privacy_metrics,
+    calculate_longitudinal_metrics,
+    compute_visit_position_metrics,
+    compute_temporal_fidelity_score,
+    compute_statistical_fidelity_score,
+    compute_longitudinal_fidelity_score,
+    compute_temporal_coherence_score,
+    plot_umap,
+    plot_km_overall,
+    plot_variable_by_visit,
+    plot_numeric_grid,
+    plot_categorical_grid,
+    plot_correlation_comparison,
+    plot_pca_shared_space,
+    plot_temporal_trajectory,
+    plot_slope_grid,
+    plot_variance_grid,
+    plot_autocorrelation_grid,
+    plot_visit_distribution,
+    plot_visit_timing,
+    plot_temporal_cross_correlation,
+    plot_km_responder,
+    plot_visit_position_timing,
+    plot_last_visit_vs_d3fup,
+    compute_last_visit_vs_d3fup_metrics,
+)
+'''
 from eval.metrics_distribution import (
     calculate_similarity_metrics,
     calculate_correlation_distance,
@@ -55,9 +90,6 @@ from eval.metrics_scores import (
 )
 from eval.plots_scores import (
     plot_scores_dashboard,
-    plot_umap,
-    plot_km_overall,
-    plot_variable_by_visit,
 )
 from eval.plots_distribution import (
     plot_numeric_grid,
@@ -77,12 +109,10 @@ from eval.plots_longitudinal import (
     plot_visit_position_timing,
     plot_last_visit_vs_d3fup,
     compute_last_visit_vs_d3fup_metrics,
+    plot_umap,
+    plot_km_overall,
+    plot_variable_by_visit,
 )
-
-
-# ======================================================
-# LATIN-1 SAFETY
-# ======================================================
 
 _UNICODE_REPLACEMENTS = {
     '\u2014': '--', '\u2013': '-',
@@ -107,9 +137,6 @@ def _fmt(v) -> str:
         return f"{float(v):.3f}" if not np.isnan(float(v)) else "N/A"
     except Exception:
         return "N/A"
-
-from sklearn.experimental import enable_iterative_imputer  # Necessario per MICE
-from sklearn.impute import IterativeImputer, KNNImputer
 
 
 def apply_custom_imputation(df, num_vars, cat_vars):
@@ -164,9 +191,7 @@ def apply_custom_imputation(df, num_vars, cat_vars):
                 
     return df_imputed
 
-# ======================================================
 # SafePDF
-# ======================================================
 
 class _SafePDF(ReportPDF):
     def cell(self, w=0, h=0, txt="", border=0, ln=0, align="", fill=False, link=""):
@@ -177,10 +202,7 @@ class _SafePDF(ReportPDF):
         return super().write(h, _safe(str(txt)), link)
 
 
-# ======================================================
-# MAIN
-# ======================================================
-
+# MAIN --------------------------------------
 def main(
     real_path:         str,
     synth_path:        str,
@@ -193,7 +215,8 @@ def main(
     real_raw = pd.read_excel(real_path)
     synth    = pd.read_excel(synth_path)
 
-    time_cfg, variables, _, prep_cfg = load_config(config_path)
+    time_cfg, variables, _, prep_cfg = load_config(
+        data_path  = config_path, model_path = "config/model_config.json") #load_config(config_path)
     data_cfg = build_data_config(time_cfg, variables)
 
     num_vars      = [v.name for v in data_cfg.static_cont  + data_cfg.temporal_cont]
@@ -203,7 +226,7 @@ def main(
     time_col    = data_cfg.time_col
     patient_col = data_cfg.patient_id_col
     fup_col     = data_cfg.fup_col
-    max_len     = getattr(time_cfg, "max_visits", 9)
+    max_len     = getattr(time_cfg, "max_visits", 12)
 
     # Ordiniamo per paziente e tempo e prendiamo solo le prime max_len visite
     print(f"     Troncamento dataset reale a max {max_len} visite...")
@@ -214,8 +237,24 @@ def main(
     print("     Esecuzione imputazione (MICE cont, KNN cat) su dataset reale...")
     num_ok  = [v for v in num_vars      if v in real.columns and v in synth.columns]
     cat_ok  = [v for v in cat_vars      if v in real.columns and v in synth.columns]
-    real = apply_custom_imputation(real, num_ok, cat_ok)
+    #real = apply_custom_imputation(real, num_ok, cat_ok)
     #real = real_raw
+    #processor = Preprocessor(data_cfg, embedding_configs = prep_cfg.emb_vars, log_vars = prep_cfg.log_vars)
+    
+    processor = torch.load("processing/preprocessor_fitted.pt", weights_only=False)['preprocessor']  # ← CARICA fitted
+    inverse_maps = processor.inverse_maps 
+    print(f"Loaded inverse_maps keys: {list(inverse_maps.keys())}")
+
+    real_df = processor._force_types(real)
+    real = processor._impute(real_df)
+    
+    #for v in ['SEX', 'DEATH']:  # binari sospetti
+    #    print(f"{v} PRE-impute: {real_df[v].value_counts(normalize=True).sort_index()}")
+    #    print(f"{v} POST-impute: {real[v].value_counts(normalize=True).sort_index()}")
+    #    print(f"  synth: {synth[v].value_counts(normalize=True).sort_index()}")
+    #    print(f"  inverse_maps[{v}]: {processor.inverse_maps.get(v, 'None')}")
+
+    '''
     import json 
 
     with open(config_path, 'r') as f:
@@ -249,9 +288,11 @@ def main(
             elif config_min == 0 and actual_min == 1:
                 inv_map = {k + 1: v for k, v in inv_map.items()}
                 print(f" [!] Allineamento: {col_name} scalata da 0-based a 1-based")
-
+            
+            if not set(real[col_name].unique()).issubset(set(inv_map.keys())):
+                print(f"[WARNING] {col_name} valori fuori mapping:", set(real[col_name].unique()))
         inverse_maps[col_name] = inv_map
-
+    '''
     print(f"  Pazienti — real: {real[patient_col].nunique()}  "
           f"synth: {synth[patient_col].nunique()}")
 
@@ -368,9 +409,22 @@ def main(
             "Label originali decodificate via inverse_maps. "
             "Cramer's V: 0=nessuna associazione, 1=identiche."
         )
+        # Aggiungi prima di plot_categorical_grid:
+        #for v in cat_ok:
+        #    print(f"{v}: real_unique={sorted(real[v].unique())}, synth_unique={sorted(synth[v].unique())}")
+        #    print(f"  inverse_maps: {inverse_maps.get(v, 'None')}")
+
         for img in plot_categorical_grid(
                 real, synth, cat_ok, plot_dir,inverse_maps=inverse_maps):
             pdf.image(img, x=10, w=190)
+
+    #v = "SEX"  # esempio
+    #print("REAL raw:", sorted(real[v].unique()))
+    #print("SYNTH raw:", sorted(synth[v].unique()))
+    #print("MAP:", inverse_maps[v])
+    # Frequenze su raw (senza decode)
+    #print("REAL freq raw:\n", real[v].value_counts(normalize=True))
+    #print("SYNTH freq raw:\n", synth[v].value_counts(normalize=True))
 
     # ── 6. Correlazioni ───────────────────────────────────────────────
     print("[6/14] Matrici di correlazione...")
@@ -589,7 +643,7 @@ def main(
 
 # ======================================================
 if __name__ == "__main__":
-    OUTPUT_PATH = "output/exp_3"
+    OUTPUT_PATH = "output/exp_4"
     CONFIG_PATH = "config/data_config2.json"
 
     main(

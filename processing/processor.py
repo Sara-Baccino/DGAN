@@ -51,7 +51,7 @@ from config.config_loader import DataConfig
 
 _logger = logging.getLogger(__name__)
 
-MAP_MISSING = 0 #"__MISSING__"
+MAP_MISSING = "__MISSING__"
 
 
 class Preprocessor:
@@ -131,10 +131,10 @@ class Preprocessor:
 
         df            = df.reset_index(drop=True)
         df            = self._force_types(df)
+        for v in self.vars:
+            if v.kind == "categorical" and v.name in df.columns:
+                print(v.name, sorted(df[v.name].unique())[:10])
         df            = self._impute(df)
-        cat_cols = [v.name for v in self.vars if v.kind == "categorical" and v.name in df.columns]
-        assert not df[cat_cols].isna().any().any(), "Ci sono ancora NaN nelle categoriche dopo imputazione"
-
         df            = self._encode_categoricals(df)
         padded        = self._long_to_padded(df)
         padded        = self._fit_scalers(padded)
@@ -288,21 +288,25 @@ class Preprocessor:
                 continue
             if v.kind == "continuous":
                 df[v.name] = pd.to_numeric(df[v.name], errors="coerce")
-            else:
-                #col = df[v.name].astype(str)
-                #col = col.where(~col.str.lower().isin(_STR_NANS), other=MAP_MISSING)
-                #col = col.fillna(MAP_MISSING)
-                #df[v.name] = col.astype(int)
-                # categoriche → converti prima a float, poi sostituisci missing e cast a int
-                if v.dtype == "int":
-                    # converti numeriche → int, missing a 0
-                    #col = pd.to_numeric(df[v.name], errors="coerce")    #.fillna(MAP_MISSING)
-                    #df[v.name] = col.astype(int)
-                    df[v.name] = pd.to_numeric(df[v.name], errors="coerce").astype("Int64")
+            #else:
+            #    col = df[v.name].astype(str)
+            #    col = col.where(~col.str.lower().isin(_STR_NANS), other=MAP_MISSING)
+            #    col = col.fillna(MAP_MISSING)
+            #    df[v.name] = col
+            if v.kind == "categorical":
+                col = df[v.name]
 
-                else:  # stringhe
-                    df[v.name] = df[v.name].astype(str).str.strip().replace({"nan": np.nan, "None": np.nan, "": np.nan})
-                    #col = col.where(~col.str.lower().isin(_STR_NANS), other=str(MAP_MISSING))
+                if pd.api.types.is_numeric_dtype(col):
+                    # Caso 1: categorica numerica (1.0, 2.0 → "1", "2")
+                    col = col.round().astype("Int64").astype(str)
+                else:
+                    # Caso 2: categorica stringa (es. "PBC0001")
+                    col = col.astype(str)
+
+                col = col.where(~col.str.lower().isin(_STR_NANS), other=MAP_MISSING)
+                col = col.fillna(MAP_MISSING)
+
+                df[v.name] = col
         return df
 
     # ==================================================================
@@ -324,31 +328,53 @@ class Preprocessor:
         _validate_dataframe).
         """
         df = df.copy()
-        df = df.replace({pd.NA: np.nan})
 
-        # ── 1. Temporali continue — MICE ──────────────────────────────
+        # ── 1. Temporali continue — interpolazione per paziente ───────
+        # Per le variabili temporali, l'interpolazione lineare dentro-paziente
+        # e' molto piu' corretta di MICE globale: preserva la traiettoria
+        # individuale e non introduce correlazioni artificiose tra pazienti.
+        # Strategia per ogni paziente:
+        #   a) Interpolazione lineare per i NaN interni alla serie
+        #   b) Forward-fill per i NaN iniziali (bordo sinistro)
+        #   c) Backward-fill per i NaN finali (bordo destro)
+        #   d) Se rimangono NaN (paziente con solo NaN per quella var):
+        #      mediana globale della variabile come ultimo fallback
         temp_cont_names = [v.name for v in self.vars
                            if not v.static and v.kind == "continuous"
                            and v.name in df.columns]
         if temp_cont_names:
-            tc_data = df[temp_cont_names].values.astype(np.float64)
-            # Solo se ci sono effettivamente NaN da imputare
-            if np.isnan(tc_data).any():
-                try:
-                    imputer = IterativeImputer(
-                        max_iter=self.mice_max_iter, tol=1e-2, random_state=0, min_value=-np.inf)
-                    imputer.fit(tc_data)
-                    self._mice_temporal = imputer
-                    df[temp_cont_names] = imputer.transform(tc_data).astype(np.float32)
-                except Exception as e:
+            has_nan = df[temp_cont_names].isna().any().any()
+            if has_nan:
+                # Interpola per-paziente mantenendo l'ordine temporale
+                df_sorted = df.sort_values([self.id_col, self.time_col])
+                for col in temp_cont_names:
+                    if not df_sorted[col].isna().any():
+                        continue
+                    # groupby + interpolate dentro ogni paziente
+                    df_sorted[col] = (
+                        df_sorted.groupby(self.id_col, group_keys=False)[col]
+                        .apply(lambda s: (
+                            s.interpolate(method="linear", limit_direction="both")
+                             .ffill()
+                             .bfill()
+                        ))
+                    )
+                    # Fallback globale per pazienti con colonna interamente NaN
+                    if df_sorted[col].isna().any():
+                        global_median = df_sorted[col].median()
+                        df_sorted[col] = df_sorted[col].fillna(
+                            global_median if not pd.isna(global_median) else 0.0
+                        )
+                # Riordina come il df originale
+                df[temp_cont_names] = df_sorted.reindex(df.index)[temp_cont_names]
+                n_imputed = df[temp_cont_names].isna().sum().sum()
+                if n_imputed > 0:
                     warnings.warn(
-                        f"MICE su variabili temporali continue fallito: {e}. "
-                        f"Le colonne con NaN verranno imputate con la mediana.",
+                        f"Rimasti {n_imputed} NaN nelle temporali continue dopo interpolazione. "
+                        f"Imputati con 0.",
                         UserWarning,
                     )
-                    for col in temp_cont_names:
-                        if df[col].isna().any():
-                            df[col] = df[col].fillna(df[col].median())
+                    df[temp_cont_names] = df[temp_cont_names].fillna(0.0)
 
         # ── 2. Statiche continue — MICE ───────────────────────────────
         stat_cont_names = [v.name for v in self.vars
@@ -379,14 +405,16 @@ class Preprocessor:
         stat_cat_names = [v.name for v in self.vars
                           if v.static and v.kind == "categorical"
                           and v.name in df.columns]
-        #for col in stat_cat_names:
-        #    print(col, df[col].dtype, df[col].isna().sum())
         if stat_cat_names:
-            #n_missing = sum((df[n] == MAP_MISSING).sum() for n in stat_cat_names)
-            n_missing = sum(df[n].isna().sum() for n in stat_cat_names)
+            n_missing = sum((df[n] == MAP_MISSING).sum() for n in stat_cat_names)
             if n_missing > 0:
                 try:
-                    df = self._knn_impute_cat(df, stat_cat_names, key="static")
+                    #df = self._knn_impute_cat(df, stat_cat_names, key="static")
+                    for col in stat_cat_names:  # ← for col in, non df[col]!
+                        mode = df[col][df[col] != MAP_MISSING].mode()
+                        if len(mode) > 0:
+                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
+                    #df[stat_cat_names] = df[stat_cat_names].fillna(df[col].mode()[0])
                 except Exception as e:
                     warnings.warn(
                         f"KNN su categoriche statiche fallito: {e}. "
@@ -394,22 +422,17 @@ class Preprocessor:
                         UserWarning,
                     )
                     for col in stat_cat_names:
-                        #mode = df[col][df[col] != MAP_MISSING].mode()
-                        if df[col].isna().any():
-                            mode = df[col].dropna().mode()
-                            if len(mode) > 0:
-                                #df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
-                                df[col] = df[col].fillna(mode.iloc[0])
-                            else:
-                                raise ValueError(f"{col} completamente NaN anche dopo KNN")
+                        mode = df[col][df[col] != MAP_MISSING].mode()
+                        if len(mode) > 0:
+                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
 
         # ── 4. Categoriche temporali — KNN ────────────────────────────
         temp_cat_names = [v.name for v in self.vars
                           if not v.static and v.kind == "categorical"
                           and v.name in df.columns]
         if temp_cat_names:
-            #n_missing = sum((df[n] == MAP_MISSING).sum() for n in temp_cat_names)
-            n_missing = sum(df[n].isna().sum() for n in temp_cat_names)
+            n_missing = sum(
+                (df[n] == MAP_MISSING).sum() for n in temp_cat_names)
             if n_missing > 0:
                 try:
                     df = self._knn_impute_cat(df, temp_cat_names, key="temporal")
@@ -420,13 +443,9 @@ class Preprocessor:
                         UserWarning,
                     )
                     for col in temp_cat_names:
-                        #mode = df[col][df[col] != MAP_MISSING].mode()
-                        mode = df[col].dropna().mode()
+                        mode = df[col][df[col] != MAP_MISSING].mode()
                         if len(mode) > 0:
-                            #df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
-                            df[col] = df[col].fillna(mode.iloc[0])
-                        else:
-                            raise ValueError(f"{col} completamente NaN anche dopo KNN")
+                            df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
 
         return df
 
@@ -443,10 +462,8 @@ class Preprocessor:
         num_df = pd.DataFrame(index=df.index)
 
         for name in cat_names:
-            col = df[name].astype(object)
-            col = col.where(pd.notna(col), np.nan)
-            #uniq = [v for v in col.unique() if v != MAP_MISSING]
-            uniq = [v for v in col.dropna().unique()]
+            col  = df[name]
+            uniq = [v for v in col.unique() if v != MAP_MISSING]
             if not uniq:
                 warnings.warn(
                     f"Variabile categorica '{name}': tutti i valori sono missing. "
@@ -488,12 +505,21 @@ class Preprocessor:
         arr_rounded = np.round(arr).astype(int).clip(1, None)
         for j, name in enumerate(cat_names):
             codes = arr_rounded[:, j]
-            #inv   = {i + 1: u for i, u in enumerate(
-            #    [v for v in df[name].unique() if v != MAP_MISSING])}
-            inv = {i + 1: u for i, u in enumerate([v for v in df[name].dropna().unique()])}
-            if not inv:
+            #inv   = {v: k for k, v in v.mapping.items()}  #{i + 1: u for i, u in enumerate([v for v in df[name].unique() if v != MAP_MISSING])}
+            #if not inv:
+            #    continue
+            #df[name] = [inv.get(c, inv[min(inv)]) for c in codes]
+            # Recuperiamo l'oggetto variabile corretto per questa colonna
+            var_cfg = next((v for v in self.vars if v.name == name), None)
+            
+            if var_cfg is None or not var_cfg.mapping:
                 continue
-            df[name] = [inv.get(c, inv[min(inv)]) for c in codes]
+                
+            # Creiamo la mappa inversa: codice numerico -> stringa originale
+            inv = {v_int: k_str for k_str, v_int in var_cfg.mapping.items()}
+            
+            # Applichiamo la decodifica
+            df[name] = [inv.get(c, inv[min(inv.keys())]) for c in codes]
 
         return df
 
@@ -504,22 +530,12 @@ class Preprocessor:
     def _encode_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
         """Dopo l'imputazione non ci sono più MAP_MISSING → encoding diretto."""
         df = df.copy()
-        
         for v in self.vars:
-            if df[v.name].isna().any():
-                raise ValueError(f"{v.name} contiene ancora NaN dopo imputazione")
-            
             if v.kind != "categorical" or v.name not in df.columns:
                 continue
-            # prepara mapping coerente
-            if v.dtype == "int":
-                v.mapping = {int(k): int(vv) for k, vv in v.mapping.items()}
-            else:  # stringhe
-                v.mapping = {str(k): int(vv) for k, vv in v.mapping.items()}
-
             # Controlla valori fuori mapping
             known = set(v.mapping.keys())
-            unknown = set(df[v.name].unique()) - known #- {MAP_MISSING}
+            unknown = set(df[v.name].unique()) - known - {MAP_MISSING}
             if unknown:
                 warnings.warn(
                     f"Variable '{v.name}': valori non nel mapping: {unknown}. "
@@ -527,7 +543,9 @@ class Preprocessor:
                     UserWarning,
                 )
             self.inverse_maps[v.name] = {val: key for key, val in v.mapping.items()}
-            df[v.name] = df[v.name].map(lambda x, m=v.mapping: m.get(x, 1)).astype(int)
+            df[v.name] = df[v.name].map(
+                lambda x, m=v.mapping: m.get(x, 1)
+            ).astype(int)
         return df
 
     # ==================================================================
@@ -682,6 +700,7 @@ class Preprocessor:
 
         t_offset  = np.zeros_like(vt)
         delta_max = np.ones(N, dtype=np.float32)
+        self.global_time_max = float(delta_max.max())
 
         single_visit_warned = False
 
@@ -735,7 +754,8 @@ class Preprocessor:
         followup_norm = np.zeros(N, dtype=np.float32)
 
         for i in range(N):
-            t_norm[i]          = t_offset[i] / delta_max[i]
+            #t_norm[i]          = t_offset[i] / delta_max[i]    #normalizzazione per paziente
+            t_norm[i] = t_offset[i] / self.global_time_max  #normalizzazione globale
             t_norm[i][~vf[i]]  = 0.0
             followup_norm[i]   = delta_max[i] / self.global_time_max
 
@@ -931,7 +951,8 @@ class Preprocessor:
                     t_norm_val = min(1.0, max(0.0, float(synthetic["visit_times"][i, t])))
                     # Aggancia l'ultimo step esattamente a delta_max_i
                     if step_i == n_valid - 1:
-                        time_denorm = delta_max_i
+                        #time_denorm = delta_max_i
+                        time_denorm = t_norm_val * self.global_time_max # Scala globale
                     else:
                         time_denorm = t_norm_val * delta_max_i
                 else:

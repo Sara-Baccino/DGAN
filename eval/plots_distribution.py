@@ -179,8 +179,8 @@ def plot_categorical_grid(
                    Se None, converte con str().
     """
     # Decodifica int -> stringa originale
-    real_dec  = decode_categoricals(real,  variables, inverse_maps)
-    synth_dec = decode_categoricals(synth, variables, inverse_maps)
+    #real_dec  = decode_categoricals(real,  variables, inverse_maps)
+    #synth_dec = decode_categoricals(synth, variables, inverse_maps)
 
     paths   = []
     per_page = ncols * max_rows
@@ -192,8 +192,8 @@ def plot_categorical_grid(
         axes = np.array(axes).flatten()
 
         for ax, v in zip(axes, chunk):
-            r_raw = real_dec[v].astype(str).replace('nan', np.nan).dropna()
-            s_raw = synth_dec[v].astype(str).replace('nan', np.nan).dropna()
+            r_raw = real[v].astype(str).replace('nan', np.nan).dropna() #real_dec[v]
+            s_raw = synth[v].astype(str).replace('nan', np.nan).dropna()
 
             # Ordina categorie: prima per frequenza reale, poi alfabeticamente
             all_cats = sorted(

@@ -212,25 +212,19 @@ def _scat_marginal_loss(
             continue
         pred_p = soft.mean(dim=0)
         tgt_p  = target_probs[name]
+        # KL(pred || tgt): penalizza quando il generatore si allontana dalla target
+        # Direzione corretta: F.kl_div(input=log_q, target=p) = KL(p || q)
+        # Vogliamo minimizzare KL(pred || tgt) = sum(pred * log(pred/tgt))
+        # = F.kl_div(tgt.log(), pred) in pytorch convention
         losses.append(F.kl_div(
-            pred_p.clamp(min=1e-8).log(),
-            tgt_p.clamp(min=1e-8),
+            tgt_p.clamp(min=1e-8).log(),   # log(target)
+            pred_p.clamp(min=1e-8),        # predicted (input to KL)
             reduction="sum",
         ))
+        # Aggiungi entropy bonus: penalizza distribuzioni troppo peaked (collapse)
+        entropy_j = -(pred_p * pred_p.clamp(min=1e-8).log()).sum()
+        losses.append(-0.1 * entropy_j)   # massimizza entropia (anti-collapse)
     return torch.stack(losses).mean() if losses else torch.tensor(0.0)
-
-def _categorical_entropy_loss(fake_logits, eps=1e-8):
-    """
-    Entropia media per-sample.
-    Penalizza distribuzioni troppo deterministiche.
-    """
-
-    soft = F.softmax(fake_logits, dim=-1)
-    log_soft = torch.log(soft.clamp(min=eps))
-
-    entropy = -(soft * log_soft).sum(dim=-1)
-
-    return entropy.mean()
 
 
 def _check_finite(loss: torch.Tensor, name: str) -> torch.Tensor:
@@ -244,6 +238,110 @@ def _check_finite(loss: torch.Tensor, name: str) -> torch.Tensor:
         )
         return torch.zeros_like(loss)
     return loss
+
+
+def _delta_loss(
+    fake_deltas:  torch.Tensor,   # [B, T] intervalli generati (normalizzati)
+    real_times:   torch.Tensor,   # [B, T] visit_times reali (normalizzati [0,1])
+    fake_valid:   torch.Tensor,   # [B, T] bool
+    real_valid:   torch.Tensor,   # [B, T] bool
+) -> torch.Tensor:
+    """
+    Penalizza la differenza di distribuzione degli intervalli inter-visita.
+
+    Per i reali calcola Δt_real[b,t] = visit_time[b,t] - visit_time[b,t-1].
+    Per i sintetici usa fake_deltas (già prodotti dal generator).
+
+    Confronta: media, std, percentile 25 e 75 degli intervalli.
+    Questo e' piu' robusto della sola differenza media/std (cattura la forma
+    della distribuzione, non solo i momenti centrali).
+    """
+    # Calcola intervalli reali da visit_times
+    real_iv_list, fake_iv_list = [], []
+    B = real_times.shape[0]
+    for b in range(B):
+        r_idx = real_valid[b].nonzero(as_tuple=True)[0]
+        if len(r_idx) >= 2:
+            rt = real_times[b, r_idx]
+            real_iv_list.append((rt[1:] - rt[:-1]).clamp(min=0.0))
+        f_idx = fake_valid[b].nonzero(as_tuple=True)[0]
+        if len(f_idx) >= 2:
+            fd = fake_deltas[b, f_idx[1:]]   # skip step 0 (delta prima visita = 0)
+            fake_iv_list.append(fd.clamp(min=0.0))
+
+    if not real_iv_list or not fake_iv_list:
+        return torch.tensor(0.0, device=real_times.device)
+
+    r_iv = torch.cat(real_iv_list)
+    f_iv = torch.cat(fake_iv_list)
+
+    if len(r_iv) < 2 or len(f_iv) < 2:
+        return torch.tensor(0.0, device=real_times.device)
+
+    loss = (f_iv.mean() - r_iv.mean()).pow(2)
+    loss = loss + (f_iv.std().clamp(min=1e-6) - r_iv.std().clamp(min=1e-6)).pow(2)
+
+    # Penalita asimmetrica se sintetici sistematicamente piu corti
+    if f_iv.mean() < r_iv.mean() * 0.5:
+        undershoot = (r_iv.mean() - f_iv.mean()) / (r_iv.mean() + 1e-8)
+        loss = loss + undershoot.pow(2)
+
+    return loss
+
+
+def _autocorrelation_loss(
+    fake_cont:   torch.Tensor,   # [B, T, n_cont]
+    real_cont:   torch.Tensor,   # [B, T, n_cont]
+    fake_valid:  torch.Tensor,   # [B, T] bool
+    real_valid:  torch.Tensor,   # [B, T] bool
+    max_lag:     int = 2,
+) -> torch.Tensor:
+    """
+    Penalizza la differenza di struttura di autocorrelazione lag-1..max_lag
+    tra traiettorie reali e sintetiche.
+
+    Per ogni feature continua temporale, calcola la correlazione di Pearson
+    tra x[t] e x[t+lag] per lag = 1..max_lag, sia per reali che sintetici.
+    Penalizza la differenza media sui lag e sulle feature.
+
+    Questo spinge il generatore a produrre traiettorie con la stessa
+    smoothness e persistenza temporale dei dati reali (es. ALP decresce
+    gradualmente, non casualmente).
+    """
+    n_cont = fake_cont.shape[-1]
+    if n_cont == 0:
+        return torch.tensor(0.0, device=fake_cont.device)
+
+    losses = []
+    for lag in range(1, max_lag + 1):
+        for j in range(n_cont):
+            f_ac_list, r_ac_list = [], []
+            B = fake_cont.shape[0]
+            for b in range(B):
+                f_idx = fake_valid[b].nonzero(as_tuple=True)[0]
+                if len(f_idx) > lag:
+                    fx = fake_cont[b, f_idx[:-lag], j]
+                    fy = fake_cont[b, f_idx[lag:],  j]
+                    if fx.std() > 1e-6 and fy.std() > 1e-6:
+                        f_ac = ((fx - fx.mean()) * (fy - fy.mean())).mean() / (
+                            fx.std() * fy.std() + 1e-8)
+                        f_ac_list.append(f_ac)
+
+                r_idx = real_valid[b].nonzero(as_tuple=True)[0]
+                if len(r_idx) > lag:
+                    rx = real_cont[b, r_idx[:-lag], j]
+                    ry = real_cont[b, r_idx[lag:],  j]
+                    if rx.std() > 1e-6 and ry.std() > 1e-6:
+                        r_ac = ((rx - rx.mean()) * (ry - ry.mean())).mean() / (
+                            rx.std() * ry.std() + 1e-8)
+                        r_ac_list.append(r_ac.detach())  # target: no grad needed
+
+            if f_ac_list and r_ac_list:
+                f_ac_mean = torch.stack(f_ac_list).mean()
+                r_ac_mean = torch.stack(r_ac_list).mean()
+                losses.append((f_ac_mean - r_ac_mean).pow(2))
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=fake_cont.device)
 
 
 # ==================================================================
@@ -279,10 +377,12 @@ class DGAN:
         self.lambda_nv    = float(mc.lambda_nv)
         self.lambda_scat  = float(mc.lambda_static_cat)
         self.lambda_fm    = float(mc.lambda_fm)
-        self.lambda_var      = float(mc.lambda_var)   # varianza feature continue
-        self.lambda_interval = float(getattr(mc, "lambda_interval", 2.0))  # intervalli inter-visita
+        self.lambda_var      = float(mc.lambda_var)
+        # lambda_interval rimpiazzato da lambda_delta (usa deltas espliciti del generatore v3)
+        self.lambda_delta   = float(mc.lambda_delta)
+        self.lambda_autocorr = float(getattr(mc, "lambda_autocorr", 0.5))
+        self.autocorr_max_lag = int(getattr(mc, "autocorr_max_lag", 2))
         self.lambda_aux   = float(mc.lambda_aux)
-        self.lambda_delta = float(getattr(mc, "lambda_delta", 1.5))
 
         self.current_temperature = float(mc.gumbel_temperature_start)
         self.temperature_min     = float(mc.temperature_min)
@@ -299,8 +399,15 @@ class DGAN:
         # ── Lambda_scat warmup ────────────────────────────────────────
         self.lambda_scat_warmup_epochs = int(mc.lambda_scat_warmup_epochs)
 
+        # ── GP curriculum: rampa lambda_gp da 0 → target nelle prime N epoche ─
+        # All'inizio il generatore produce distribuzione casuale: GP alto è
+        # instabile. Aumentare gradualmente evita mode collapse precoce.
+        self.gp_warmup_epochs = int(getattr(mc, "gp_warmup_epochs", 30))
+
         self.target_probs_static: Dict[str, torch.Tensor] = {}
 
+        # _build_model() viene chiamato DOPO tutte le assegnazioni di attributi
+        # perché usa self.ema_decay, self.instance_noise_start, ecc.
         self._build_model()
 
         self.loss_history: Dict[str, List] = {
@@ -308,8 +415,9 @@ class DGAN:
             "gp_static":     [], "gp_temporal": [],
             "irr_loss":      [], "fup_loss":    [], "nv_loss":       [],
             "scat_loss":     [], "fm_loss":     [], "aux_loss":      [],
-            "var_loss":      [],    #"entropy": [],
-            "interval_loss": [],   # distribuzione intervalli inter-visita
+            "var_loss":      [],
+            "delta_loss":    [],   # distribuzione intervalli (da deltas generatore v3)
+            "autocorr_loss": [],   # autocorrelazione lag-1..max_lag
             "mean_n_visits": [],
             # Statistiche per monitoring clinico
             "fake_cont_mean": [], "real_cont_mean": [],
@@ -406,37 +514,14 @@ class DGAN:
     def _instance_noise_strength(self) -> float:
         """
         Restituisce la forza corrente del rumore di istanza sulle OHE reali.
-        Decade esponenzialmente da instance_noise_start → instance_noise_end
+        Decade linearmente da instance_noise_start → instance_noise_end
         nel corso delle epoche configurate.
         """
         if self.instance_noise_start <= 0:
             return 0.0
-        #total_epochs = self.model_config.epochs
-        #frac = min(self._current_epoch / max(total_epochs, 1), 1.0)
-        #return self.instance_noise_start + frac * (self.instance_noise_end - self.instance_noise_start)
-        
         total_epochs = self.model_config.epochs
-        t = self._current_epoch / max(total_epochs, 1)
-        # decay esponenziale (molto meglio del lineare)
-        return self.instance_noise_start * (0.1 ** t)
-    
-    def _gp_lambda(self):
-        t = self._current_epoch / max(self.model_config.epochs, 1)
-
-        # forte all’inizio → poi cala
-        scale = 1.0 - 0.7 * t   # da 1 → 0.3
-
-        return (self.lambda_gp_s * scale, self.lambda_gp_t * scale)
-    
-    def _current_max_len(self):
-        t = self._current_epoch / max(self.model_config.epochs, 1)
-
-        if t < 0.3:
-            return int(self.max_len * 0.4)
-        elif t < 0.6:
-            return int(self.max_len * 0.7)
-        else:
-            return self.max_len
+        frac = min(self._current_epoch / max(total_epochs, 1), 1.0)
+        return self.instance_noise_start + frac * (self.instance_noise_end - self.instance_noise_start)
 
     def _effective_lambda_scat(self) -> float:
         """
@@ -452,38 +537,17 @@ class DGAN:
         scale = (1.0 - _math.cos(_math.pi * t)) / 2.0
         return self.lambda_scat * scale
 
-    def _delta_loss(self, fake_cont, real_cont, fake_valid, real_valid):
-        losses = []
-        n_cont = fake_cont.shape[-1]
-
-        for j in range(n_cont):
-            f_deltas = []
-            r_deltas = []
-
-            for b in range(fake_cont.shape[0]):
-                f_idx = fake_valid[b].nonzero(as_tuple=True)[0]
-                r_idx = real_valid[b].nonzero(as_tuple=True)[0]
-
-                if len(f_idx) > 1:
-                    f_vals = fake_cont[b, f_idx, j]
-                    f_deltas.append(f_vals[1:] - f_vals[:-1])
-
-                if len(r_idx) > 1:
-                    r_vals = real_cont[b, r_idx, j]
-                    r_deltas.append(r_vals[1:] - r_vals[:-1])
-
-            if not f_deltas or not r_deltas:
-                continue
-
-            f_d = torch.cat(f_deltas)
-            r_d = torch.cat(r_deltas)
-
-            loss_j = (f_d.mean() - r_d.mean()).pow(2)
-            loss_j += (f_d.std() - r_d.std()).pow(2)
-
-            losses.append(loss_j)
-
-        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=fake_cont.device)
+    def _effective_gp(self) -> tuple:
+        """
+        GP curriculum: lambda_gp_s e lambda_gp_t crescono linearmente da 0
+        ai valori configurati nelle prime gp_warmup_epochs epoche.
+        Motivazione: nelle prime epoche il gradiente penalty su distribuzioni
+        random e' instabile e rallenta la convergenza del generatore.
+        """
+        if self.gp_warmup_epochs <= 0:
+            return self.lambda_gp_s, self.lambda_gp_t
+        t = min(self._current_epoch / max(self.gp_warmup_epochs, 1), 1.0)
+        return self.lambda_gp_s * t, self.lambda_gp_t * t
 
     def set_train(self):
         self.generator.train()
@@ -587,11 +651,12 @@ class DGAN:
         # ── Static discriminator ──────────────────────────────────────
         d_real_s = self.disc_static(real_s)
         d_fake_s = self.disc_static(fake_s)
-        lambda_gp_s, lambda_gp_t = self._gp_lambda()
-        gp_s     = _gradient_penalty(lambda x: self.disc_static(x), real_s, fake_s, self.device)
+        gp_s     = _gradient_penalty(
+            lambda x: self.disc_static(x), real_s, fake_s, self.device)
         aux_loss = self.disc_static.auxiliary_loss(real_s, embed_targets)
+        eff_gp_s, eff_gp_t = self._effective_gp()
         loss_d_s = (_wgan_d_loss(d_real_s, d_fake_s)
-                    + self.lambda_gp_s * gp_s   #+ self.lambda_gp_s * gp_s
+                    + eff_gp_s * gp_s
                     + self.lambda_aux  * aux_loss)
         loss_d_s = _check_finite(loss_d_s, "disc_static")
 
@@ -608,7 +673,7 @@ class DGAN:
         d_fake_t = self.disc_temporal(fake_s, fake_t, fake_vf)
         gp_t     = _gradient_penalty(
             lambda x: self.disc_temporal(real_s, x, real_vf), real_t, fake_t, self.device)
-        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t) + self.lambda_gp_t * gp_t   #+ self.lambda_gp_t * gp_t
+        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t) + eff_gp_t * gp_t
         loss_d_t = _check_finite(loss_d_t, "disc_temporal")
 
         if update_temporal:
@@ -637,7 +702,13 @@ class DGAN:
         fake_out, fake_disc = self._generate_fake(batch_size, real_irr=real_irr)
 
         # ── WGAN generator loss (dominante) ───────────────────────────
+        # NOTA: fake_disc["static"] NON viene detachato qui.
+        # Il disc_temporal usa le static features come conditioning:
+        # i gradienti devono fluire sia attraverso il path statico che
+        # quello temporale verso il generatore.
+        # Il detach avviene SOLO in _train_discriminators (con no_grad).
         d_fake_s = self.disc_static(fake_disc["static"])
+        # Passa fake_static SENZA detach al temporal disc: gradient flow completo
         d_fake_t = self.disc_temporal(
             fake_disc["static"], fake_disc["temporal"], fake_disc["valid_flag"])
         loss_g = _wgan_g_loss(d_fake_s, d_fake_t)
@@ -674,7 +745,6 @@ class DGAN:
         if eff_lambda_scat > 0 and self.target_probs_static and fake_soft:
             scat_loss = _scat_marginal_loss(fake_soft, self.target_probs_static)
             scat_loss = _check_finite(scat_loss, "scat_loss")
-            #entropy_loss = _categorical_entropy_loss(fake_soft)
 
         # ── Feature matching ──────────────────────────────────────────
         fm_loss = torch.tensor(0.0, device=self.device)
@@ -698,29 +768,47 @@ class DGAN:
             )
             var_loss = _check_finite(var_loss, "var_loss")
 
-        # ── Intervalli inter-visita ──────────────────────────────────
-        interval_loss = torch.tensor(0.0, device=self.device)
-        if (self.lambda_interval > 0
+        # ── Delta loss (intervalli inter-visita espliciti da generator v3) ──
+        # Usa i deltas prodotti esplicitamente dal generator (interval_head).
+        # Piu' preciso di _interval_loss che ricalcola delta dai visit_times.
+        delta_loss = torch.tensor(0.0, device=self.device)
+        if (self.lambda_delta > 0
+                and real_batch is not None
+                and "visit_time" in real_batch
+                and "deltas" in fake_out):
+            delta_loss = _delta_loss(
+                fake_out["deltas"],
+                real_batch["visit_time"].to(self.device),
+                fake_out["valid_flag"],
+                real_batch["valid_flag"].to(self.device),
+            )
+            delta_loss = _check_finite(delta_loss, "delta_loss")
+        elif (self.lambda_delta > 0
                 and real_batch is not None
                 and "visit_time" in real_batch):
-            interval_loss = _interval_loss(
+            # Fallback: usa _interval_loss se il generator non produce deltas (v2)
+            delta_loss = _interval_loss(
                 fake_out["visit_times"],
                 real_batch["visit_time"].to(self.device),
                 fake_out["valid_flag"],
                 real_batch["valid_flag"].to(self.device),
             )
-            interval_loss = _check_finite(interval_loss, "interval_loss")
-        
-        # - Delta loss (varianza intra-paziente)
-        delta_loss = torch.tensor(0.0, device=self.device)
+            delta_loss = _check_finite(delta_loss, "delta_loss_fallback")
 
-        if self.lambda_delta > 0:
-            delta_loss = self._delta_loss(
+        # ── Autocorrelation loss ──────────────────────────────────────
+        autocorr_loss = torch.tensor(0.0, device=self.device)
+        if (self.lambda_autocorr > 0
+                and real_batch is not None
+                and "temporal_cont" in real_batch
+                and fake_out["temporal_cont"].shape[-1] > 0):
+            autocorr_loss = _autocorrelation_loss(
                 fake_out["temporal_cont"],
                 real_batch["temporal_cont"].to(self.device),
                 fake_out["valid_flag"],
                 real_batch["valid_flag"].to(self.device),
+                max_lag=self.autocorr_max_lag,
             )
+            autocorr_loss = _check_finite(autocorr_loss, "autocorr_loss")
 
         # ── Total ─────────────────────────────────────────────────────
         total = (loss_g
@@ -730,8 +818,8 @@ class DGAN:
                  + eff_lambda_scat      * scat_loss
                  + self.lambda_fm       * fm_loss
                  + self.lambda_var      * var_loss
-                 + self.lambda_delta * delta_loss
-                 + self.lambda_interval * interval_loss)
+                 + self.lambda_delta    * delta_loss
+                 + self.lambda_autocorr * autocorr_loss)
 
         total = _check_finite(total, "total_generator")
         total.backward()
@@ -764,7 +852,7 @@ class DGAN:
 
         return (loss_g.item(), irr_loss.item(), fup_loss.item(),
                 nv_loss.item(), scat_loss.item(), fm_loss.item(),
-                var_loss.item(), interval_loss.item(), mean_nv, stats)
+                var_loss.item(), delta_loss.item(), autocorr_loss.item(), mean_nv, stats)
 
     # ─────────────────────────────────────────────────────────────────
 
@@ -838,7 +926,7 @@ class DGAN:
         print(f"  λ_gp_s={self.lambda_gp_s}  λ_gp_t={self.lambda_gp_t}  "
               f"λ_fup={self.lambda_fup}  λ_nv={self.lambda_nv}  "
               f"λ_var={self.lambda_var}  λ_scat={self.lambda_scat}  "
-              f"λ_interval={self.lambda_interval}")
+              f"λ_delta_interval={self.lambda_delta}")
         print(f"{'='*70}\n")
 
         loader, keys = self._build_loader(
@@ -923,6 +1011,17 @@ class DGAN:
         critic_steps_t = self.model_config.critic_steps_temporal
         best_loss, patience_counter = float("inf"), 0
 
+        # Stampa distribuzione target categoriche statiche (attesa dal generatore)
+        if self.target_probs_static:
+            print("\n=== TARGET distribuzione categoriche statiche ===")
+            for vname, prob in self.target_probs_static.items():
+                p = prob.cpu().tolist()
+                top3 = sorted(enumerate(p), key=lambda x: -x[1])[:3]
+                top3_str = ", ".join(f"cat{i}={v:.3f}" for i, v in top3)
+                entropy = -(prob * prob.clamp(min=1e-8).log()).sum().item()
+                print(f"  {vname}: entropy={entropy:.3f}  top3=[{top3_str}]")
+            print()
+
         for epoch in range(epochs):
             self._current_epoch = epoch   # usato da instance_noise e scat_warmup
             batch_losses = []
@@ -930,17 +1029,6 @@ class DGAN:
             for batch_tuple in loader:
                 batch = self._reconstruct_batch(batch_tuple, keys)
                 batch = self._move(batch)
-                '''# curriculum length
-                curr_len = self._current_max_len()
-
-                batch["temporal_cont"] = batch["temporal_cont"][:, :curr_len]
-                batch["valid_flag"]    = batch["valid_flag"][:, :curr_len]
-                batch["visit_time"]    = batch["visit_time"][:, :curr_len]
-
-                if "temporal_cat" in batch:
-                    for k in batch["temporal_cat"]:
-                        batch["temporal_cat"][k] = batch["temporal_cat"][k][:, :curr_len]
-                '''
                 B     = batch["temporal_cont"].shape[0]
 
                 real_disc     = prepare_discriminator_inputs(batch, self.preprocessor)
@@ -961,7 +1049,7 @@ class DGAN:
                     aux_list.append(aux)
 
                 (lg, l_irr, l_fup, l_nv, l_scat,
-                 l_fm, l_var, l_iv, mean_nv, stats) = self._train_generator(
+                 l_fm, l_var, l_delta, l_ac, mean_nv, stats) = self._train_generator(
                     real_disc, B, real_irr, real_batch=batch)
 
                 batch_losses.append({
@@ -977,7 +1065,8 @@ class DGAN:
                     "scat_loss":     l_scat,
                     "fm_loss":       l_fm,
                     "var_loss":      l_var,
-                    "interval_loss": l_iv,
+                    "delta_loss":    l_delta,
+                    "autocorr_loss": l_ac,
                     "mean_n_visits": mean_nv,
                     "fake_cont_mean": stats["fake_cont_mean"],
                     "fake_cont_std":  stats["fake_cont_std"],
@@ -1005,22 +1094,59 @@ class DGAN:
                 self.temperature_min, self.current_temperature * 0.995)
 
             # ── Stampa ─────────────────────────────────────────────────
+            eff_gp_s_now, eff_gp_t_now = self._effective_gp()
             print(
                 f"[Ep {epoch+1:4d}/{epochs}]  "
                 f"G={avg['generator']:+7.3f}  "
                 f"D_s={avg['disc_static']:+7.3f}  D_t={avg['disc_temporal']:+7.3f}  "
-                f"GP_s={avg['gp_static']:5.3f}  GP_t={avg['gp_temporal']:5.3f} |"
-                f"Nv_fake={avg['mean_n_visits']:5.1f}  NvL={avg['nv_loss']:.4f}  "
-                f"| Fup={avg['fup_loss']:.4f}  Scat={avg['scat_loss']:.4f}  "
-                f"VarL={avg['var_loss']:.4f}  IvL={avg['interval_loss']:.4f}"
+                f"GP_s={avg['gp_static']:5.3f}(lam={eff_gp_s_now:.1f})  "
+                f"GP_t={avg['gp_temporal']:5.3f}(lam={eff_gp_t_now:.1f})"
+            )
+            # Categoriche: mostra distribuzione per le prime variabili (collapse detection)
+            cat_stats = ""
+            for var in self.data_config.static_cat[:3]:
+                if var.name in self.target_probs_static:
+                    tp = self.target_probs_static[var.name].cpu()
+                    max_p = float(tp.max())
+                    n_eff = int((tp > 0.01).sum())
+                    cat_stats += f" {var.name}(tgt_max={max_p:.2f},n={n_eff})"
+            print(
+                f"              "
+                f"Nv={avg['mean_n_visits']:4.1f}  NvL={avg['nv_loss']:.3f}  "
+                f"Fup={avg['fup_loss']:.3f}  Scat={avg['scat_loss']:.3f}  "
+                f"VarL={avg['var_loss']:.3f}  dL={avg['delta_loss']:.3f}  "
+                f"AcL={avg['autocorr_loss']:.3f}{cat_stats}"
             )
             print(
                 f"              "
-                f"Cont(fake) μ={avg['fake_cont_mean']:+.3f} σ={avg['fake_cont_std']:.3f}  "
-                #f"Cont(real) μ={real_cont_mean:+.3f} σ={real_cont_std:.3f}  "
-                f"| T={self.current_temperature:.3f}",
+                f"Cont(fake) mu={avg['fake_cont_mean']:+.3f} s={avg['fake_cont_std']:.3f}  "
+                f"Cont(real) mu={real_cont_mean:+.3f} s={real_cont_std:.3f}  "
+                f"| T={self.current_temperature:.3f}  "
+                f"noise={self._instance_noise_strength():.3f}",
                 flush=True,
             )
+
+            # Ogni 50 ep: campiona il generatore e mostra distribuzione categoriche
+            if (epoch + 1) % 50 == 0 or epoch == 0:
+                with torch.no_grad():
+                    self.set_eval()
+                    z_s_mon, z_t_mon = self.generator.sample_noise(64, torch.device(self.device))
+                    out_mon = self.generator(z_s_mon, z_t_mon, temperature=self.current_temperature)
+                    self.set_train()
+                    if out_mon.get("static_cat_soft"):
+                        cat_lines = []
+                        for vname, soft in out_mon["static_cat_soft"].items():
+                            p_fake = soft.mean(dim=0).cpu()
+                            p_real = self.target_probs_static.get(vname, p_fake.new_zeros(len(p_fake)))
+                            n_active = int((p_fake > 0.05).sum())
+                            max_p = float(p_fake.max())
+                            target_max = float(p_real.max())
+                            cat_lines.append(
+                                f"  {vname}: n_active={n_active}/{len(p_fake)}  "
+                                f"max_p={max_p:.3f} (tgt={target_max:.3f})")
+                        if cat_lines:
+                            print(f"  [Cat@ep{epoch+1}] " + "  ".join(
+                                l.strip() for l in cat_lines[:4]))
 
             disc_loss = avg["disc_static"] + avg["disc_temporal"]
             if disc_loss < best_loss:

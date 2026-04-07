@@ -13,7 +13,7 @@ from model.dgan import DGAN
 
 from datetime import datetime
 # timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "3"
+timestr = "5"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,12 +35,12 @@ def main():
     # =========================================================================
     set_seed(42)
 
-    config_path = "config/data_config2.json"
+    data_config_path  = "config/data_config2.json"
+    model_config_path = "config/model_config.json"
 
-    # ── FIX: load_config restituisce 4 valori (aggiunto prep_cfg) ────────────
-    # Vecchia firma (v1):  time_cfg, variables, model_cfg = load_config(...)
-    # Nuova firma (v2):    time_cfg, variables, model_cfg, prep_cfg = load_config(...)
-    time_cfg, variables, model_cfg, prep_cfg = load_config(config_path)
+    time_cfg, variables, model_cfg, prep_cfg = load_config(
+        data_path  = data_config_path, model_path = model_config_path,
+    )
 
     data_cfg = build_data_config(time_cfg, variables)
 
@@ -89,7 +89,7 @@ def main():
     # ── Tutti i parametri di preprocessing vengono ora da prep_cfg (config JSON) ──
     preprocessor = Preprocessor(
         data_cfg,
-        embedding_configs = embedding_configs,
+        embedding_configs = prep_cfg.emb_vars,      #embedding_configs,
         log_vars          = prep_cfg.log_vars,
         mice_max_iter     = prep_cfg.mice_max_iter,
         knn_neighbors     = prep_cfg.knn_neighbors,
@@ -97,6 +97,13 @@ def main():
     )
 
     tensors = preprocessor.fit_transform(df_train)
+    print("Saving FITTED preprocessor with inverse_maps...")
+    torch.save({
+        'preprocessor': preprocessor,  # Salva TUTTO: scalers, inverse_maps, imputers fitted
+        'inverse_maps': preprocessor.inverse_maps,  # Esplicito per sicurezza
+        'data_cfg': data_cfg,
+    }, f"processing/preprocessor_fitted.pt")
+    print(f"  Saved: preprocessor_fitted.pt (inverse_maps: {preprocessor.inverse_maps.keys() if preprocessor.inverse_maps else 'None'})")
 
     # ── NOTA: le vecchie maschere (temporal_cat_mask, visit_mask) sono rimosse ──
     # Il codice usa ora valid_flag [N,T] bool come unico indicatore di padding.
@@ -221,7 +228,7 @@ def main():
     from utils.plots import plot_training_history, plot_training_history2
 
     plot_training_history(dgan, timestr)
-    plot_training_history2(dgan, timestr, config_path=config_path)
+    plot_training_history2(dgan, timestr, config_path=data_config_path)
 
     print("\n" + "=" * 80)
     print("✓ PIPELINE COMPLETE")

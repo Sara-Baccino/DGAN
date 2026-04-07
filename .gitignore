@@ -17,6 +17,11 @@ output/
 *.pdf
 *.txt
 *.docx
+*.pt 
+*.json
 
 #altri file
 upsampling.py
+metrics.py
+plots.py
+stats.py
