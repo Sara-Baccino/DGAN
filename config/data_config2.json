@@ -1,6 +1,6 @@
 {
   "time": {
-    "max_visits": 40,
+    "max_visits": 8,
     "visit_column": "MONTHS_FROM_BASELINE",
     "patient_id": "RECORD_ID",
     "fup_column": "t_FUP",
@@ -11,7 +11,7 @@
     "mice_max_iter": 10,
     "knn_neighbors": 5,
     "log_vars": ["ALP", "ALT", "AST", "BIL", "GGT", "CRE", "TRIGVAL"],
-    "emb_vars": {"CENTRE": 12},
+    "emb_vars": {"CENTRE": 16},
     "clip_z": 4.0
   },
 

@@ -41,7 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional
 
-
+import torch_directml
 class DGANGenerator(nn.Module):
     """Generatore DGAN.
     """
@@ -59,6 +59,7 @@ class DGANGenerator(nn.Module):
         min_visits:      int   = 2,
         static_proj_dim: int   = 16,   # proiezione s_h → input GRU ogni step
         attn_heads:      int   = 4,    # teste Self-Attention (0 = skip)
+        device = None,
     ):
         super().__init__()
         self.data_config     = data_config
@@ -72,6 +73,8 @@ class DGANGenerator(nn.Module):
         self.min_visits      = max(1, int(min_visits))
         self.static_cond_dim = static_proj_dim
         self.attn_heads      = attn_heads
+
+        self.device = device if device is not None else torch.device("cpu")
 
         n_cont = data_config.n_temp_cont
 
@@ -254,7 +257,8 @@ class DGANGenerator(nn.Module):
         real_irr:    Optional[torch.Tensor]   = None,
     ) -> Dict:
         B, T, _ = z_temporal.shape
-        device   = z_temporal.device
+        #device   = z_temporal.device
+        device = self.device
         n_cont   = self.data_config.n_temp_cont
 
         # ── Step 1: Ramo statico ───────────────────────────────────────
@@ -278,7 +282,23 @@ class DGANGenerator(nn.Module):
             if name in embed_cfg:
                 static_cat_embed[name] = out
             else:
-                static_cat[name]      = F.gumbel_softmax(out, tau=temperature, hard=True,  dim=-1)
+                #static_cat[name]      = F.gumbel_softmax(out, tau=temperature, hard=True,  dim=-1)
+                # Calcoliamo la versione soft
+                # 1. Calcoliamo la versione soft (Gumbel-Softmax)
+                y_soft = F.gumbel_softmax(out, tau=temperature, hard=False, dim=-1)
+
+                # 2. Otteniamo l'indice della classe massima
+                index = y_soft.argmax(dim=-1, keepdim=True)
+
+                # 3. CREAZIONE ONE-HOT SENZA SCATTER (DirectML friendly)
+                # Invece di scatter_, usiamo il confronto tra l'indice di colonna e l'indice scelto
+                # torch.arange crea i numeri da 0 a N_classi, il confronto crea una maschera booleana
+                shape = y_soft.shape
+                columns = torch.arange(shape[-1], device=y_soft.device).reshape(1, shape[-1])
+                y_hard = (index == columns).float()
+
+                # 4. Straight-Through Estimator (per mantenere i gradienti)
+                static_cat[name] = y_hard - y_soft.detach() + y_soft
                 static_cat_soft[name] = F.gumbel_softmax(out, tau=temperature, hard=False, dim=-1)
 
         # Scalari globali dal ramo statico
@@ -289,7 +309,7 @@ class DGANGenerator(nn.Module):
         # valid_flag: True per i primi n_visits step
         t_pos     = torch.arange(T, dtype=torch.float32, device=device)
         n_v_round = n_visits.round().long().clamp(self.min_visits, T)     # [B]
-        valid_flag = t_pos.unsqueeze(0) < n_v_round.float().unsqueeze(1)  # [B,T]
+        valid_flag = t_pos.to(device).unsqueeze(0) < n_v_round.to(device).float().unsqueeze(1)  # [B,T]
 
         # [6] Proiezione statica da concatenare a ogni step GRU
         s_cond = self.static_cond_proj(s_h)                    # [B, static_cond_dim]
@@ -313,12 +333,12 @@ class DGANGenerator(nn.Module):
 
         for t in range(T):
             # [6] Input GRU: [z_t, x_prev_cont, cat_prev_ohe, delta_prev, s_cond]
-            gru_in = torch.cat(
-                [z_temporal[:, t, :], x_prev_cont, cat_prev_ohe, delta_prev, s_cond],
-                dim=-1,
-            ).unsqueeze(1)                                      # [B, 1, input_size]
+            components = [ z_temporal[:, t, :], x_prev_cont, cat_prev_ohe, delta_prev, s_cond]
 
-            h_t_3d, hidden = self.gru(gru_in, hidden)          # [B, 1, H]
+            # Sposta tutto sul device, assicurati che sia Float32 e concatena
+            gru_in = torch.cat([c.to(device).float() for c in components], dim=-1).unsqueeze(1)  # [B, 1, input_size]
+
+            h_t_3d, hidden = self.gru(gru_in.to(device), hidden.to(device))          # [B, 1, H]
             h_t = h_t_3d.squeeze(1)                            # [B, H]
             h_seq[:, t, :] = h_t
 
@@ -394,8 +414,13 @@ class DGANGenerator(nn.Module):
                     irr_states = self._cummax_irr(hazard)
                 temporal_cat[name] = torch.stack([1.0 - irr_states, irr_states], dim=-1)
             else:
-                temporal_cat[name] = F.gumbel_softmax(
-                    head(h_seq), tau=temperature, hard=True, dim=-1)
+                temporal_cat[name] = F.gumbel_softmax(head(h_seq), tau=temperature, hard=True, dim=-1)
+                #y_soft_t = F.gumbel_softmax(out_t, tau=temperature, hard=False, dim=-1)
+                #idx_t = y_soft_t.argmax(dim=-1, keepdim=True)
+                #cols_t = torch.arange(y_soft_t.shape[-1], device=y_soft_t.device).reshape(1, y_soft_t.shape[-1])
+                #y_hard_t = (idx_t == cols_t).float()
+
+                #temporal_cat[name][:, t, :] = y_hard_t - y_soft_t.detach() + y_soft_t
 
         # ── Step 5: Costruzione visit_times con vincolo t_FUP ─────────
         

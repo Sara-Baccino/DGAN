@@ -45,11 +45,12 @@ from typing import Optional, Dict, List
 import numpy as np
 import logging
 
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(log_dir="runs/dgan_experiment_1")
+
 from model.generator    import DGANGenerator
-from model.discriminator import (
-    StaticDiscriminator, TemporalDiscriminator,
-    prepare_discriminator_inputs,
-)
+from model.discriminator import (StaticDiscriminator, TemporalDiscriminator, prepare_discriminator_inputs)
 
 try:
     from opacus import PrivacyEngine
@@ -412,7 +413,7 @@ class DGAN:
 
         self.loss_history: Dict[str, List] = {
             "generator":     [], "disc_static": [], "disc_temporal": [],
-            "gp_static":     [], "gp_temporal": [],
+            #"gp_static":     [], "gp_temporal": [],
             "irr_loss":      [], "fup_loss":    [], "nv_loss":       [],
             "scat_loss":     [], "fm_loss":     [], "aux_loss":      [],
             "var_loss":      [],
@@ -458,6 +459,7 @@ class DGAN:
             dropout        = mc.generator.dropout,
             noise_ar_rho   = mc.noise_ar_rho,
             min_visits     = self.data_config.min_visits,   # da DataConfig
+            device         = self.device
         ).to(self.device)
 
         self.disc_static = StaticDiscriminator(
@@ -474,9 +476,14 @@ class DGAN:
             model_config = mc,
         ).to(self.device)
 
-        if self.preprocessor.embeddings:
-            self.preprocessor.embeddings = self.preprocessor.embeddings.to(self.device)
+        #if self.preprocessor.embeddings:
+        #    self.preprocessor.embeddings = self.preprocessor.embeddings.to(self.device)
 
+        # AGGIUNGI QUESTO: Sposta gli embedding del preprocessor
+        if hasattr(self.preprocessor, 'embeddings'):
+            for name in self.preprocessor.embeddings:
+                self.preprocessor.embeddings[name].to(self.device)
+        
         # Optimizer con betas dal config
         b1, b2 = mc.optimizer_beta1, mc.optimizer_beta2
 
@@ -490,6 +497,7 @@ class DGAN:
             self.disc_static.parameters(), lr=mc.lr_d_s, betas=(b1, b2))
         self.opt_disc_temporal = torch.optim.Adam(
             self.disc_temporal.parameters(), lr=mc.lr_d_t, betas=(b1, b2))
+
 
         # ── EMA generatore: deepcopy iniziale, poi aggiornato ogni gen step ──
         if self.ema_decay > 0.0:
@@ -651,12 +659,11 @@ class DGAN:
         # ── Static discriminator ──────────────────────────────────────
         d_real_s = self.disc_static(real_s)
         d_fake_s = self.disc_static(fake_s)
-        gp_s     = _gradient_penalty(
-            lambda x: self.disc_static(x), real_s, fake_s, self.device)
+        #gp_s     = _gradient_penalty(lambda x: self.disc_static(x), real_s, fake_s, self.device)
         aux_loss = self.disc_static.auxiliary_loss(real_s, embed_targets)
-        eff_gp_s, eff_gp_t = self._effective_gp()
+        #eff_gp_s, eff_gp_t = self._effective_gp()
         loss_d_s = (_wgan_d_loss(d_real_s, d_fake_s)
-                    + eff_gp_s * gp_s
+                    #+ eff_gp_s * gp_s
                     + self.lambda_aux  * aux_loss)
         loss_d_s = _check_finite(loss_d_s, "disc_static")
 
@@ -671,9 +678,8 @@ class DGAN:
         # ── Temporal discriminator ────────────────────────────────────
         d_real_t = self.disc_temporal(real_s, real_t, real_vf)
         d_fake_t = self.disc_temporal(fake_s, fake_t, fake_vf)
-        gp_t     = _gradient_penalty(
-            lambda x: self.disc_temporal(real_s, x, real_vf), real_t, fake_t, self.device)
-        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t) + eff_gp_t * gp_t
+        #gp_t     = _gradient_penalty(lambda x: self.disc_temporal(real_s, x, real_vf), real_t, fake_t, self.device)
+        loss_d_t = _wgan_d_loss(d_real_t, d_fake_t)     #+ eff_gp_t * gp_t
         loss_d_t = _check_finite(loss_d_t, "disc_temporal")
 
         if update_temporal:
@@ -685,7 +691,7 @@ class DGAN:
             self.opt_disc_temporal.step()
 
         return (loss_d_s.item(), loss_d_t.item(),
-                gp_s.item(),   gp_t.item(),
+                #gp_s.item(),   gp_t.item(),
                 aux_loss.item())
 
     # ─────────────────────────────────────────────────────────────────
@@ -910,6 +916,60 @@ class DGAN:
     # ─────────────────────────────────────────────────────────────────
     # FIT
     # ─────────────────────────────────────────────────────────────────
+    def train_step(self, loader, keys, critic_steps, critic_steps_t, profiler=None):
+        batch_losses = []
+
+        for batch_tuple in loader:
+            batch = self._reconstruct_batch(batch_tuple, keys)
+            batch = self._move(batch)
+            B     = batch["temporal_cont"].shape[0]
+
+            real_disc     = prepare_discriminator_inputs(batch, self.preprocessor)
+            real_irr      = self._extract_real_irr(batch)
+            embed_targets = self._build_embed_targets(batch)
+
+            n_steps = max(critic_steps, critic_steps_t)
+            ld_s_list, ld_t_list, gp_s_list, gp_t_list, aux_list = [], [], [], [], []
+
+            for step_idx in range(n_steps):
+                #ld_s, ld_t, gp_s, gp_t, aux
+                ld_s, ld_t, aux = self._train_discriminators(
+                    real_disc, embed_targets, B,
+                    update_static   = (step_idx < critic_steps),
+                    update_temporal = (step_idx < critic_steps_t),
+                )
+                ld_s_list.append(ld_s); ld_t_list.append(ld_t)
+                #gp_s_list.append(gp_s); gp_t_list.append(gp_t)
+                aux_list.append(aux)
+
+            (lg, l_irr, l_fup, l_nv, l_scat,
+                l_fm, l_var, l_delta, l_ac, mean_nv, stats) = self._train_generator(
+                real_disc, B, real_irr, real_batch=batch)
+
+            batch_losses.append({
+                "generator":     lg,
+                "disc_static":   float(np.mean(ld_s_list)),
+                "disc_temporal": float(np.mean(ld_t_list)),
+                #"gp_static":     float(np.mean(gp_s_list)),
+                #"gp_temporal":   float(np.mean(gp_t_list)),
+                "aux_loss":      float(np.mean(aux_list)),
+                "irr_loss":      l_irr,
+                "fup_loss":      l_fup,
+                "nv_loss":       l_nv,
+                "scat_loss":     l_scat,
+                "fm_loss":       l_fm,
+                "var_loss":      l_var,
+                "delta_loss":    l_delta,
+                "autocorr_loss": l_ac,
+                "mean_n_visits": mean_nv,
+                "fake_cont_mean": stats["fake_cont_mean"],
+                "fake_cont_std":  stats["fake_cont_std"],
+            })
+
+            if profiler is not None:
+                profiler.step() # Segnala al profiler che un batch è finito
+
+        return batch_losses
 
     def fit(self, tensors_dict: Dict, epochs: int = None):
         self.set_train()
@@ -1022,131 +1082,68 @@ class DGAN:
                 print(f"  {vname}: entropy={entropy:.3f}  top3=[{top3_str}]")
             print()
 
+
+        # training loop
         for epoch in range(epochs):
+
             self._current_epoch = epoch   # usato da instance_noise e scat_warmup
-            batch_losses = []
 
-            for batch_tuple in loader:
-                batch = self._reconstruct_batch(batch_tuple, keys)
-                batch = self._move(batch)
-                B     = batch["temporal_cont"].shape[0]
+            #batch_losses = self.train_step(loader, keys, critic_steps, critic_steps_t)
+            
+            # Esegui il training normale
+            if epoch == 1: # Profila solo alla seconda epoca (per evitare overhead iniziale)
+                with torch.profiler.profile(
+                    schedule=torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=1),
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler('./runs/dgan_experiment'),
+                    record_shapes=True,
+                    with_stack=True
+                ) as prof:
+                    batch_losses = self.train_step(loader, keys, critic_steps, critic_steps_t, profiler=prof)
+                    
+            else:
+                batch_losses = self.train_step(loader, keys, critic_steps, critic_steps_t)
 
-                real_disc     = prepare_discriminator_inputs(batch, self.preprocessor)
-                real_irr      = self._extract_real_irr(batch)
-                embed_targets = self._build_embed_targets(batch)
 
-                n_steps = max(critic_steps, critic_steps_t)
-                ld_s_list, ld_t_list, gp_s_list, gp_t_list, aux_list = [], [], [], [], []
 
-                for step_idx in range(n_steps):
-                    ld_s, ld_t, gp_s, gp_t, aux = self._train_discriminators(
-                        real_disc, embed_targets, B,
-                        update_static   = (step_idx < critic_steps),
-                        update_temporal = (step_idx < critic_steps_t),
-                    )
-                    ld_s_list.append(ld_s); ld_t_list.append(ld_t)
-                    gp_s_list.append(gp_s); gp_t_list.append(gp_t)
-                    aux_list.append(aux)
-
-                (lg, l_irr, l_fup, l_nv, l_scat,
-                 l_fm, l_var, l_delta, l_ac, mean_nv, stats) = self._train_generator(
-                    real_disc, B, real_irr, real_batch=batch)
-
-                batch_losses.append({
-                    "generator":     lg,
-                    "disc_static":   float(np.mean(ld_s_list)),
-                    "disc_temporal": float(np.mean(ld_t_list)),
-                    "gp_static":     float(np.mean(gp_s_list)),
-                    "gp_temporal":   float(np.mean(gp_t_list)),
-                    "aux_loss":      float(np.mean(aux_list)),
-                    "irr_loss":      l_irr,
-                    "fup_loss":      l_fup,
-                    "nv_loss":       l_nv,
-                    "scat_loss":     l_scat,
-                    "fm_loss":       l_fm,
-                    "var_loss":      l_var,
-                    "delta_loss":    l_delta,
-                    "autocorr_loss": l_ac,
-                    "mean_n_visits": mean_nv,
-                    "fake_cont_mean": stats["fake_cont_mean"],
-                    "fake_cont_std":  stats["fake_cont_std"],
-                })
-
-            avg = {k: float(np.mean([b[k] for b in batch_losses]))
-                   for k in batch_losses[0]}
+            avg = {k: float(np.mean([b[k] for b in batch_losses])) for k in batch_losses[0]}
             for k, v in avg.items():
+                writer.add_scalar(f"Loss/{k}", v, epoch)
                 if k in self.loss_history:
                     self.loss_history[k].append(v)
 
-            # Stats reali globali per confronto
-            real_cont_mean = 0.0
-            real_cont_std  = 0.0
-            if real_cont_all is not None and real_vf_all is not None:
-                vf_flat  = real_vf_all.bool()
-                rc_slice = real_cont_all[:, :, :3]
-                vf_exp   = vf_flat.unsqueeze(-1).expand_as(rc_slice)
-                vals     = rc_slice[vf_exp]
-                if len(vals) > 1:
-                    real_cont_mean = float(vals.mean())
-                    real_cont_std  = float(vals.std())
 
-            self.current_temperature = max(
-                self.temperature_min, self.current_temperature * 0.995)
+            self.current_temperature = max(self.temperature_min, self.current_temperature * 0.995)
+
+            if epoch % 10 == 0:
+                for name, param in self.generator.named_parameters():
+                    writer.add_histogram(f"G_Grads/{name}", param.grad, epoch)
+                for name, param in self.disc_temporal.named_parameters():
+                    writer.add_histogram(f"D_Temp_Grads/{name}", param.grad, epoch)
+                for name, param in self.disc_static.named_parameters():
+                    writer.add_histogram(f"D_Static_Grads/{name}", param.grad, epoch)
+
+            
+            # Logga anche parametri dinamici
+            writer.add_scalar("Params/Gumbel_Temp", self.current_temperature, epoch)
 
             # ── Stampa ─────────────────────────────────────────────────
-            eff_gp_s_now, eff_gp_t_now = self._effective_gp()
-            print(
-                f"[Ep {epoch+1:4d}/{epochs}]  "
-                f"G={avg['generator']:+7.3f}  "
-                f"D_s={avg['disc_static']:+7.3f}  D_t={avg['disc_temporal']:+7.3f}  "
-                f"GP_s={avg['gp_static']:5.3f}(lam={eff_gp_s_now:.1f})  "
-                f"GP_t={avg['gp_temporal']:5.3f}(lam={eff_gp_t_now:.1f})"
+            #eff_gp_s_now, eff_gp_t_now = self._effective_gp()
+            print( f"[Ep {epoch+1:4d}/{epochs}]  "
+                f"G={avg['generator']:+7.3f}  D_s={avg['disc_static']:+7.3f}  D_t={avg['disc_temporal']:+7.3f}  "
+                #f"GP_s={avg['gp_static']:5.3f}(lam={eff_gp_s_now:.1f})  "
+                #f"GP_t={avg['gp_temporal']:5.3f}(lam={eff_gp_t_now:.1f})"
             )
-            # Categoriche: mostra distribuzione per le prime variabili (collapse detection)
-            cat_stats = ""
-            for var in self.data_config.static_cat[:3]:
-                if var.name in self.target_probs_static:
-                    tp = self.target_probs_static[var.name].cpu()
-                    max_p = float(tp.max())
-                    n_eff = int((tp > 0.01).sum())
-                    cat_stats += f" {var.name}(tgt_max={max_p:.2f},n={n_eff})"
-            print(
-                f"              "
+            print(f"              "
                 f"Nv={avg['mean_n_visits']:4.1f}  NvL={avg['nv_loss']:.3f}  "
                 f"Fup={avg['fup_loss']:.3f}  Scat={avg['scat_loss']:.3f}  "
                 f"VarL={avg['var_loss']:.3f}  dL={avg['delta_loss']:.3f}  "
-                f"AcL={avg['autocorr_loss']:.3f}{cat_stats}"
+                f"AcL={avg['autocorr_loss']:.3f}"
             )
-            print(
-                f"              "
+            print(f"              "
                 f"Cont(fake) mu={avg['fake_cont_mean']:+.3f} s={avg['fake_cont_std']:.3f}  "
-                f"Cont(real) mu={real_cont_mean:+.3f} s={real_cont_std:.3f}  "
-                f"| T={self.current_temperature:.3f}  "
-                f"noise={self._instance_noise_strength():.3f}",
+                f"| T={self.current_temperature:.3f}  noise={self._instance_noise_strength():.3f}",
                 flush=True,
             )
-
-            # Ogni 50 ep: campiona il generatore e mostra distribuzione categoriche
-            if (epoch + 1) % 50 == 0 or epoch == 0:
-                with torch.no_grad():
-                    self.set_eval()
-                    z_s_mon, z_t_mon = self.generator.sample_noise(64, torch.device(self.device))
-                    out_mon = self.generator(z_s_mon, z_t_mon, temperature=self.current_temperature)
-                    self.set_train()
-                    if out_mon.get("static_cat_soft"):
-                        cat_lines = []
-                        for vname, soft in out_mon["static_cat_soft"].items():
-                            p_fake = soft.mean(dim=0).cpu()
-                            p_real = self.target_probs_static.get(vname, p_fake.new_zeros(len(p_fake)))
-                            n_active = int((p_fake > 0.05).sum())
-                            max_p = float(p_fake.max())
-                            target_max = float(p_real.max())
-                            cat_lines.append(
-                                f"  {vname}: n_active={n_active}/{len(p_fake)}  "
-                                f"max_p={max_p:.3f} (tgt={target_max:.3f})")
-                        if cat_lines:
-                            print(f"  [Cat@ep{epoch+1}] " + "  ".join(
-                                l.strip() for l in cat_lines[:4]))
 
             disc_loss = avg["disc_static"] + avg["disc_temporal"]
             if disc_loss < best_loss:

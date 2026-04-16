@@ -643,7 +643,7 @@ def main(
 
 # ======================================================
 if __name__ == "__main__":
-    OUTPUT_PATH = "output/exp_4"
+    OUTPUT_PATH = "output/exp_5"
     CONFIG_PATH = "config/data_config2.json"
 
     main(

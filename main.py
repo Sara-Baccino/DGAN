@@ -10,10 +10,11 @@ import random
 from config.config_loader import load_config, build_data_config
 from processing.processor import Preprocessor
 from model.dgan import DGAN
+import torch_directml
 
 from datetime import datetime
 # timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "5"
+timestr = "1"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -131,7 +132,8 @@ def main():
     # =========================================================================
     # 5. INIZIALIZZA DGAN
     # =========================================================================
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    #device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"  #torch_directml.device()    #if torch_directml.is_available() else "cpu"
     logger.info(f"\nUsing device: {device}")
 
     dgan = DGAN(

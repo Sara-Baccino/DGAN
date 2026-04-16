@@ -9,7 +9,7 @@ __pycache__/
 
 #output
 output/
-
+runs/
 # Dati (opzionale, ma consigliato per file pesanti)
 *.xlsx
 *.csv
@@ -25,3 +25,4 @@ upsampling.py
 metrics.py
 plots.py
 stats.py
+main_eval2.py
