@@ -34,6 +34,7 @@ from eval.plots import (
     plot_utility_section,
     plot_privacy_section,
 )
+from eval.plots_longitudinal import plot_irreversible_events
 
 _UNICODE_REPLACEMENTS = {
     '\u2014': '--', '\u2013': '-',
@@ -118,6 +119,7 @@ def run_validation_report(
     synth_path:     str    = "",
     umap_color_vars: list[str] | None = None,
     tstr_targets:   list[str] | None  = None,
+    irr_vars:       list[str] | None  = None,
 ) -> dict:
     """
     Esegue la pipeline completa di validazione:
@@ -187,6 +189,19 @@ def run_validation_report(
 
     # Privacy plots
     privacy_plots = plot_privacy_section(real, synth, num_ok, plot_dir)
+
+    # Irreversible event plots
+    irr_plots = []
+    if irr_vars:
+        print("[report] Generazione plot variabili irreversibili...")
+        irr_plots = plot_irreversible_events(
+            real        = real,
+            synth       = synth,
+            irr_vars    = irr_vars,
+            time_col    = time_col,
+            patient_col = patient_col,
+            outdir      = plot_dir,
+        )
 
     # ── 3. PDF ────────────────────────────────────────────────────────────────
     print("[report] Assemblaggio PDF...")
@@ -340,6 +355,19 @@ def run_validation_report(
     pdf.add_metrics_table(privacy, "PRIVACY METRICS")
     _add_image_list(pdf, privacy_plots)
     
+    # ── Sezione D: Variabili Irreversibili ───────────────────────────────────
+    if irr_plots:
+        pdf.section("D. IRREVERSIBLE EVENTS — Timing e Prevalenza")
+        pdf.add_note(
+            "Per ogni variabile irreversibile: "
+            "(1) Kaplan-Meier tempo-al-primo-evento con log-rank test, "
+            "(2) Prevalenza cumulativa nel tempo real vs synth, "
+            "(3) Distribuzione del timing del primo evento (KDE + KS), "
+            "(4) Incidenza per finestra temporale (bar chart). "
+            "KM p>>0.05 = curve compatibili. KS distribuzione timing: <0.15 buono."
+        )
+        _add_image_list(pdf, irr_plots)
+
     # ── Salvataggio ───────────────────────────────────────────────────────────
     out_file = os.path.join(output_path, "Synthetic_Data_Validation_Report.pdf")
     pdf.output(out_file)

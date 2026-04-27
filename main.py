@@ -14,7 +14,7 @@ import torch_directml
 
 from datetime import datetime
 # timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "1"
+timestr = "6"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ def main():
     # =========================================================================
     # 2. CARICA DATI
     # =========================================================================
-    df_train = pd.read_excel("DGAN_PBC.xlsx")
+    df_train = pd.read_excel("PBC_Risk.xlsx")
     print(f"\nLoaded {len(df_train)} rows, "
           f"{df_train[data_cfg.patient_id_col].nunique()} patients")
 
@@ -85,7 +85,7 @@ def main():
     # 4. PREPROCESSING
     # =========================================================================
     # Configura embedding per CENTRE (48 categorie → 12 dimensioni)
-    embedding_configs = {"CENTRE": 12}
+    embedding_configs = {"CENTRE": 8}
 
     # ── Tutti i parametri di preprocessing vengono ora da prep_cfg (config JSON) ──
     preprocessor = Preprocessor(
@@ -133,7 +133,7 @@ def main():
     # 5. INIZIALIZZA DGAN
     # =========================================================================
     #device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = "cpu"  #torch_directml.device()    #if torch_directml.is_available() else "cpu"
+    device = "cpu"      #torch_directml.device()    if torch_directml.is_available() else "cpu"
     logger.info(f"\nUsing device: {device}")
 
     dgan = DGAN(
@@ -150,7 +150,7 @@ def main():
     print(f"  Disc static params:  {sum(p.numel() for p in dgan.disc_static.parameters()):,}")
     print(f"  Disc temporal params:{sum(p.numel() for p in dgan.disc_temporal.parameters()):,}")
     print(f"  min_visits enforced: {dgan.generator.min_visits}")
-    print(f"  noise_ar_rho:        {dgan.generator.noise_ar_rho}")
+    #print(f"  noise_ar_rho:        {dgan.generator.noise_ar_rho}")
 
     # =========================================================================
     # 6. TRAINING

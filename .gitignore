@@ -26,3 +26,4 @@ metrics.py
 plots.py
 stats.py
 main_eval2.py
+generator_cnn.py

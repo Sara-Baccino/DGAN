@@ -1,6 +1,6 @@
 {
   "time": {
-    "max_visits": 8,
+    "max_visits": 38,
     "visit_column": "MONTHS_FROM_BASELINE",
     "patient_id": "RECORD_ID",
     "fup_column": "t_FUP",
@@ -21,7 +21,6 @@
       {"name": "HEIGHT",     "type": "float"},
       {"name": "WEIGHT",     "type": "float"},
       {"name": "TAUDCADOSE", "type": "float"},
-      {"name": "t_FUP",      "type": "float"},
       {"name": "INRPTVAL",   "type": "float"},
       {"name": "CRE",        "type": "float"},
       {"name": "SOD",        "type": "float"},
@@ -33,32 +32,25 @@
       {"name": "WBCVAL",     "type": "float"},
       {"name": "NEUTVAL",    "type": "float"},
       {"name": "LINFVAL",    "type": "float"},
-      {"name": "VITDVAL",    "type": "float"},
-      {"name": "t_DEATH",    "type": "float"},
-      {"name": "t_TRANSP",   "type": "float"},
-      {"name": "t_HEPC",     "type": "float"},
-      {"name": "t_VARB",     "type": "float"},
-      {"name": "t_ENCP",     "type": "float"},
-      {"name": "t_ASCT",     "type": "float"},
-      {"name": "t_ESOVAR",   "type": "float"}
+      {"name": "VITDVAL",    "type": "float"}
     ],
 
     "categorical": {
       "SEX":            {"type": "int", "mapping": {"1": 1, "2": 2}},
-      "ETHNICC":        {"type": "int", "mapping": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}},
+      "ETHNICC":        {"type": "int", "mapping": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}},
       "CENTRE": {
         "type": "string",
         "mapping": {
-          "PBC0001": 1,  "PBC0002": 2,  "PBC0003": 3,  "PBC0004": 4,  "PBC0005": 5,
-          "PBC0006": 6,  "PBC0007": 7,  "PBC0008": 8,  "PBC0011": 9,  "PBC0014": 10,
-          "PBC0015": 11, "PBC0016": 12, "PBC0019": 13, "PBC0022": 14, "PBC0023": 15,
-          "PBC0024": 16, "PBC0025": 17, "PBC0026": 18, "PBC0027": 19, "PBC0029": 20,
-          "PBC0031": 21, "PBC0032": 22, "PBC0033": 23, "PBC0035": 24, "PBC0038": 25,
-          "PBC0039": 26, "PBC0041": 27, "PBC0043": 28, "PBC0044": 29, "PBC0045": 30,
-          "PBC0046": 31, "PBC0047": 32, "PBC0050": 33, "PBC0052": 34, "PBC0053": 35,
-          "PBC0055": 36, "PBC0058": 37, "PBC0062": 38, "PBC0063": 39, "PBC0065": 40,
-          "PBC0067": 41, "PBC0068": 42, "PBC0070": 43, "PBC0071": 44, "PBC0074": 45,
-          "PBC0075": 46, "PBC0084": 47, "PBC0087": 48, "PBC0088": 49
+          "PBC0001": 1,  "PBC0003": 2,  "PBC0004": 3,  "PBC0005": 4,
+          "PBC0006": 5,  "PBC0008": 6,  "PBC0011": 7,  "PBC0014": 8,
+          "PBC0015": 9, "PBC0016": 10, "PBC0019": 11, "PBC0023": 12,
+          "PBC0025": 13, "PBC0026": 14, "PBC0027": 15, 
+          "PBC0031": 16, "PBC0032": 17, "PBC0033": 18, "PBC0035": 19, "PBC0038": 20,
+          "PBC0039": 21, "PBC0041": 22, "PBC0043": 23, "PBC0044": 24, "PBC0045": 25,
+          "PBC0046": 26, "PBC0047": 27, "PBC0050": 28, "PBC0052": 29, "PBC0053": 30,
+          "PBC0055": 31, "PBC0058": 32, "PBC0062": 33, "PBC0063": 34, "PBC0065": 35,
+          "PBC0067": 36, "PBC0068": 37, "PBC0070": 38, "PBC0071": 39, "PBC0074": 40,
+          "PBC0087": 41, "PBC0088": 42
         }
       },
       "ALCOHOL":           {"type": "int", "mapping": {"0": 1, "1": 2, "2": 3}},
@@ -68,12 +60,6 @@
       "DEATH":             {"type": "int", "mapping": {"0": 1, "1": 2}},
       "TRANSP":            {"type": "int", "mapping": {"0": 1, "1": 2}},
       "WDRAWYN":           {"type": "int", "mapping": {"0": 1, "1": 2}},
-      "DEATHRYN":          {"type": "int", "mapping": {"0": 1, "1": 2}},
-      "HEPC":              {"type": "int", "mapping": {"0": 1, "1": 2}},
-      "ESOVAR":            {"type": "int", "mapping": {"0": 1, "1": 2}},
-      "ASCT":              {"type": "int", "mapping": {"0": 1, "1": 2}},
-      "VARB":              {"type": "int", "mapping": {"0": 1, "1": 2}},
-      "ENCP":              {"type": "int", "mapping": {"0": 1, "1": 2}},
       "CMBND":             {"type": "int", "mapping": {"0": 1, "1": 2}},
       "CMBIND":            {"type": "int", "mapping": {"0": 1, "1": 2}},
       "CMBOS":             {"type": "int", "mapping": {"0": 1, "1": 2}},
@@ -95,6 +81,12 @@
       {"name": "GGT", "type": "float"},
       {"name": "PLC", "type": "float"}
     ],
-  "categorical": {}
+  "categorical": {
+    "HEPC":              {"type": "int", "mapping": {"0": 1, "1": 2}, "irreversible": true},
+      "ESOVAR":            {"type": "int", "mapping": {"0": 1, "1": 2}, "irreversible": true},
+      "ASCT":              {"type": "int", "mapping": {"0": 1, "1": 2}, "irreversible": true},
+      "VARB":              {"type": "int", "mapping": {"0": 1, "1": 2}, "irreversible": true},
+      "ENCP":              {"type": "int", "mapping": {"0": 1, "1": 2}, "irreversible": true}
+  }
   }
 }

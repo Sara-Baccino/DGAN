@@ -1100,3 +1100,316 @@ def plot_variable_by_visit(
 
     return paths
 
+
+# ======================================================
+# Irreversible categorical variables analysis
+# ======================================================
+
+def plot_irreversible_events(
+    real:        pd.DataFrame,
+    synth:       pd.DataFrame,
+    irr_vars:    list[str],
+    time_col:    str,
+    patient_col: str,
+    outdir:      str,
+    time_max:    float | None = None,
+    n_grid:      int          = 60,
+) -> list[str]:
+    """
+    Analisi completa delle variabili categoriche binarie irreversibili
+    (HEPC, ESOVAR, ASCT, VARB, ENCP e simili).
+
+    Produce per ogni variabile 4 pannelli in un'unica figura:
+
+      1. Kaplan-Meier dell'evento (tempo al primo evento = 1)
+         Confronta real vs synth. Annota log-rank p-value e numero a rischio.
+
+      2. Prevalenza cumulativa nel tempo
+         Percentuale di pazienti con stato=1 ad ogni bin temporale.
+         Real vs synth: deviazione visibile = errore di timing.
+
+      3. Distribuzione del tempo al primo evento
+         KDE del tempo in mesi in cui lo stato passa da 0 a 1.
+         Mostra se il modello impara il timing corretto degli eventi.
+
+      4. Proporzione di pazienti con evento al follow-up finale
+         Barra doppia (real vs synth) con il tasso grezzo di prevalenza.
+         Utile per verificare se la frequenza complessiva è corretta.
+
+    Parametri
+    ----------
+    irr_vars    : lista di colonne binarie irreversibili (es. ["HEPC","ASCT"]).
+                  Devono contenere valori 0/1 (o encodati come 1/2 → convertiti).
+    time_col    : colonna dei mesi dal baseline.
+    patient_col : colonna ID paziente.
+    time_max    : limite asse temporale (None = max dei dati).
+    n_grid      : punti della griglia temporale per la prevalenza cumulativa.
+
+    Restituisce lista di path PNG (uno per variabile).
+    """
+    try:
+        from lifelines import KaplanMeierFitter
+        from lifelines.statistics import logrank_test
+        _lifelines_ok = True
+    except ImportError:
+        print("[WARNING] lifelines non installato - pannello KM saltato.")
+        _lifelines_ok = False
+
+    paths = []
+
+    def _to_binary(series: pd.Series) -> pd.Series:
+        """Converte 1/2 → 0/1 se necessario (encoding categorico del preprocessor)."""
+        s = pd.to_numeric(series, errors="coerce").fillna(0)
+        if s.max() == 2:
+            return (s == 2).astype(float)
+        return (s > 0.5).astype(float)
+
+    def _first_event_time(df: pd.DataFrame, var: str) -> pd.DataFrame:
+        """
+        Per ogni paziente: trova il tempo in mesi del primo step con stato=1.
+        Se il paziente non ha mai lo stato=1, usa il suo tempo massimo come
+        tempo di censura (evento=0).
+        Returns DataFrame con [patient_col, 'event_time', 'event'].
+        """
+        rows = []
+        for pid, g in df.groupby(patient_col):
+            g = g.sort_values(time_col)
+            times  = pd.to_numeric(g[time_col], errors="coerce").values
+            states = _to_binary(g[var]).values
+            idx1   = np.where(states == 1)[0]
+            if len(idx1) > 0:
+                rows.append({patient_col: pid,
+                             "event_time": float(times[idx1[0]]),
+                             "event": 1})
+            else:
+                rows.append({patient_col: pid,
+                             "event_time": float(np.nanmax(times)) if len(times) else 0.0,
+                             "event": 0})
+        return pd.DataFrame(rows)
+
+    def _cumulative_prevalence(df: pd.DataFrame, var: str,
+                                grid: np.ndarray) -> np.ndarray:
+        """
+        Prevalenza cumulativa: per ogni punto t della griglia,
+        frazione di pazienti con almeno un evento <= t.
+        """
+        first_ev = _first_event_time(df, var)
+        has_event = first_ev[first_ev["event"] == 1]["event_time"].values
+        total_patients = len(first_ev)
+        if total_patients == 0:
+            return np.zeros(len(grid))
+        prev = np.array([
+            np.sum(has_event <= t) / total_patients
+            for t in grid
+        ])
+        return prev
+
+    # ── Determine time axis ───────────────────────────────────────────
+    if time_max is None:
+        r_max = pd.to_numeric(real[time_col],  errors="coerce").max()
+        s_max = pd.to_numeric(synth[time_col], errors="coerce").max()
+        time_max = float(max(r_max, s_max))
+    if time_max <= 0 or np.isnan(time_max):
+        time_max = 120.0
+    grid = np.linspace(0.0, time_max, n_grid)
+
+    # ── One figure per variable ───────────────────────────────────────
+    for var in irr_vars:
+        if var not in real.columns or var not in synth.columns:
+            print(f"  [WARN] plot_irreversible_events: '{var}' non trovata. Saltata.")
+            continue
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(
+            f"Irreversible Event Analysis — {var}\n"
+            "Top-left: KM (time-to-event)  |  Top-right: Cumulative prevalence\n"
+            "Bottom-left: Distribution of event timing  |  Bottom-right: Overall event rate",
+            fontsize=11, fontweight="bold", y=1.01,
+        )
+        ax_km, ax_prev, ax_time, ax_rate = axes.flatten()
+
+        r_ev = _first_event_time(real,  var)
+        s_ev = _first_event_time(synth, var)
+
+        # ── Panel 1: Kaplan-Meier ─────────────────────────────────────
+        if _lifelines_ok and r_ev["event"].sum() >= 2 and s_ev["event"].sum() >= 2:
+            kmf_r = KaplanMeierFitter()
+            kmf_r.fit(r_ev["event_time"], r_ev["event"],
+                      label=f"Real  (n={len(r_ev)}, events={r_ev['event'].sum():.0f})")
+            kmf_r.plot_survival_function(ax=ax_km, color=COLOR_REAL,
+                                          ci_show=True, linestyle="-")
+
+            kmf_s = KaplanMeierFitter()
+            kmf_s.fit(s_ev["event_time"], s_ev["event"],
+                      label=f"Synth (n={len(s_ev)}, events={s_ev['event'].sum():.0f})")
+            kmf_s.plot_survival_function(ax=ax_km, color=COLOR_SYNTH,
+                                          ci_show=True, linestyle="--")
+
+            test = logrank_test(
+                r_ev["event_time"], s_ev["event_time"],
+                r_ev["event"],     s_ev["event"],
+            )
+            p_str = f"p={test.p_value:.3f}" if test.p_value >= 0.001 else "p<0.001"
+            ax_km.text(0.97, 0.97,
+                       f"Log-rank\nchi2={test.test_statistic:.2f}\n{p_str}",
+                       transform=ax_km.transAxes, fontsize=8,
+                       ha="right", va="top",
+                       bbox=dict(boxstyle="round,pad=0.3",
+                                 facecolor="white", alpha=0.85))
+            ax_km.set_xlabel("Months from baseline", fontsize=9)
+            ax_km.set_ylabel("Event-free probability", fontsize=9)
+            ax_km.set_title(f"Kaplan-Meier: time to first {var}=1",
+                            fontsize=9, fontweight="bold")
+            ax_km.set_xlim(0, time_max)
+            ax_km.grid(alpha=0.3)
+        else:
+            ax_km.text(0.5, 0.5, "Insufficient events for KM\n"
+                       f"(real={r_ev['event'].sum():.0f}, "
+                       f"synth={s_ev['event'].sum():.0f})",
+                       ha="center", va="center", transform=ax_km.transAxes, fontsize=9)
+            ax_km.axis("off")
+
+        # ── Panel 2: Cumulative prevalence ────────────────────────────
+        r_prev = _cumulative_prevalence(real,  var, grid)
+        s_prev = _cumulative_prevalence(synth, var, grid)
+
+        ax_prev.plot(grid, r_prev * 100, color=COLOR_REAL,  lw=2,
+                     label=f"Real  (final: {r_prev[-1]*100:.1f}%)")
+        ax_prev.plot(grid, s_prev * 100, color=COLOR_SYNTH, lw=2, ls="--",
+                     label=f"Synth (final: {s_prev[-1]*100:.1f}%)")
+
+        # Shaded area between curves = discrepancy
+        ax_prev.fill_between(grid, r_prev * 100, s_prev * 100,
+                             alpha=0.12, color="gray",
+                             label="Gap (real-synth)")
+
+        # Annotate max absolute gap and at which time it occurs
+        abs_gap = np.abs(r_prev - s_prev)
+        if abs_gap.max() > 0:
+            t_max_gap = grid[np.argmax(abs_gap)]
+            ax_prev.axvline(t_max_gap, color="gray", lw=1, ls=":",
+                            label=f"Max gap at t={t_max_gap:.0f}mo "
+                                  f"({abs_gap.max()*100:.1f}%)")
+
+        ax_prev.set_xlabel("Months from baseline", fontsize=9)
+        ax_prev.set_ylabel("Cumulative prevalence (%)", fontsize=9)
+        ax_prev.set_title(f"Cumulative prevalence of {var}=1 over time",
+                          fontsize=9, fontweight="bold")
+        ax_prev.set_xlim(0, time_max)
+        ax_prev.set_ylim(0, 100)
+        ax_prev.legend(fontsize=7)
+        ax_prev.grid(alpha=0.3)
+
+        # ── Panel 3: Distribution of event timing ─────────────────────
+        r_times = r_ev[r_ev["event"] == 1]["event_time"].values
+        s_times = s_ev[s_ev["event"] == 1]["event_time"].values
+
+        if len(r_times) >= 3:
+            sns.kdeplot(r_times, ax=ax_time, color=COLOR_REAL,
+                        fill=True, alpha=0.35, warn_singular=False,
+                        label=f"Real  (n={len(r_times)}, "
+                              f"med={np.median(r_times):.0f}mo)")
+            ax_time.axvline(np.median(r_times), color=COLOR_REAL,
+                            lw=1.5, ls="--", alpha=0.7)
+
+        if len(s_times) >= 3:
+            sns.kdeplot(s_times, ax=ax_time, color=COLOR_SYNTH,
+                        fill=True, alpha=0.35, warn_singular=False,
+                        label=f"Synth (n={len(s_times)}, "
+                              f"med={np.median(s_times):.0f}mo)")
+            ax_time.axvline(np.median(s_times), color=COLOR_SYNTH,
+                            lw=1.5, ls="--", alpha=0.7)
+
+        if len(r_times) >= 2 and len(s_times) >= 2:
+            ks_stat, p_val = ks_2samp(r_times, s_times)
+            p_str = f"p={p_val:.3f}" if p_val >= 0.001 else "p<0.001"
+            ax_time.text(0.02, 0.97,
+                         f"KS={ks_stat:.3f}, {p_str}\n"
+                         f"Real  mean={np.mean(r_times):.1f}mo  "
+                         f"std={np.std(r_times):.1f}mo\n"
+                         f"Synth mean={np.mean(s_times):.1f}mo  "
+                         f"std={np.std(s_times):.1f}mo",
+                         transform=ax_time.transAxes, fontsize=7, va="top",
+                         bbox=dict(boxstyle="round,pad=0.25",
+                                   facecolor="white", alpha=0.85))
+        elif len(r_times) == 0 and len(s_times) == 0:
+            ax_time.text(0.5, 0.5, "No events in either dataset",
+                         ha="center", va="center",
+                         transform=ax_time.transAxes, fontsize=9)
+
+        ax_time.set_xlabel("Time of first event (months from baseline)", fontsize=9)
+        ax_time.set_ylabel("Density", fontsize=9)
+        ax_time.set_title(f"Distribution of event timing: {var}",
+                          fontsize=9, fontweight="bold")
+        ax_time.set_xlim(0, time_max)
+        ax_time.legend(fontsize=7)
+        ax_time.grid(alpha=0.3)
+
+        # ── Panel 4: Overall event rate (bar) ─────────────────────────
+        n_r = len(r_ev)
+        n_s = len(s_ev)
+        rate_r = float(r_ev["event"].sum()) / n_r * 100 if n_r > 0 else 0.0
+        rate_s = float(s_ev["event"].sum()) / n_s * 100 if n_s > 0 else 0.0
+
+        # Prevalence per-time-bin (bar chart showing how rate evolves)
+        n_bins   = 8
+        bin_edges = np.linspace(0, time_max, n_bins + 1)
+        bin_labels = [f"{bin_edges[i]:.0f}-{bin_edges[i+1]:.0f}"
+                      for i in range(n_bins)]
+
+        def _rate_per_bin(df_ev, bin_edges):
+            """
+            For each bin [t_lo, t_hi]: fraction of ALL patients
+            whose first event fell in that window.
+            """
+            total = len(df_ev)
+            if total == 0:
+                return np.zeros(len(bin_edges) - 1)
+            rates = []
+            for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+                n_in_bin = ((df_ev["event"] == 1) &
+                            (df_ev["event_time"] >= lo) &
+                            (df_ev["event_time"] <  hi)).sum()
+                rates.append(n_in_bin / total * 100)
+            return np.array(rates)
+
+        r_rates = _rate_per_bin(r_ev, bin_edges)
+        s_rates = _rate_per_bin(s_ev, bin_edges)
+
+        x    = np.arange(n_bins)
+        w    = 0.35
+        bars_r = ax_rate.bar(x - w/2, r_rates, width=w,
+                              color=COLOR_REAL,  alpha=0.75, label=f"Real  (total {rate_r:.1f}%)")
+        bars_s = ax_rate.bar(x + w/2, s_rates, width=w,
+                              color=COLOR_SYNTH, alpha=0.75, label=f"Synth (total {rate_s:.1f}%)")
+
+        # Annotate difference per bin
+        for i, (rr, ss) in enumerate(zip(r_rates, s_rates)):
+            diff = ss - rr
+            if abs(diff) >= 1.0:
+                ax_rate.text(i, max(rr, ss) + 0.3,
+                             f"{diff:+.1f}%", ha="center",
+                             fontsize=6.5, color="dimgray")
+
+        ax_rate.set_xticks(x)
+        ax_rate.set_xticklabels(bin_labels, rotation=30, ha="right", fontsize=8)
+        ax_rate.set_ylabel("% of patients with first event in bin", fontsize=9)
+        ax_rate.set_title(
+            f"Incidence per time window — {var}\n"
+            f"Total event rate: Real={rate_r:.1f}%  Synth={rate_s:.1f}%",
+            fontsize=9, fontweight="bold",
+        )
+        ax_rate.legend(fontsize=8)
+        ax_rate.grid(axis="y", alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(outdir, f"irreversible_{var}.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        paths.append(path)
+        print(f"  [irreversible] {var}: real_rate={rate_r:.1f}%  "
+              f"synth_rate={rate_s:.1f}%  "
+              f"real_events={r_ev['event'].sum():.0f}  "
+              f"synth_events={s_ev['event'].sum():.0f}")
+
+    return paths

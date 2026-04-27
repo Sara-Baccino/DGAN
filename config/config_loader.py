@@ -206,6 +206,13 @@ class GRUDiscConfig:
 
 
 @dataclass
+class LSTMDiscConfig:
+    hidden_dim:    int  = 64
+    lstm_layers:   int  = 2
+    bidirectional: bool = False
+
+
+@dataclass
 class MLPHeadDiscConfig:
     n_layers:   int = 3
     hidden_dim: int = 64
@@ -222,16 +229,27 @@ class MLPHeadDiscConfig:
 
 @dataclass
 class TempDiscriminatorConfig:
-    arch:    str              = "cnn"
-    cnn:     CNNDiscConfig    = field(default_factory=CNNDiscConfig)
-    gru:     GRUDiscConfig    = field(default_factory=GRUDiscConfig)
+    arch:    str               = "lstm"
+    cnn:     CNNDiscConfig     = field(default_factory=CNNDiscConfig)
+    gru:     GRUDiscConfig     = field(default_factory=GRUDiscConfig)
+    lstm:    LSTMDiscConfig    = field(default_factory=LSTMDiscConfig)
     mlp:     MLPHeadDiscConfig = field(default_factory=MLPHeadDiscConfig)
-    dropout: float            = 0.1
+    dropout: float             = 0.1
 
     # Shortcut properties per compatibilità col codice esistente
     @property
     def hidden_dim(self) -> int:
+        if self.arch == "lstm":
+            return self.lstm.hidden_dim
         return self.cnn.hidden_dim if self.arch == "cnn" else self.gru.hidden_dim
+
+    @property
+    def lstm_layers(self) -> int:
+        return self.lstm.lstm_layers
+
+    @property
+    def bidirectional(self) -> bool:
+        return self.lstm.bidirectional
 
     @property
     def kernel_size(self) -> int:
@@ -243,6 +261,8 @@ class TempDiscriminatorConfig:
 
     @property
     def n_layers(self) -> int:
+        if self.arch == "lstm":
+            return self.lstm.lstm_layers
         return self.cnn.n_layers if self.arch == "cnn" else self.gru.n_layers
 
     @property
@@ -790,11 +810,12 @@ def _build_static_disc_config(raw: dict) -> DiscriminatorConfig:
 
 
 def _build_temp_disc_config(raw: dict) -> TempDiscriminatorConfig:
-    cnn_raw = _get(raw, "cnn",      {})
-    gru_raw = _get(raw, "gru",      {})
-    mlp_raw = _get(raw, "mlp_head", {})
+    cnn_raw  = _get(raw, "cnn",      {})
+    gru_raw  = _get(raw, "gru",      {})
+    lstm_raw = _get(raw, "lstm",     {})
+    mlp_raw  = _get(raw, "mlp_head", {})
     return TempDiscriminatorConfig(
-        arch    = _get(raw, "arch",    "cnn"),
+        arch    = _get(raw, "arch",    "lstm"),
         dropout = _get(raw, "dropout", 0.1),
         cnn = CNNDiscConfig(
             hidden_dim    = _get(cnn_raw, "hidden_dim",   96),
@@ -805,6 +826,11 @@ def _build_temp_disc_config(raw: dict) -> TempDiscriminatorConfig:
         gru = GRUDiscConfig(
             hidden_dim = _get(gru_raw, "hidden_dim", 64),
             n_layers   = _get(gru_raw, "n_layers",    2),
+        ),
+        lstm = LSTMDiscConfig(
+            hidden_dim    = _get(lstm_raw, "hidden_dim",    64),
+            lstm_layers   = _get(lstm_raw, "lstm_layers",    2),
+            bidirectional = _get(lstm_raw, "bidirectional", False),
         ),
         mlp = MLPHeadDiscConfig(
             n_layers   = _get(mlp_raw, "n_layers",   3),
@@ -940,10 +966,10 @@ def build_model_config(cfg: dict) -> ModelConfig:
             "dropout":    _get(sd_raw, "dropout",         0.1),
         }
 
-    # Retrocompatibilità discriminatore temporale flat (senza sottoblocchi cnn/gru/mlp)
-    if not _get(td_raw, "cnn", None) and not _get(td_raw, "gru", None):
+    # Retrocompatibilità discriminatore temporale flat (senza sottoblocchi cnn/gru/lstm/mlp)
+    if not _get(td_raw, "cnn", None) and not _get(td_raw, "gru", None) and not _get(td_raw, "lstm", None):
         td_raw = {
-            "arch":    _get(td_raw, "arch",    "cnn"),
+            "arch":    _get(td_raw, "arch",    "lstm"),
             "dropout": _get(td_raw, "dropout", 0.1),
             "cnn": {
                 "hidden_dim":    _get(td_raw, "hidden_dim",    96),
@@ -954,6 +980,11 @@ def build_model_config(cfg: dict) -> ModelConfig:
             "gru": {
                 "hidden_dim": _get(td_raw, "gru_hidden_dim", 64),
                 "n_layers":   _get(td_raw, "gru_layers",      2),
+            },
+            "lstm": {
+                "hidden_dim":    _get(td_raw, "hidden_dim",    64),
+                "lstm_layers":   _get(td_raw, "n_layers",       2),
+                "bidirectional": _get(td_raw, "bidirectional", False),
             },
             "mlp_head": {
                 "n_layers":   _get(td_raw, "mlp_layers",    3),

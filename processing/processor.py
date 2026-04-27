@@ -754,8 +754,8 @@ class Preprocessor:
         followup_norm = np.zeros(N, dtype=np.float32)
 
         for i in range(N):
-            #t_norm[i]          = t_offset[i] / delta_max[i]    #normalizzazione per paziente
-            t_norm[i] = t_offset[i] / self.global_time_max  #normalizzazione globale
+            # Normalizzazione per-paziente: visit_times ∈ [0, 1] dove 1.0 = t_FUP
+            t_norm[i]         = t_offset[i] / delta_max[i]
             t_norm[i][~vf[i]]  = 0.0
             followup_norm[i]   = delta_max[i] / self.global_time_max
 
@@ -950,11 +950,10 @@ class Preprocessor:
                 if "visit_times" in synthetic and synthetic["visit_times"] is not None:
                     t_norm_val = min(1.0, max(0.0, float(synthetic["visit_times"][i, t])))
                     # Aggancia l'ultimo step esattamente a delta_max_i
-                    if step_i == n_valid - 1:
-                        #time_denorm = delta_max_i
-                        time_denorm = t_norm_val * self.global_time_max # Scala globale
-                    else:
-                        time_denorm = t_norm_val * delta_max_i
+                    # Normalizzazione per-paziente: tutti gli step (incluso l'ultimo)
+                    # usano delta_max_i = followup_norm * global_time_max del paziente.
+                    # L'ultimo step avrà time_denorm ≈ delta_max_i = t_FUP.
+                    time_denorm = t_norm_val * delta_max_i
                 else:
                     time_denorm = float(t) * (delta_max_i / max(T - 1, 1))
 
