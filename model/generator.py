@@ -1,41 +1,5 @@
 """
-model/generator.py  [gretel-style v3 — LSTM + channel min/max]
-================================================================================
-Cambiamenti rispetto alla versione GRU:
-
-  [NUOVO] LSTM al posto di GRU
-    L'LSTM ha due stati nascosti (h, c): la cell-state c porta memoria a lungo
-    raggio (utile per traiettorie cliniche lunghe), mentre h è l'output di ogni
-    passo. Questo riduce il "forgetting" precoce dei biomarker iniziali.
-    to_h0 ora produce sia h0 che c0: [n_layers*H*2] → split in due metà.
-
-  [NUOVO] Channel min/max clamping per le feature continue temporali
-    Dopo la head continua, ogni feature viene clampata ai valori
-    [channel_min[j], channel_max[j]] appresi dai dati reali durante il fit.
-    Questo evita la generazione di valori fuori scala senza normalizzare
-    globalmente il tempo (il tempo segue la propria logica via followup_norm).
-    I bound sono registrati come buffer (non parametri) → salvati nel checkpoint.
-
-    Flusso:
-      temporal_cont_head(h_seq) → raw_out → clamp(channel_min, channel_max)
-
-  [INVARIATO]
-    - Ramo statico s_h → h0/c0, followup_head, n_visits_head, static outputs
-    - Proiezione s_h_proj concatenata all'input LSTM ogni step
-    - Self-Attention post-LSTM su h_seq
-    - Gumbel-Softmax per categoriche (statiche e temporali)
-    - cummax per variabili irreversibili
-    - Noise AR configurabile via noise_ar_rho
-    - valid_flag da n_visits_head
-    - Vincolo t_FUP via ratio-scaling dei deltas
-
-================================================================================
-API pubblica (invariata rispetto alla v2 GRU):
-  DGANGenerator(data_config, preprocessor, ...)
-  .set_channel_bounds(channel_min, channel_max)   ← [NUOVO] chiamato da DGAN.fit()
-  .sample_noise(batch_size, device) → (z_s, z_t)
-  .forward(z_static, z_temporal, temperature, real_irr) → dict
-================================================================================
+model/generator.py  
 """
 
 import warnings
@@ -79,7 +43,7 @@ class DGANGenerator(nn.Module):
 
         n_cont = data_config.n_temp_cont
 
-        # ── [1] Ramo statico ──────────────────────────────────────────
+        # [1] Ramo statico 
         self.fc_static = nn.Sequential(
             nn.Linear(z_static_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -88,7 +52,7 @@ class DGANGenerator(nn.Module):
         # [LSTM] h0 + c0: ogni layer ha un hidden e un cell state
         self.to_h0 = nn.Linear(hidden_dim, n_layers * hidden_dim * 2)
 
-        # ── t_FUP dal ramo statico ─────────────────────────────────────
+        # t_FUP dal ramo statico
         self.followup_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
@@ -97,7 +61,19 @@ class DGANGenerator(nn.Module):
         )
         nn.init.constant_(self.followup_head[-2].bias, -0.62)
 
-        # ── n_visits dal ramo statico ──────────────────────────────────
+        # Lunghezza sequenza osservata (seq_len_norm) 
+        # Separata da followup_head: predice t_last / global_time_max.
+        # Vincolo strutturale: seq_len_norm <= followup_norm.
+        # Il generatore impara che la sequenza osservata è una PORZIONE del follow-up totale (seq_len <= t_FUP per costruzione).
+        self.seq_len_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+        nn.init.constant_(self.seq_len_head[-2].bias, -0.62)
+
+        # n_visits dal ramo statico 
         self.n_visits_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
@@ -105,7 +81,7 @@ class DGANGenerator(nn.Module):
         )
         nn.init.constant_(self.n_visits_head[-1].bias, 4.0)
 
-        # ── Static outputs ─────────────────────────────────────────────
+        # Static outputs 
         if data_config.n_static_cont > 0:
             self.static_cont_head = nn.Linear(hidden_dim, data_config.n_static_cont)
             nn.init.zeros_(self.static_cont_head.weight)
@@ -126,10 +102,10 @@ class DGANGenerator(nn.Module):
                     )
                 self.static_cat_heads[v.name] = nn.Linear(hidden_dim, v.n_categories)
 
-        # ── Proiezione statica per conditioning a ogni step LSTM ───────
+        # Proiezione statica per conditioning a ogni step LSTM 
         self.static_cond_proj = nn.Linear(hidden_dim, static_proj_dim)
 
-        # ── Categorie temporali per autoregression ─────────────────────
+        # Categorie temporali per autoregression 
         self._temp_cat_sizes: Dict[str, int] = {}
         for var in preprocessor.vars:
             if var.static or var.kind != "categorical":
@@ -144,7 +120,7 @@ class DGANGenerator(nn.Module):
         total_cat_prev_dim = sum(self._temp_cat_sizes.values())
         self._n_cont_input = max(n_cont, 0)
 
-        # ── [LSTM] Temporal LSTM ───────────────────────────────────────
+        # [LSTM] Temporal LSTM ==========================================
         # Input: [z_t, x_prev_cont, cat_prev_ohe, delta_prev, s_h_proj]
         lstm_input_size = (
             z_temporal_dim
@@ -161,7 +137,7 @@ class DGANGenerator(nn.Module):
             dropout     = dropout if n_layers > 1 else 0.0,
         )
 
-        # ── [5] Self-Attention post-LSTM ──────────────────────────────
+        # [5] Self-Attention post-LSTM (opzionale)
         if attn_heads > 0:
             actual_heads = attn_heads
             while hidden_dim % actual_heads != 0 and actual_heads > 1:
@@ -177,7 +153,7 @@ class DGANGenerator(nn.Module):
             self.self_attn = None
             self.attn_norm = None
 
-        # ── Output temporali continui ──────────────────────────────────
+        # Output temporali continui 
         out_cont_dim = max(n_cont, 1)
         self.temporal_cont_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -187,9 +163,8 @@ class DGANGenerator(nn.Module):
         nn.init.zeros_(self.temporal_cont_head[-1].weight)
         nn.init.zeros_(self.temporal_cont_head[-1].bias)
 
-        # ── [NUOVO] Channel min/max buffers ───────────────────────────
-        # Inizializzati a (-inf, +inf) → nessun clamping finché non vengono
-        # impostati da set_channel_bounds() durante il fit.
+        # Channel min/max buffers 
+        # Inizializzati a (-inf, +inf) → nessun clamping finché non vengono impostati da set_channel_bounds() durante il fit.
         # Registrati come buffer: seguono .to(device) e vengono salvati nel checkpoint.
         self.register_buffer(
             "channel_min",
@@ -200,15 +175,15 @@ class DGANGenerator(nn.Module):
             torch.full((out_cont_dim,), float("+inf"))
         )
 
-        # ── Intervallo inter-visita Δt ─────────────────────────────────
+        # Intervallo inter-visita Δt ===============================
         self.interval_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.ReLU(),
             nn.Linear(hidden_dim // 4, 1),
         )
-        nn.init.constant_(self.interval_head[-1].bias, 0.5)
-
-        # ── Categoriche temporali ──────────────────────────────────────
+        nn.init.constant_(self.interval_head[-1].bias, -3.5)
+        
+        # Categoriche temporali
         self.temporal_cat_heads = nn.ModuleDict()
         self.temporal_cat_irrev: Dict[str, bool] = {}
         for var in preprocessor.vars:
@@ -228,10 +203,7 @@ class DGANGenerator(nn.Module):
                     hidden_dim, len(var.mapping))
                 self.temporal_cat_irrev[var.name] = False
 
-    # ------------------------------------------------------------------
-    # API PUBBLICA AGGIUNTIVA
-    # ------------------------------------------------------------------
-
+    
     def set_channel_bounds(
         self,
         channel_min: torch.Tensor,   # [n_cont]
@@ -240,13 +212,8 @@ class DGANGenerator(nn.Module):
         """
         Imposta i limiti [min, max] per ogni feature continua temporale.
 
-        Tipicamente chiamato da DGAN.fit() dopo aver calcolato i bound
-        dal dataset reale (es. min/max per-feature su tutti gli step validi).
-        I bound vengono copiati nei buffer e NON richiedono gradient.
-
-        Nota: il tempo (visit_times) NON è una feature continua in temporal_cont
-        e NON viene gestito qui. La normalizzazione temporale è già garantita
-        dalla struttura ratio-scaling del generatore (vedi Step 5 del forward).
+        Tipicamente chiamato da DGAN.fit() dopo aver calcolato i bound dal dataset reale (es. min/max per-feature su tutti gli step validi).
+        I bound vengono copiati nei buffer e non richiedono gradient.
         """
         n = self.channel_min.shape[0]
         if channel_min.shape[0] != n or channel_max.shape[0] != n:
@@ -257,8 +224,6 @@ class DGANGenerator(nn.Module):
         self.channel_min.copy_(channel_min.to(self.channel_min.device))
         self.channel_max.copy_(channel_max.to(self.channel_max.device))
 
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _cummax_irr(hazard: torch.Tensor) -> torch.Tensor:
         """Garantisce monotonia crescente per gli stati irreversibili."""
@@ -268,11 +233,9 @@ class DGANGenerator(nn.Module):
     def sample_noise(self, batch_size: int, device: torch.device) -> tuple:
         """
         Campiona rumore latente (z_s, z_t).
-
         Se noise_ar_rho > 0, z_t segue un processo AR(1):
             z_t[t] = rho * z_t[t-1] + sqrt(1-rho^2) * eps
-        Questo introduce correlazione temporale nel rumore di input,
-        aiutando il generatore a produrre traiettorie più smooth.
+        Questo introduce correlazione temporale nel rumore di input, aiutando il generatore a produrre traiettorie più smooth.
         """
         z_s = torch.randn(batch_size, self.z_static_dim, device=device)
         if self.noise_ar_rho <= 0.0:
@@ -291,8 +254,6 @@ class DGANGenerator(nn.Module):
                 z_t[:, t, :] = rho * z_t[:, t - 1, :] + std_innov * eps
         return z_s, z_t
 
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         z_static:    torch.Tensor,             # [B, z_s]
@@ -304,7 +265,7 @@ class DGANGenerator(nn.Module):
         device   = self.device
         n_cont   = self.data_config.n_temp_cont
 
-        # ── Step 1: Ramo statico ───────────────────────────────────────
+        # Step 1: Ramo statico ==================================================
         s_h = self.fc_static(z_static)                          # [B, H]
 
         # [LSTM] Inizializza h0 e c0 separatamente
@@ -337,7 +298,12 @@ class DGANGenerator(nn.Module):
                 static_cat_soft[name] = F.gumbel_softmax(out, tau=temperature,
                                                           hard=False, dim=-1)
 
-        followup_norm = self.followup_head(s_h).squeeze(-1)     # [B] ∈ [0,1]
+        followup_norm = self.followup_head(s_h).squeeze(-1)     # [B] = t_FUP ∈ [0,1]
+
+        # seq_len_norm = lunghezza sequenza osservata normalizzata ∈ [0, followup_norm]
+        # Vincolo strutturale: la sequenza non può durare più del follow-up totale.
+        seq_len_raw   = self.seq_len_head(s_h).squeeze(-1)       # [B] ∈ [0,1]
+        seq_len_norm  = torch.minimum(seq_len_raw, followup_norm) # seq_len <= t_FUP
         n_v_raw       = F.softplus(self.n_visits_head(s_h).squeeze(-1)) + 1.0
         n_visits      = n_v_raw.clamp(float(self.min_visits), float(T))
 
@@ -348,7 +314,7 @@ class DGANGenerator(nn.Module):
         # Proiezione statica per conditioning a ogni step
         s_cond = self.static_cond_proj(s_h)                    # [B, static_cond_dim]
 
-        # ── Step 2: Loop AR con LSTM ───────────────────────────────────
+        #  Step 2: Loop AR con LSTM ==========================================
         h_seq      = torch.zeros(B, T, self.hidden_dim, device=device)
         deltas_buf = torch.zeros(B, T, device=device)
         cont_buf   = torch.zeros(B, T, max(n_cont, 1), device=device)
@@ -383,9 +349,7 @@ class DGANGenerator(nn.Module):
                 x_prev_cont = x_cont_t.detach()
 
             # Delta Δt
-            # [BASELINE FIX] Il primo step è sempre al baseline (t=0, delta=0).
-            # I pazienti reali hanno sempre la prima visita a mese 0.
-            # Forziamo delta[0]=0 per costruzione: il generatore non deve impararlo.
+            # Il primo step è sempre al baseline (t=0, delta=0) --> delta[0]=0 per costruzione.
             if t == 0:
                 delta_t = torch.zeros(B, 1, device=device)
             else:
@@ -411,7 +375,7 @@ class DGANGenerator(nn.Module):
             if cat_parts:
                 cat_prev_ohe = torch.cat(cat_parts, dim=-1)
 
-        # ── Step 3: Self-Attention post-LSTM ──────────────────────────
+        # Step 3: Self-Attention post-LSTM (opzionale)
         if self.self_attn is not None:
             attn_mask_key = ~valid_flag                         # [B, T] bool
             attn_out, _   = self.self_attn(
@@ -420,17 +384,11 @@ class DGANGenerator(nn.Module):
             )
             h_seq = self.attn_norm(h_seq + attn_out)
 
-        # ── Step 4: Output temporali finali con channel clamping ───────
+        # Step 4: Output temporali finali con channel clamping 
         raw_cont = self.temporal_cont_head(h_seq)               # [B, T, out_cont_dim]
 
-        # [NUOVO] Channel min/max clamping (per-feature, ignorando il tempo)
-        # channel_min/max sono buffer [out_cont_dim] → broadcast su [B, T, out_cont_dim]
-        # Se non impostati (ancora -inf/+inf), torch.clamp è un no-op.
-        temporal_cont = torch.clamp(
-            raw_cont,
-            min = self.channel_min,
-            max = self.channel_max,
-        )
+        # Channel min/max clamping (per-feature, ignorando il tempo)
+        temporal_cont = torch.clamp(raw_cont, min = self.channel_min, max = self.channel_max)
         if n_cont == 0:
             temporal_cont = temporal_cont[:, :, :0]
         else:
@@ -457,18 +415,33 @@ class DGANGenerator(nn.Module):
                 temporal_cat[name] = F.gumbel_softmax(
                     head(h_seq), tau=temperature, hard=True, dim=-1)
 
-        # ── Step 5: visit_times con vincolo t_FUP ─────────────────────
-        # cumsum dei delta → T_obs = tempo ultima visita valida
-        # Se T_obs > t_FUP: scala tutti i delta per t_FUP/T_obs  (ratio ≤ 1)
-        # Garantisce visit_last <= t_FUP per costruzione, senza clipping brusco.
-        # Il TEMPO non viene clampato via channel_min/max: ha la sua logica.
-        cumsum_d = torch.cumsum(deltas_buf, dim=1)              # [B, T]
+        # Step 5: visit_times normalizzati sulla lunghezza sequenza osservata 
+        #
+        # LOGICA (con normalizzazione per lunghezza osservata):
+        #   visit_times in [0, 1] dove 1.0 = t_last = t_seq_obs
+        #   t_seq_obs = seq_len_norm * global_time_max  (lunghezza osservata)
+        #   t_FUP     = followup_norm * global_time_max (durata totale follow-up)
+        #   con t_seq_obs <= t_FUP per costruzione
+        #
+        # Il generatore produce delta arbitrari; li scala affinché la loro somma (sull'ultima visita valida) coincida con seq_len_norm.
+        # In questo modo:
+        #   - visit_times[last] = 1.0  (= t_seq_obs normalizzato)
+        #   - L'inverse_transform ricostruisce: t = visit_times * delta_max_i
+        #     dove delta_max_i = seq_len_norm * global_time_max = t_seq_obs
+        #   - followup_norm rimane feature condizionante separata (t_FUP info)
+        #
+        # Il modello impara che le sequenze hanno lunghezza variabile ≤ t_FUP.
+        
+        cumsum_d = torch.cumsum(deltas_buf, dim=1)               # [B, T]
         last_idx = (n_v_round - 1).clamp(0, T - 1).unsqueeze(1)
         T_obs    = cumsum_d.gather(1, last_idx).squeeze(1).clamp(min=1e-6)
-        ratio    = torch.minimum(followup_norm / T_obs, torch.ones_like(followup_norm))
-        delta_final = deltas_buf * ratio.unsqueeze(1)           # [B, T]
+        # Scala per seq_len_norm (non followup_norm)
+        ratio       = torch.minimum(
+            seq_len_norm / T_obs, torch.ones_like(seq_len_norm))
+        delta_final = deltas_buf * ratio.unsqueeze(1)            # [B, T]
+        # visit_times ∈ [0,1] normalizzato su seq_len_norm
         visit_times = (torch.cumsum(delta_final, dim=1) /
-                       followup_norm.clamp(min=1e-6).unsqueeze(1)).clamp(0.0, 1.0)
+                       seq_len_norm.clamp(min=1e-6).unsqueeze(1)).clamp(0.0, 1.0)
 
         return {
             "static_cont":      static_cont,
@@ -480,7 +453,8 @@ class DGANGenerator(nn.Module):
             "valid_flag":       valid_flag,          # [B, T] bool
             "visit_times":      visit_times,         # [B, T] ∈ [0,1]
             "deltas":           delta_final,         # [B, T] intervalli scalati
-            "followup_norm":    followup_norm,       # [B] ∈ [0,1] — t_FUP
+            "followup_norm":    followup_norm,       # [B] ∈ [0,1] — t_FUP / global_t_max
+            "seq_len_norm":     seq_len_norm,        # [B] ∈ [0,1] — t_seq_obs / global_t_max
             "n_visits":         n_visits,
             "n_visits_pred":    n_v_raw,
         }

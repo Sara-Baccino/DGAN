@@ -1,40 +1,5 @@
 """
-processing/preprocessor.py  [v6-fully-parametrized]
-================================================================================
-Rispetto a v5:
-
-  [NUOVO] Gestione warning ed errori espliciti:
-    - WARNING se nessuna variabile continua o categorica (temporale o statica)
-      → imputazione saltata, non crash silenzioso
-    - ERROR se il DataFrame è vuoto o ha meno di 2 pazienti
-    - ERROR se la colonna time_col manca
-    - ERROR se max_len < 1
-    - WARNING se alcuni pazienti hanno 0 visite valide
-    - WARNING se max_len viene superato (troncamento silenzioso → ora loggato)
-    - WARNING se un paziente ha 1 sola visita (delta_max = 0 → followup forzato)
-    - ERROR se la colonna fup_col è dichiarata in config ma mancante nel DataFrame
-
-  [NUOVO] t_FUP dalla colonna reale:
-    - Se data_cfg.fup_col è presente nel DataFrame, il follow-up per paziente
-      viene letto direttamente da quella colonna (prima visita per paziente).
-    - La normalizzazione usa t_FUP come delta_max del paziente invece della
-      durata calcolata dall'ultima visita.
-    - In questo modo l'ultimo step temporale generato corrisponde esattamente
-      al tempo di follow-up del paziente.
-    - Se la colonna manca → warning e fallback al comportamento v5
-      (delta dalla prima all'ultima visita).
-
-  [NUOVO] Parametri da config:
-    - mice_max_iter, knn_neighbors: ora argomenti espliciti del costruttore
-    - clip_z: clipping z-score in inverse_transform (da prep_cfg.clip_z)
-
-  Invariato rispetto a v5:
-    - MICE per continue temporali e statiche
-    - KNNImputer per categoriche
-    - valid_flag [N,T] bool
-    - Normalizzazione temporale delta-shift per paziente (v4.2)
-    - Gestione embedding
-================================================================================
+processing/preprocessor.py  
 """
 
 import logging
@@ -329,16 +294,13 @@ class Preprocessor:
         """
         df = df.copy()
 
-        # ── 1. Temporali continue — interpolazione per paziente ───────
-        # Per le variabili temporali, l'interpolazione lineare dentro-paziente
-        # e' molto piu' corretta di MICE globale: preserva la traiettoria
-        # individuale e non introduce correlazioni artificiose tra pazienti.
+        # 1. Temporali continue — interpolazione per paziente 
+        # L'interpolazione lineare dentro-paziente preserva la traiettoria individuale e non introduce correlazioni artificiose tra pazienti.
         # Strategia per ogni paziente:
         #   a) Interpolazione lineare per i NaN interni alla serie
         #   b) Forward-fill per i NaN iniziali (bordo sinistro)
         #   c) Backward-fill per i NaN finali (bordo destro)
-        #   d) Se rimangono NaN (paziente con solo NaN per quella var):
-        #      mediana globale della variabile come ultimo fallback
+        #   d) Se rimangono NaN (paziente con solo NaN per quella var): mediana globale della variabile come ultimo fallback
         temp_cont_names = [v.name for v in self.vars
                            if not v.static and v.kind == "continuous"
                            and v.name in df.columns]
@@ -376,7 +338,7 @@ class Preprocessor:
                     )
                     df[temp_cont_names] = df[temp_cont_names].fillna(0.0)
 
-        # ── 2. Statiche continue — MICE ───────────────────────────────
+        # 2. Statiche continue - MICE 
         stat_cont_names = [v.name for v in self.vars
                            if v.static and v.kind == "continuous"
                            and v.name in df.columns]
@@ -401,7 +363,7 @@ class Preprocessor:
                         if df[col].isna().any():
                             df[col] = df[col].fillna(df[col].median())
 
-        # ── 3. Categoriche statiche — KNN ─────────────────────────────
+        # 3. Categoriche statiche - KNN 
         stat_cat_names = [v.name for v in self.vars
                           if v.static and v.kind == "categorical"
                           and v.name in df.columns]
@@ -426,7 +388,7 @@ class Preprocessor:
                         if len(mode) > 0:
                             df[col] = df[col].replace(MAP_MISSING, mode.iloc[0])
 
-        # ── 4. Categoriche temporali — KNN ────────────────────────────
+        # 4. Categoriche temporali - KNN 
         temp_cat_names = [v.name for v in self.vars
                           if not v.static and v.kind == "categorical"
                           and v.name in df.columns]
@@ -643,7 +605,7 @@ class Preprocessor:
         temporal_cont_vars = [v for v in self.vars if not v.static and v.kind == "continuous"]
         vf                 = padded["valid_flag"]  # [N,T] bool
 
-        # ── Statici ───────────────────────────────────────────────────
+        # Statici ====================================
         if static_cont_vars and "df_static" in padded:
             cols = []
             for v in static_cont_vars:
@@ -661,7 +623,7 @@ class Preprocessor:
             if cols:
                 padded["static_cont_scaled"] = np.concatenate(cols, axis=1)
 
-        # ── Temporali ─────────────────────────────────────────────────
+        # Temporali ===========================================
         for j, v in enumerate(temporal_cont_vars):
             data  = padded["temporal_cont"][:, :, j]
             if v.name in self.log_vars:
@@ -685,13 +647,19 @@ class Preprocessor:
         """
         Normalizzazione temporale per paziente.
 
-        Se fup_times[i] > 0 (da colonna t_FUP reale):
-          - delta_max[i] = fup_times[i] - t_first[i]
-          - t_norm[i, t] = (t_raw - t_first) / delta_max  ∈ [0, 1]
-          - L'ultimo step valido corrisponde esattamente a t_FUP.
-
-        Se fup_times[i] == 0 o la colonna non c'era:
-          - Fallback: delta_max[i] = t_last - t_first (comportamento v5)
+        STRATEGIA:
+          delta_max[i] = t_last_observed - t_first
+          -> visit_times in [0, 1] dove 1.0 = ultima visita osservata
+ 
+          followup_norm[i] = t_FUP / global_time_max  in (0, 1]
+          -> scalare separato che porta l'info sulla durata totale del follow-up senza vincolare la normalizzazione delle visite
+ 
+          global_time_max = max(t_FUP) su tutti i pazienti
+ 
+        VANTAGGI rispetto a normalizzare su t_FUP:
+          - Permette troncamento delle sequenze: se consideri solo i primi N step, visit_times è già [0,1] sulla parte osservata 
+          - La lunghezza della sequenza non è più vincolata a coprire t_FUP
+          - followup_norm rimane come feature condizionante indipendente
         """
         vt  = padded["visit_times_raw"]   # [N,T]
         vf  = padded["valid_flag"]        # [N,T] bool
@@ -700,6 +668,7 @@ class Preprocessor:
 
         t_offset  = np.zeros_like(vt)
         delta_max = np.ones(N, dtype=np.float32)
+        fup_abs   = np.zeros(N, dtype=np.float32)  # t_FUP assoluto per followup_norm
         self.global_time_max = float(delta_max.max())
 
         single_visit_warned = False
@@ -707,46 +676,45 @@ class Preprocessor:
         for i in range(N):
             valid_idx = np.where(vf[i])[0]
             if len(valid_idx) == 0:
+                fup_abs[i] = float(fup[i]) if fup[i] > 1e-8 else 1.0
                 continue
 
             t_first = vt[i, valid_idx[0]]
+            t_last  = float(vt[i, valid_idx[-1]])
 
-            # Determina delta_max: usa t_FUP se disponibile e > 0
+            # Determina delta_max: usa lunghezza osservata (t_last - t_first)
+            d = t_last - t_first
+            if d < 1e-8:
+                if not single_visit_warned:
+                    warnings.warn(
+                        f"Paziente indice {i}: una sola visita o visite con lo stesso "
+                        f"timestamp. delta_max forzato a 1.0.",
+                        UserWarning,
+                    )
+                    single_visit_warned = True
+                d = 1.0
+            delta_max[i]=d
+
+            # t_FUP assoluto per followup_norm
             if fup[i] > 1e-8:
-                # t_FUP è assoluto → delta = t_FUP - t_first
-                d = float(fup[i]) - float(t_first)
-                if d < 1e-8:
-                    # t_FUP coincide o precede la prima visita (non dovrebbe accadere)
-                    if not single_visit_warned:
-                        warnings.warn(
-                            f"Paziente indice {i}: delta t_FUP - t_first = {d:.4f} "
-                            f"(quasi zero). Potrebbe indicare t_FUP espresso come "
-                            f"durata dal baseline invece che come data assoluta. "
-                            f"Usa delta_max = max(fup[i], ultima_visita - t_first).",
-                            UserWarning,
-                        )
-                        single_visit_warned = True
-                    d = max(float(vt[i, valid_idx[-1]]) - float(t_first), 1.0)
-                delta_max[i] = d
+                fup_val = float(fup[i])
+                if fup_val < t_last - 1e-6:
+                    warnings.warn(
+                        f"Paziente indice {i}: t_FUP={fup_val:.2f} < "
+                        f"t_last={t_last:.2f}. Uso t_last come t_FUP.",
+                        UserWarning,
+                    )
+                    fup_val = t_last
+                fup_abs[i] = fup_val
             else:
-                # Fallback: distanza prima-ultima visita
-                t_last = vt[i, valid_idx[-1]]
-                d      = float(t_last) - float(t_first)
-                if d < 1e-8:
-                    if not single_visit_warned:
-                        warnings.warn(
-                            f"Paziente indice {i} ha una sola visita o visite "
-                            f"con lo stesso timestamp. delta_max forzato a 1.0.",
-                            UserWarning,
-                        )
-                        single_visit_warned = True
-                    d = 1.0
-                delta_max[i] = d
-
+                fup_abs[i] = t_last
+            
             t_offset[i]          = vt[i] - t_first
             t_offset[i][~vf[i]]  = 0.0
 
-        self.global_time_max = float(delta_max.max())
+        #self.global_time_max = float(delta_max.max())
+        # global_time_max = max(t_FUP) su tutti i pazienti
+        self.global_time_max = float(fup_abs.max())
         if self.global_time_max < 1e-8:
             self.global_time_max = 1.0
 
@@ -754,14 +722,21 @@ class Preprocessor:
         followup_norm = np.zeros(N, dtype=np.float32)
 
         for i in range(N):
-            # Normalizzazione per-paziente: visit_times ∈ [0, 1] dove 1.0 = t_FUP
+            # Normalizzazione per-paziente: visit_times in [0, 1] dove 1.0 = t_FUP
             t_norm[i]         = t_offset[i] / delta_max[i]
             t_norm[i][~vf[i]]  = 0.0
-            followup_norm[i]   = delta_max[i] / self.global_time_max
+            # followup_norm ∈ (0,1] = t_FUP / global_time_max
+            followup_norm[i]   = fup_abs[i] / self.global_time_max
+           # followup_norm[i]   = delta_max[i] / self.global_time_max
 
-        padded["visit_times"]   = t_norm.astype(np.float32)
-        padded["followup_norm"] = followup_norm.astype(np.float32)
-        # Salva delta_max per uso in inverse_transform
+        # seq_len_norm: lunghezza sequenza osservata / global_time_max in (0, 1]
+        # Distinto da followup_norm (t_FUP / global_time_max).
+        # Usato dal generatore per scalare i delta e dall'inverse_transform per denormalizzare i tempi di visita.
+        seq_len_norm = (delta_max / self.global_time_max).astype(np.float32)
+
+        padded["visit_times"]           = t_norm.astype(np.float32)
+        padded["followup_norm"]         = followup_norm.astype(np.float32)
+        padded["seq_len_norm"]          = seq_len_norm
         padded["delta_max_per_patient"] = delta_max
         return padded
 
@@ -810,6 +785,7 @@ class Preprocessor:
             "valid_flag":     torch.tensor(vf_np,                   dtype=torch.bool),
             "visit_time":     torch.tensor(padded["visit_times"],    dtype=torch.float32),
             "followup_norm":  torch.tensor(padded["followup_norm"],  dtype=torch.float32),
+            "seq_len_norm":   torch.tensor(padded["seq_len_norm"],   dtype=torch.float32),
             "n_visits":       torch.tensor(n_visits_np,              dtype=torch.long),
             "temporal_cat":   {},
         }
@@ -921,7 +897,7 @@ class Preprocessor:
                     static_data[v.name] = self.inverse_maps[v.name][val_enc]
                     offset += n_cat
 
-            # 3. Statici categorici — Embedding
+            # 3. Statici categorici - Embedding
             if "static_cat_embed_decoded" in synthetic:
                 for v in static_cat_vars:
                     if v.name not in self.embedding_configs:
@@ -931,14 +907,23 @@ class Preprocessor:
                     val_enc = values[idx_enc]
                     static_data[v.name] = self.inverse_maps[v.name][val_enc]
 
-            # 4. Durata follow-up (denormalizzata)
+            # 4. Durata follow-up per t_FUP (denormalizzata)
             if followup_norm is not None:
-                delta_max_i = float(followup_norm[i]) * self.global_time_max
+                fup_denorm = float(followup_norm[i]) * self.global_time_max
             else:
-                delta_max_i = self.global_time_max
-            static_data[self.fup_col] = delta_max_i   # colonna t_FUP configurabile
+                fup_denorm = self.global_time_max
+            static_data[self.fup_col] = fup_denorm   # colonna t_FUP configurabile
 
-            # 5. Visite temporali — usa valid_flag
+            # seq_len: lunghezza sequenza osservata (per denorm visitetemporali)
+            # Distinto da t_FUP: seq_len <= t_FUP.
+            # Se seq_len_norm non presente (modello vecchio), fallback a followup_norm.
+            seq_len_norm_val = synthetic.get("seq_len_norm", None)
+            if seq_len_norm_val is not None:
+                delta_max_i = float(seq_len_norm_val[i]) * self.global_time_max
+            else:
+                delta_max_i = fup_denorm  # fallback legacy
+
+            # 5. Visite temporali - usa valid_flag
             if vf_raw.dtype == torch.bool:
                 valid_steps = vf_raw[i].nonzero(as_tuple=True)[0].tolist()
             else:
@@ -950,9 +935,8 @@ class Preprocessor:
                 if "visit_times" in synthetic and synthetic["visit_times"] is not None:
                     t_norm_val = min(1.0, max(0.0, float(synthetic["visit_times"][i, t])))
                     # Aggancia l'ultimo step esattamente a delta_max_i
-                    # Normalizzazione per-paziente: tutti gli step (incluso l'ultimo)
-                    # usano delta_max_i = followup_norm * global_time_max del paziente.
-                    # L'ultimo step avrà time_denorm ≈ delta_max_i = t_FUP.
+                    # Normalizzazione per-paziente: tutti gli step (incluso l'ultimo) usano delta_max_i = followup_norm * global_time_max del paziente.
+                    # L'ultimo step avrà time_denorm circa delta_max_i = t_FUP.
                     time_denorm = t_norm_val * delta_max_i
                 else:
                     time_denorm = float(t) * (delta_max_i / max(T - 1, 1))

@@ -1,34 +1,5 @@
 """
-model/dgan.py  [gretel-style v3 — LSTM + channel min/max]
-================================================================================
-Cambiamenti rispetto alla versione precedente:
-
-  [NUOVO] Calcolo channel min/max in fit()
-    Prima dell'inizio del training, calcola per ogni feature continua temporale
-    i valori min e max sui dati reali (solo step valid_flag=True).
-    I bound vengono passati al generatore via generator.set_channel_bounds().
-    Il tempo (visit_times) NON è incluso: ha la propria normalizzazione.
-
-  [NUOVO] Loss module separato
-    Tutte le loss sono importate da model.losses (file dedicato).
-    Il training loop usa solo le loss necessarie, senza alias privati.
-
-  [SEMPLIFICATO] Training loop
-    Rimossi: GP curriculum, lambda_scat warmup coseno, instance noise.
-    Rimasti: WGAN, irr, fup, nv, scat, fm, var (intra-paziente), delta, autocorr.
-    Ogni loss è attivata solo se il suo lambda > 0 e i dati sono disponibili.
-
-  [SEMPLIFICATO] Architettura
-    Generator: LSTM (via generator.py v3)
-    TemporalDiscriminator: LSTM (arch="lstm", via discriminator.py v3)
-
-  [INVARIATO]
-    - EMA generatore
-    - Early stopping su disc_loss
-    - Save/Load con channel_bounds nel checkpoint
-    - generate() con temperatura configurabile
-    - Warm-start followup e n_visits
-================================================================================
+model/dgan.py 
 """
 
 import copy
@@ -94,7 +65,7 @@ class DGAN:
             if var:
                 self.embed_var_categories[var_name] = len(var.mapping)
 
-        # ── Lambda ────────────────────────────────────────────────────
+        # Lambda 
         mc = model_config
         self.lambda_gp_s      = float(mc.lambda_gp_s)
         self.lambda_gp_t      = float(mc.lambda_gp_t)
@@ -139,7 +110,7 @@ class DGAN:
             "fake_cont_std":  [],
         }
 
-    # ─────────────────────────────────────────────────────────────────
+    # region Utils
 
     def _calc_static_dim(self) -> int:
         dim = self.data_config.n_static_cont
@@ -214,7 +185,7 @@ class DGAN:
         else:
             self.ema_generator = None
 
-    # ─────────────────────────────────────────────────────────────────
+    # Train Utils
 
     def _update_ema(self):
         if self.ema_generator is None:
@@ -269,20 +240,62 @@ class DGAN:
                     targets[var_name] = p
         return targets
 
-    # ─────────────────────────────────────────────────────────────────
-    # CHANNEL BOUNDS: calcola min/max reali e li imposta nel generatore
-    # ─────────────────────────────────────────────────────────────────
+    def _compute_irr_prevalence_targets(self, tensors_dict: Dict) -> None:
+        """
+        Calcola la prevalenza reale (frazione di pazienti con stato=1 nell'ultima visita valida) 
+        per ogni variabile temporale binaria irreversibile. Salvata in self.target_prevalence_temporal.
+        Chiamata una volta sola all'inizio del fit().
+        """
+        tcat = tensors_dict.get("temporal_cat")
+        vf   = tensors_dict.get("valid_flag")
+        if tcat is None or vf is None:
+            return
 
+        vf_bool = vf.bool() if isinstance(vf, torch.Tensor) else torch.tensor(vf).bool()
+
+        irr_names = [
+            self.data_config.temporal_cat[idx].name
+            for idx in self.irreversible_idx
+        ]
+
+        for var in self.data_config.temporal_cat:
+            if var.name not in irr_names:
+                continue
+            if var.name not in tcat:
+                continue
+
+            cat_tensor = tcat[var.name]   # [N, T, n_cat] or [N, T] (encoded int)
+            N = cat_tensor.shape[0]
+            n_events = 0
+
+            for b in range(N):
+                valid_idx = vf_bool[b].nonzero(as_tuple=True)[0]
+                if len(valid_idx) == 0:
+                    continue
+                last_t = int(valid_idx[-1])
+                if cat_tensor.dim() == 3:
+                    # OHE: [N, T, 2] → stato=1 se argmax==1
+                    state = int(torch.argmax(cat_tensor[b, last_t]))
+                else:
+                    # Encoded int: 1=stato_0, 2=stato_1 (mapping gretel)
+                    state = int(cat_tensor[b, last_t]) - 1  # 0 o 1
+                if state == 1:
+                    n_events += 1
+
+            prevalence = n_events / max(N, 1)
+            self.target_prevalence_temporal[var.name] = prevalence
+            print(f"  [irr_prev] {var.name}: prevalence={prevalence:.3f} "
+                  f"({n_events}/{N} pazienti con stato=1)")
+
+    # CHANNEL BOUNDS: calcola min/max reali e li imposta nel generatore
+    
     def _compute_channel_bounds(self, tensors_dict: Dict) -> None:
         """
-        Calcola per ogni feature continua temporale i valori min e max
-        sui dati reali (solo step valid_flag=True) e li imposta nel generatore.
+        Calcola per ogni feature continua temporale i valori min e max sui dati reali (solo step valid_flag=True) e li imposta nel generatore.
 
-        Il TEMPO non è incluso: è gestito dalla struttura ratio-scaling
-        del generatore, non da un clamping esplicito.
+        Il TEMPO non è incluso: è gestito dalla struttura ratio-scaling del generatore, non da un clamping esplicito.
 
-        I bound vengono salvati come buffer nel generatore e persistono
-        nel checkpoint via save/load.
+        I bound vengono salvati come buffer nel generatore e persistono nel checkpoint via save/load.
         """
         tc = tensors_dict.get("temporal_cont")
         vf = tensors_dict.get("valid_flag")
@@ -315,10 +328,7 @@ class DGAN:
             f"Channel bounds impostati per {n_cont} feature continue temporali.")
         print(f"  Channel bounds: min={ch_min.tolist()}  max={ch_max.tolist()}")
 
-    # ─────────────────────────────────────────────────────────────────
-    # GENERATE FAKE
-    # ─────────────────────────────────────────────────────────────────
-
+    
     def _generate_fake(
         self,
         batch_size: int,
@@ -333,9 +343,9 @@ class DGAN:
         fake_disc = prepare_discriminator_inputs(fake_out, self.preprocessor)
         return fake_out, fake_disc
 
-    # ─────────────────────────────────────────────────────────────────
-    # TRAIN DISCRIMINATORS
-    # ─────────────────────────────────────────────────────────────────
+    # region Train Disc
+    #  TRAIN DISCRIMINATORS
+    # =========================================
 
     def _train_discriminators(
         self,
@@ -411,9 +421,9 @@ class DGAN:
 
         return loss_d_s.item(), loss_d_t.item(), aux_loss.item()
 
-    # ─────────────────────────────────────────────────────────────────
-    # TRAIN GENERATOR
-    # ─────────────────────────────────────────────────────────────────
+    # region Train Gen
+    #  TRAIN GENERATOR
+    # =========================================
 
     def _train_generator(
         self,
@@ -423,25 +433,17 @@ class DGAN:
         real_batch: Optional[Dict],
     ):
         self.opt_gen.zero_grad()
-        # --- TIMER 1: IL PROCESSO DI GENERAZIONE ---
-        #t_start_gen = time.time()
-
+        
         fake_out, fake_disc = self._generate_fake(batch_size, real_irr=real_irr)
-        #dt_inference = time.time() - t_start_gen
-
-        # --- TIMER 2: IL CALCOLO DELLE LOSS ---
-        #t_start_loss = time.time()
-        # ── WGAN generator loss ───────────────────────────────────────
-        # Il disc_temporal usa fake_static come conditioning:
-        # i gradienti devono fluire attraverso entrambi i path → no detach.
+        
         d_fake_s = self.disc_static(fake_disc["static"])
         d_fake_t = self.disc_temporal(
             fake_disc["static"], fake_disc["temporal"], fake_disc["valid_flag"])
         loss_g = wgan_g_loss(d_fake_s, d_fake_t)
         loss_g = check_finite(loss_g, "generator")
 
-        # ── Irreversibilità ───────────────────────────────────────────
-        #t_sub = time.time()
+        # LOSS AUSILIARIE ==================================================
+        # Irreversibilità 
         irr_loss = torch.tensor(0.0, device=self.device)
         if self.irreversible_idx and self.lambda_irr > 0:
             irr_states = self._extract_fake_irr(fake_out["temporal_cat"])
@@ -449,10 +451,8 @@ class DGAN:
                 irr_loss = irr_loss + irreversibility_loss(
                     irr_states[..., k], fake_out["valid_flag"])
             irr_loss = check_finite(irr_loss, "irr_loss")
-        #dt_irr = time.time() - t_sub
         
-        # ── Followup supervision ──────────────────────────────────────
-        #t_sub = time.time()
+        # Followup supervision 
         fup_loss = torch.tensor(0.0, device=self.device)
         if (self.lambda_fup > 0
                 and real_batch is not None
@@ -461,10 +461,8 @@ class DGAN:
                 fake_out["followup_norm"],
                 real_batch["followup_norm"].to(self.device))
             fup_loss = check_finite(fup_loss, "fup_loss")
-        #dt_fup = time.time() - t_sub
-
-        # ── N_visits supervision ──────────────────────────────────────
-        #t_sub = time.time()
+        
+        #  N_visits supervision
         nv_loss = torch.tensor(0.0, device=self.device)
         if (self.lambda_nv > 0
                 and real_batch is not None
@@ -473,18 +471,15 @@ class DGAN:
                 fake_out["n_visits_pred"],
                 real_batch["n_visits"].float().to(self.device))
             nv_loss = check_finite(nv_loss, "nv_loss")
-        #dt_nv = time.time() - t_sub
-        # ── Static categorical marginal ───────────────────────────────
-        #t_sub = time.time()
+        
+        # Static categorical marginal 
         scat_loss = torch.tensor(0.0, device=self.device)
         fake_soft = fake_out.get("static_cat_soft") or {}
         if self.lambda_scat > 0 and self.target_probs_static and fake_soft:
             scat_loss = static_cat_marginal_loss(fake_soft, self.target_probs_static)
             scat_loss = check_finite(scat_loss, "scat_loss")
-        #dt_cat = time.time() - t_sub
 
-        # ── Feature matching ──────────────────────────────────────────
-        #t_sub = time.time()
+        #  Feature matching 
         fm_loss = torch.tensor(0.0, device=self.device)
         if self.lambda_fm > 0 and hasattr(self.disc_static, "get_features"):
             feat_real = self.disc_static.get_features(
@@ -492,10 +487,8 @@ class DGAN:
             feat_fake = self.disc_static.get_features(fake_disc["static"])
             fm_loss   = feature_matching_loss(feat_real, feat_fake)
             fm_loss   = check_finite(fm_loss, "fm_loss")
-        #dt_fm = time.time() - t_sub
-
-        # ── Varianza intra-paziente ───────────────────────────────────
-        #t_sub = time.time()
+        
+        #  Varianza intra-paziente 
         var_loss = torch.tensor(0.0, device=self.device)
         if (self.lambda_var > 0
                 and real_batch is not None
@@ -508,26 +501,26 @@ class DGAN:
                 real_batch["valid_flag"].to(self.device),
             )
             var_loss = check_finite(var_loss, "var_loss")
-        #dt_intra = time.time() - t_sub
 
-        # ── Delta distribution loss ───────────────────────────────────
-        #t_sub = time.time()
+        # Distribuzione Delta temporali
         delta_loss = torch.tensor(0.0, device=self.device)
         if (self.lambda_delta > 0
                 and real_batch is not None
                 and "visit_time" in real_batch
+                and "seq_len_norm" in real_batch
                 and "deltas" in fake_out):
-            delta_loss = delta_distribution_loss(
-                fake_out["deltas"],
-                real_batch["visit_time"].to(self.device),
-                fake_out["valid_flag"],
-                real_batch["valid_flag"].to(self.device),
-            )
+            # visit_time reale è normalizzato per-paziente su delta_max_i ∈ [0,1].
+            # fake["deltas"] è in scala global_time_max (tramite seq_len_norm).
+            # Convertiamo i visit_times reali → stessa scala globale moltiplicando
+            # per seq_len_norm del paziente, così i delta calcolati internamente
+            # da delta_distribution_loss sono comparabili.
+            real_vt_abs = (real_batch["visit_time"].to(self.device)
+                           * real_batch["seq_len_norm"].to(self.device).unsqueeze(1))
+            delta_loss = delta_distribution_loss(fake_out["deltas"], real_vt_abs,
+                fake_out["valid_flag"], real_batch["valid_flag"].to(self.device) )
             delta_loss = check_finite(delta_loss, "delta_loss")
-        #dt_delta = time.time() - t_sub
-
-        # ── Autocorrelation loss ──────────────────────────────────────
-        #t_sub = time.time()
+        
+        #Autocorrelazione 
         autocorr_loss = torch.tensor(0.0, device=self.device)
         if (self.lambda_autocorr > 0
                 and real_batch is not None
@@ -541,10 +534,9 @@ class DGAN:
                 max_lag = self.autocorr_max_lag,
             )
             autocorr_loss = check_finite(autocorr_loss, "autocorr_loss")
-        #dt_autocorr = time.time() - t_sub
+        
 
-        # ── Irreversible prevalence loss ───────────────────────────────────────
-        #t_sub = time.time()
+        # Prevalenza var. Irreversibili 
         irr_prev_loss = torch.tensor(0.0, device=self.device)
         if (self.lambda_irr_prev > 0
                 and self.target_prevalence_temporal
@@ -555,12 +547,8 @@ class DGAN:
                 valid_flag        = fake_out["valid_flag"],
             )
             irr_prev_loss = check_finite(irr_prev_loss, "irr_prev_loss")
-        #dt_irrp = time.time() - t_sub
-        #dt_all_losses = time.time() - t_start_loss
-
-        # --- TIMER 3: BACKPROPAGATION ---
-        #t_start_back = time.time()
-        # ── Total ─────────────────────────────────────────────────────
+        
+        # loss totale
         total = (loss_g
                  + self.lambda_irr      * irr_loss
                  + self.lambda_fup      * fup_loss
@@ -583,11 +571,6 @@ class DGAN:
         self.opt_gen.step()
         self._update_ema()
 
-        #dt_backprop = time.time() - t_start_back
-        #print(f"\n[GEN PROFILE] Inf: {dt_inference:.2f}s | Losses: {dt_all_losses:.2f}s | Backprop: {dt_backprop:.2f}s")
-        #print(f"\n              AcL: {dt_autocorr:.2f}s | Irr: {dt_irr:.2f}s | Fup: {dt_fup:.2f}s | Cat: {dt_cat:.2f}s | Nv: {dt_nv:.2f}s")
-        #print(f"\n              IntraVar: {dt_intra:.2f}s | Fm: {dt_fm:.2f}s | Delta: {dt_delta:.2f}s | IrrP: {dt_nv:.2f}s")
-
         mean_nv = float(fake_out["n_visits"].detach().mean())
 
         stats = {}
@@ -606,17 +589,15 @@ class DGAN:
                 var_loss.item(), delta_loss.item(), autocorr_loss.item(),
                 irr_prev_loss.item(), mean_nv, stats)
 
-    # ─────────────────────────────────────────────────────────────────
     # LOADER
-    # ─────────────────────────────────────────────────────────────────
-
     @staticmethod
     def _build_loader(tensors_dict: Dict, batch_size: int,
                       use_dp: bool, drop_last: bool, num_workers: int = 0, pin_memory: bool = False):
         tensors, keys = [], []
 
         for k in ["static_cont", "static_cat", "temporal_cont",
-                  "valid_flag", "visit_time", "followup_norm", "n_visits"]:
+                  "valid_flag", "visit_time", "followup_norm", "n_visits",
+                  "seq_len_norm"]:
             if k in tensors_dict and tensors_dict[k] is not None:
                 tensors.append(tensors_dict[k])
                 keys.append(k)
@@ -662,10 +643,9 @@ class DGAN:
                 batch[key] = tensor
         return batch
 
-    # ─────────────────────────────────────────────────────────────────
-    # TRAIN STEP
-    # ─────────────────────────────────────────────────────────────────
-
+    # region Training loop
+    # Train Step (un passo del training loop)
+    # =========================================
     def train_step(self, loader, keys, critic_steps, critic_steps_t):
         batch_losses = []
 
@@ -730,64 +710,8 @@ class DGAN:
 
         return batch_losses
 
-    # ─────────────────────────────────────────────────────────────────
-    # FIT
-    # ─────────────────────────────────────────────────────────────────
-
-
-    # ─────────────────────────────────────────────────────────────────
-    # TARGET PREVALENCE VARIABILI IRREVERSIBILI TEMPORALI
-    # ─────────────────────────────────────────────────────────────────
-
-    def _compute_irr_prevalence_targets(self, tensors_dict: Dict) -> None:
-        """
-        Calcola la prevalenza reale (frazione di pazienti con stato=1
-        nell'ultima visita valida) per ogni variabile temporale binaria
-        irreversibile. Salvata in self.target_prevalence_temporal.
-
-        Chiamata una volta sola all'inizio del fit().
-        """
-        tcat = tensors_dict.get("temporal_cat")
-        vf   = tensors_dict.get("valid_flag")
-        if tcat is None or vf is None:
-            return
-
-        vf_bool = vf.bool() if isinstance(vf, torch.Tensor) else torch.tensor(vf).bool()
-
-        irr_names = [
-            self.data_config.temporal_cat[idx].name
-            for idx in self.irreversible_idx
-        ]
-
-        for var in self.data_config.temporal_cat:
-            if var.name not in irr_names:
-                continue
-            if var.name not in tcat:
-                continue
-
-            cat_tensor = tcat[var.name]   # [N, T, n_cat] or [N, T] (encoded int)
-            N = cat_tensor.shape[0]
-            n_events = 0
-
-            for b in range(N):
-                valid_idx = vf_bool[b].nonzero(as_tuple=True)[0]
-                if len(valid_idx) == 0:
-                    continue
-                last_t = int(valid_idx[-1])
-                if cat_tensor.dim() == 3:
-                    # OHE: [N, T, 2] → stato=1 se argmax==1
-                    state = int(torch.argmax(cat_tensor[b, last_t]))
-                else:
-                    # Encoded int: 1=stato_0, 2=stato_1 (mapping gretel)
-                    state = int(cat_tensor[b, last_t]) - 1  # 0 o 1
-                if state == 1:
-                    n_events += 1
-
-            prevalence = n_events / max(N, 1)
-            self.target_prevalence_temporal[var.name] = prevalence
-            print(f"  [irr_prev] {var.name}: prevalence={prevalence:.3f} "
-                  f"({n_events}/{N} pazienti con stato=1)")
-
+    # FIT (chiama train step)
+    # =========================================
     def fit(self, tensors_dict: Dict, epochs: int = None):
         self.set_train()
         epochs = epochs or self.model_config.epochs
@@ -806,10 +730,10 @@ class DGAN:
               f"λ_delta={self.lambda_delta}  λ_autocorr={self.lambda_autocorr}")
         print(f"{'='*70}\n")
 
-        # ── Channel min/max dal dataset reale ─────────────────────────
+        # Channel min/max dal dataset reale 
         self._compute_channel_bounds(tensors_dict)
 
-        # ── Target prevalence variabili irreversibili ─────────────────
+        # Target prevalence variabili irreversibili 
         print("Calcolo prevalenza target variabili irreversibili...")
         self._compute_irr_prevalence_targets(tensors_dict)
 
@@ -837,7 +761,7 @@ class DGAN:
                 UserWarning,
             )
 
-        # ── Target probs statiche ─────────────────────────────────────
+        # Target probs statiche 
         scat_tensor = tensors_dict.get("static_cat")
         if self.lambda_scat > 0 and scat_tensor is not None:
             print("Calcolo distribuzione marginale categoriche statiche...")
@@ -870,7 +794,7 @@ class DGAN:
                                 log_prior.to(last_layer.bias.device))
             print(f"  -> {len(self.target_probs_static)} variabili")
 
-        # ── Warm-start followup ───────────────────────────────────────
+        # Warm-start followup 
         fn_all = tensors_dict.get("followup_norm")
         if fn_all is not None:
             fn_mean  = float(fn_all.float().mean().clamp(0.02, 0.98))
@@ -879,7 +803,7 @@ class DGAN:
                 self.generator.followup_head[-2].bias.fill_(fn_logit)
             print(f"  followup warm-start: mean={fn_mean:.3f}  logit={fn_logit:.3f}")
 
-        # ── Warm-start n_visits ───────────────────────────────────────
+        # Warm-start n_visits
         nv_all = tensors_dict.get("n_visits")
         if nv_all is not None:
             nv_med = float(nv_all.float().median())
@@ -891,11 +815,29 @@ class DGAN:
                 self.generator.n_visits_head[-1].bias.fill_(nv_bias)
             print(f"  n_visits warm-start: median={nv_med:.1f}  min_visits={min_v}")
 
+        # Warm-start interval_head
+        # L'init nell'__init__ usa bias=0.5 → softplus(0.5)≈1.19, troppo grande
+        # rispetto alla scala normalizzata globale. Qui lo correggiamo con il
+        # delta medio atteso: seq_len_norm_medio / n_visits_media.
+        sln_all = tensors_dict.get("seq_len_norm")
+        nv_all2 = tensors_dict.get("n_visits")
+        if sln_all is not None and nv_all2 is not None:
+            mean_sln    = float(sln_all.float().mean().clamp(0.001, 1.0))
+            mean_nv     = float(nv_all2.float().mean().clamp(2.0, float(self.max_len)))
+            delta_target = mean_sln / mean_nv          # delta medio normalizzato atteso
+            # softplus⁻¹(x) = log(exp(x) - 1); clamp per stabilità numerica
+            iv_bias = float(np.log(max(np.exp(delta_target) - 1.0, 1e-6)))
+            with torch.no_grad():
+                self.generator.interval_head[-1].bias.fill_(iv_bias)
+            print(f"  interval warm-start: mean_sln={mean_sln:.4f}  "
+                  f"mean_nv={mean_nv:.1f}  delta_target={delta_target:.5f}  "
+                  f"iv_bias={iv_bias:.4f}")
+
         critic_steps   = self.model_config.critic_steps
         critic_steps_t = self.model_config.critic_steps_temporal
         best_loss, patience_counter = float("inf"), 0
 
-        # ── Training loop ─────────────────────────────────────────────
+        #  Training loop ===================================
         for epoch in range(epochs):
             self.current_temperature = max(
                 self.temperature_min,
@@ -947,9 +889,9 @@ class DGAN:
                           f"(best disc_loss={best_loss:.4f})")
                     break
 
-    # ─────────────────────────────────────────────────────────────────
+    # region Generation 
     # GENERATE
-    # ─────────────────────────────────────────────────────────────────
+    # =======================================================
 
     @torch.no_grad()
     def generate(self, n_samples: int, temperature: float = 0.5,
@@ -1029,9 +971,8 @@ class DGAN:
         self.set_train()
         return self.preprocessor.inverse_transform(synth)
 
-    # ─────────────────────────────────────────────────────────────────
-    # SAVE / LOAD
-    # ─────────────────────────────────────────────────────────────────
+    # SAVE e LOAD
+    # ========================================================
 
     def save(self, filepath: str):
         state = {
@@ -1047,7 +988,6 @@ class DGAN:
             "scalers_cont":            self.preprocessor.scalers_cont,
             "inverse_maps":            self.preprocessor.inverse_maps,
             "global_time_max":         self.preprocessor.global_time_max,
-            # [NUOVO] channel bounds salvati nel checkpoint
             "channel_min":             self.generator.channel_min.cpu(),
             "channel_max":             self.generator.channel_max.cpu(),
         }

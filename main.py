@@ -14,7 +14,7 @@ import torch_directml
 
 from datetime import datetime
 # timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "6"
+timestr = "7"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,12 +31,12 @@ def set_seed(seed=42):
 
 
 def main():
-    # =========================================================================
+    # ===========================================================
     # 1. CARICA CONFIGURAZIONE
-    # =========================================================================
+    # ===========================================================
     set_seed(42)
 
-    data_config_path  = "config/data_config2.json"
+    data_config_path  = "config/data_config.json"
     model_config_path = "config/model_config.json"
 
     time_cfg, variables, model_cfg, prep_cfg = load_config(
@@ -60,7 +60,7 @@ def main():
     # =========================================================================
     # 2. CARICA DATI
     # =========================================================================
-    df_train = pd.read_excel("PBC_Risk.xlsx")
+    df_train = pd.read_excel("PBC_Risk2.xlsx")
     print(f"\nLoaded {len(df_train)} rows, "
           f"{df_train[data_cfg.patient_id_col].nunique()} patients")
 
@@ -85,9 +85,9 @@ def main():
     # 4. PREPROCESSING
     # =========================================================================
     # Configura embedding per CENTRE (48 categorie → 12 dimensioni)
-    embedding_configs = {"CENTRE": 8}
+    #embedding_configs = {"CENTRE": 8}
 
-    # ── Tutti i parametri di preprocessing vengono ora da prep_cfg (config JSON) ──
+    # Tutti i parametri di preprocessing vengono ora da prep_cfg (config JSON) 
     preprocessor = Preprocessor(
         data_cfg,
         embedding_configs = prep_cfg.emb_vars,      #embedding_configs,
@@ -100,16 +100,13 @@ def main():
     tensors = preprocessor.fit_transform(df_train)
     print("Saving FITTED preprocessor with inverse_maps...")
     torch.save({
-        'preprocessor': preprocessor,  # Salva TUTTO: scalers, inverse_maps, imputers fitted
-        'inverse_maps': preprocessor.inverse_maps,  # Esplicito per sicurezza
+        'preprocessor': preprocessor,  # Salva scalers, inverse_maps, imputers fitted
+        'inverse_maps': preprocessor.inverse_maps,  
         'data_cfg': data_cfg,
     }, f"processing/preprocessor_fitted.pt")
     print(f"  Saved: preprocessor_fitted.pt (inverse_maps: {preprocessor.inverse_maps.keys() if preprocessor.inverse_maps else 'None'})")
 
-    # ── NOTA: le vecchie maschere (temporal_cat_mask, visit_mask) sono rimosse ──
-    # Il codice usa ora valid_flag [N,T] bool come unico indicatore di padding.
-    # Non fare più assert su temporal_cat_mask — non esiste nel nuovo preprocessor.
-
+    
     print("\nPreprocessing complete:")
     logger.info(f"  - valid_flag shape:     {tensors['valid_flag'].shape}")
     logger.info(f"  - temporal_cont shape:  {tensors['temporal_cont'].shape}")
@@ -181,7 +178,7 @@ def main():
     print("=" * 80 + "\n")
 
     #n_synthetic = df_train[data_cfg.patient_id_col].nunique()
-    n_synthetic = 729
+    n_synthetic = 742
     df_synthetic = dgan.generate(
         n_samples        = n_synthetic,
         temperature      = 0.5,
@@ -247,10 +244,10 @@ def test_loading():
     time_cfg, variables, model_cfg, prep_cfg = load_config(config_path)
     data_cfg = build_data_config(time_cfg, variables)
 
-    embedding_configs = {"CENTRE": 12}
+    #embedding_configs = {"CENTRE": 12}
     preprocessor = Preprocessor(
         data_cfg,
-        embedding_configs = embedding_configs,
+        embedding_configs = prep_cfg.emb_vars,
         log_vars          = prep_cfg.log_vars,
         mice_max_iter     = prep_cfg.mice_max_iter,
         knn_neighbors     = prep_cfg.knn_neighbors,

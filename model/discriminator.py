@@ -1,26 +1,5 @@
 """
-model/discriminator.py  [gretel-style v3 — LSTM temporal discriminator]
-================================================================================
-Cambiamenti rispetto alla versione CNN:
-
-  [NUOVO] LSTMTemporalDiscriminator
-    Sostituisce CNNTemporalDiscriminator come architettura di default.
-    L'LSTM è più adatto a sequenze cliniche irregolari e sparse:
-      - cattura dipendenze a lungo raggio in modo naturale
-      - la cell-state porta memoria persistente (utile per traiettorie >20 visite)
-      - attention pooling guidato da valid_flag: ignora step di padding
-    Architettura: LSTM bidirezionale (opzionale) → attention pooling → MLP
-
-  [INVARIATO]
-    - prepare_discriminator_inputs: niente masking inline, usa valid_flag
-    - StaticDiscriminator: MLP residuale + spectral norm + feature matching
-    - GRUTemporalDiscriminator: mantenuto per retrocompatibilità
-    - TemporalDiscriminator factory: ora default arch="lstm"
-
-  [RIMOSSO]
-    - CNNTemporalDiscriminator: rimosso, usare arch="lstm" o arch="gru"
-
-================================================================================
+model/discriminator.py  
 """
 
 import torch
@@ -35,12 +14,8 @@ from typing import Optional, Dict
 def prepare_discriminator_inputs(batch: Dict, preprocessor) -> Dict:
     """
     Concatena le feature in tensori flat [B,D] (static) e [B,T,D] (temporal).
-    Non applica maschere inline: valid_flag è passato separatamente e usato
-    solo nel pooling del discriminatore temporale.
-
-    [gretel] followup_norm broadcastato su T come feature temporale globale:
-    permette al discriminatore di valutare se i visit_times sono plausibili
-    rispetto alla durata totale del follow-up del paziente.
+    valid_flag è passato separatamente e usato solo nel pooling del discriminatore temporale
+    per indicare le visite effettive.
     """
     static_parts = []
 
@@ -71,7 +46,7 @@ def prepare_discriminator_inputs(batch: Dict, preprocessor) -> Dict:
         )
     static = torch.cat(static_parts, dim=-1)
 
-    # ── Temporal ─────────────────────────────────────────────────
+    #  Temporal
     temporal_cont = batch["temporal_cont"]
     B, T, _       = temporal_cont.shape
     temporal_parts = [temporal_cont]
@@ -133,10 +108,6 @@ class _ResBlock(nn.Module):
 class StaticDiscriminator(nn.Module):
     """
     Residual MLP con Spectral Norm e Feature Matching.
-
-    get_features() espone le rappresentazioni interne per la feature
-    matching loss: spinge il generatore verso rappresentazioni realistiche
-    senza richiedere un discriminatore perfetto.
     """
 
     def __init__(
@@ -282,11 +253,11 @@ class LSTMTemporalDiscriminator(nn.Module):
 
 
 # ==================================================================
-# GRU TEMPORAL DISCRIMINATOR  [retrocompatibilità]
+# GRU TEMPORAL DISCRIMINATOR 
 # ==================================================================
 
 class GRUTemporalDiscriminator(nn.Module):
-    """GRU-based discriminatore. Mantenuto per retrocompatibilità."""
+    """GRU-based discriminatore."""
 
     def __init__(
         self,
@@ -422,7 +393,7 @@ class CNNTemporalDiscriminator(nn.Module):
 
 
 # ==================================================================
-# FACTORY FUNCTION
+# CORPO PRINCIPALE
 # ==================================================================
 
 def TemporalDiscriminator(
@@ -432,10 +403,11 @@ def TemporalDiscriminator(
     **kwargs,
 ):
     """
-    Factory per il discriminatore temporale.
+    Funzione orchestratrice per il discriminatore temporale.
 
     arch="lstm" (default): LSTMTemporalDiscriminator
-    arch="gru":            GRUTemporalDiscriminator (retrocompatibilità)
+    arch="gru":            GRUTemporalDiscriminator 
+    arch="cnn":            CNNTemporalDiscriminator
     """
     td   = getattr(model_config, "temporal_discriminator", None) if model_config else None
     arch = getattr(td, "arch", kwargs.pop("arch", "lstm")).lower()

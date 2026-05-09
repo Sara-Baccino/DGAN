@@ -1,7 +1,8 @@
 """
-model/losses.py  [gretel-style v3]
+model/losses.py  
+
 ================================================================================
-Solo le loss necessarie per DGAN:
+Loss di Training:
 
   WGAN
     wgan_d_loss          — discriminatore: max E[real] - E[fake]
@@ -19,25 +20,13 @@ Solo le loss necessarie per DGAN:
 
   STRUTTURA CATEGORICA
     static_cat_marginal_loss    — KL(target || fake_marginal) per categoriche statiche
-    irreversibility_loss        — penalizza transizioni 1→0 per stati irreversibili
+    irreversibility_loss        — penalizza transizioni 1 to 0 per stati irreversibili
 
   FEATURE MATCHING
     feature_matching_loss       — MSE tra feature medie del disc_static
 
   UTILITÀ
     check_finite         — sostituisce NaN/Inf con 0 + warning
-
-================================================================================
-Rimosse rispetto alla versione precedente:
-  - time_budget_loss          (duplicata con delta_distribution_loss)
-  - time_consistency_loss     (gestita internamente dal generatore via ratio)
-  - cumsum_constraint_loss    (idem)
-  - gate_regularization_loss  (non usata)
-  - delta_min_spacing_loss    (coperta da delta_distribution_loss quantili)
-  - categorical_frequency_loss_* (rimpiazzate da static_cat_marginal_loss)
-  - inter_visit_interval_loss / inter_visit_uniformity_loss (unificate)
-  - static_cont_dist_loss     (non usata nel training loop)
-================================================================================
 """
 
 import warnings
@@ -96,7 +85,7 @@ def gradient_penalty(
 # ======================================================================
 
 def delta_distribution_loss(
-    deltas_raw:  torch.Tensor,               # [B, T]  Δt generati
+    deltas_raw:  torch.Tensor,               # [B, T]  delta_t generati
     real_times:  torch.Tensor,               # [B, T]  visit_times reali (norm.)
     fake_valid:  torch.Tensor,               # [B, T]  bool
     real_valid:  torch.Tensor,               # [B, T]  bool
@@ -105,8 +94,8 @@ def delta_distribution_loss(
     """
     Penalizza la differenza di distribuzione degli intervalli inter-visita.
 
-    Per i sintetici usa i deltas espliciti del generatore (già normalizzati).
-    Per i reali calcola Δt = visit_time[t] - visit_time[t-1].
+    Per i sintetici usa i delta espliciti del generatore (già normalizzati).
+    Per i reali calcola delta_t = visit_time[t] - visit_time[t-1].
 
     Confronta: media, std, e quantili [0.1, 0.25, 0.5, 0.75, 0.9].
     """
@@ -116,14 +105,14 @@ def delta_distribution_loss(
     device = deltas_raw.device
 
     # --- FAKE DELTAS ---
-    # Vogliamo tutti i delta dove fake_valid è True, MA saltando il primo True di ogni riga
+    # Considero tutti i delta dove fake_valid è True, ma saltando il primo True di ogni riga
     # (perché il primo delta è solitamente 0 o l'origine).
     cum_valid_f = torch.cumsum(fake_valid.long(), dim=1)
     f_mask = fake_valid & (cum_valid_f > 1)
     f_iv = deltas_raw[f_mask].clamp(min=0.0)
 
     # --- REAL DELTAS ---
-    # Δt = t[i] - t[i-1]
+    # delta_t = t[i] - t[i-1]
     r_diffs = real_times[:, 1:] - real_times[:, :-1]
     # Valido solo se sia lo step attuale che il precedente erano validi
     r_mask = real_valid[:, 1:] & real_valid[:, :-1]
@@ -163,11 +152,8 @@ def intra_patient_variance_loss(
     min_std_frac: float = 0.3,
 ) -> torch.Tensor:
     """
-    Penalizza ogni paziente sintetico con std intra-paziente
-    < min_std_frac * std_reale medio.
-
-    Forza il generatore a produrre traiettorie con variabilità realistica
-    invece di valori piatti (problema comune nei GAN su serie temporali cliniche).
+    Penalizza ogni paziente sintetico con std intra-paziente < min_std_frac * std_reale medio.
+    Forza il generatore a produrre traiettorie con variabilità realistica invece di valori piatti.
 
     Componenti:
       1. flat_penalty:  relu(threshold - f_std)^2  per ogni paziente/feature
@@ -196,7 +182,7 @@ def intra_patient_variance_loss(
         # Epsilon dentro la radice per stabilità gradienti
         return torch.sqrt(vars.squeeze(1) + 1e-8)
 
-    # Calcoliamo le std intra-paziente per tutto il batch
+    # std intra-paziente per tutto il batch
     f_stds = get_patient_stds(fake_cont, f_mask)     # [B, n_cont]
     r_stds = get_patient_stds(real_cont, r_mask).detach() # [B, n_cont]
 
@@ -212,14 +198,13 @@ def intra_patient_variance_loss(
     mean_r_std = r_stds.mean(dim=0)
     
     # Variabilità delle std tra pazienti (std della std)
-    # Serve a far sì che non tutti i pazienti abbiano la stessa varianza
     std_f_std = f_stds.std(dim=0).clamp(min=1e-6)
     std_r_std = r_stds.std(dim=0).clamp(min=1e-6)
 
     dist_penalty = (mean_f_std - mean_r_std).pow(2).mean() + \
                    (std_f_std - std_r_std).pow(2).mean()
 
-    return flat_penalty + 0.5 * dist_penalty
+    return flat_penalty + 0.75 * dist_penalty
 
 
 # ======================================================================
@@ -236,9 +221,8 @@ def autocorrelation_loss(
     """
     Penalizza la differenza di struttura di autocorrelazione lag-1..max_lag.
 
-    Per ogni feature continua e ogni lag, calcola la correlazione di Pearson
-    tra x[t] e x[t+lag] solo sugli step validi. Spinge il generatore a
-    riprodurre la smoothness e la persistenza temporale dei dati reali.
+    Per ogni feature continua e ogni lag, calcola la correlazione di Pearson tra x[t] e x[t+lag] solo sugli step validi. 
+    Spinge il generatore a riprodurre la smoothness e la persistenza temporale dei dati reali.
     """
     batch_size, T, n_cont = fake_cont.shape
     if n_cont == 0:
@@ -248,14 +232,13 @@ def autocorrelation_loss(
     f_mask = fake_valid.unsqueeze(-1).float()
     r_mask = real_valid.unsqueeze(-1).float()
 
-    # Applichiamo la maschera subito per sicurezza
     fake_cont = fake_cont * f_mask
     real_cont = real_cont * r_mask
 
     total_loss = []
 
     for lag in range(1, max_lag + 1):
-        # Definiamo i segmenti temporali: x è [t : end-lag], y è [lag : end]
+        # Segmenti temporali: x è [t : end-lag], y è [lag : end]
         # fake
         f_x = fake_cont[:, :-lag, :]
         f_y = fake_cont[:, lag:, :]
@@ -283,16 +266,14 @@ def autocorrelation_loss(
             var_x = (x_c**2).sum(dim=(0, 1)) / count.squeeze()
             var_y = (y_c**2).sum(dim=(0, 1)) / count.squeeze()
             
-            # --- STABILITÀ NUMERICA ---
-            # Invece di sqrt(var_x * var_y) + eps, facciamo sqrt(var_x * var_y + eps)
-            # L'epsilon dentro la radice evita che la derivata esploda a zero.
+            #  STABILITÀ NUMERICA : L'epsilon dentro la radice evita che la derivata esploda a zero.
             denom = torch.sqrt(var_x * var_y + 1e-8)
             
             corr = cov / denom
             return corr
 
         f_corr = get_moments(f_x, f_y, f_m)
-        r_corr = get_moments(r_x, r_y, r_m).detach() # I dati reali non generano gradienti
+        r_corr = get_moments(r_x, r_y, r_m).detach() 
 
         # MSE tra le correlazioni medie del batch per ogni feature
         total_loss.append(torch.mean((f_corr - r_corr)**2))
@@ -336,7 +317,7 @@ def n_visits_loss(
     l_var   = F.relu(real.var().clamp(min=0.0) - pred.var().clamp(min=0.0))
     qs      = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=pred.device)
     l_quant = F.mse_loss(torch.quantile(pred, qs), torch.quantile(real, qs))
-    return l_mean + 0.2 * l_var + 1.5 * l_quant
+    return l_mean + 0.75 * l_var + 0.5 * l_quant
 
 
 # ======================================================================
@@ -352,8 +333,7 @@ def static_cat_marginal_loss(
     """
     KL(target || fake_marginal) + CE pesata per categoria rara.
 
-    [Stabilità] Il KL è clampato a max_kl per prevenire esplosione quando
-    il generatore collassa su distribuzioni degeneri nelle prime epoche.
+     Il KL è clampato a max_kl per prevenire esplosione quando il generatore collassa su distribuzioni degeneri nelle prime epoche.
     Il peso w = 1/min_p enfatizza le categorie rare (anti-mode-drop).
     """
     losses = []
@@ -375,8 +355,9 @@ def static_cat_marginal_loss(
         # KL + CE
         kl = (pr * (pr / p_m).log()).sum().clamp(max=max_kl)
         # La CE può essere semplificata
-        ce = -(pr.unsqueeze(0) * p_s.clamp(min=eps).log()).sum(dim=-1).mean()
-
+        #ce = -(pr.unsqueeze(0) * p_s.clamp(min=eps).log()).sum(dim=-1).mean()
+        ce = 0
+        
         w = (1.0 / pr.min().clamp(min=1e-6)).clamp(max=20.0)
         losses.append(w * (kl + 0.5 * ce))
 
@@ -388,15 +369,15 @@ def static_cat_marginal_loss(
 # ======================================================================
 
 def irreversibility_loss(
-    irr_states: torch.Tensor,   # [B, T] o [B, T, 1]  ∈ [0,1]
+    irr_states: torch.Tensor,   # [B, T] o [B, T, 1]  in [0,1]
     valid_flag: torch.Tensor,   # [B, T] bool
 ) -> torch.Tensor:
     """
-    Penalizza transizioni 1→0 negli stati irreversibili (es. morte, trapianto).
+    Penalizza transizioni 1 to 0 negli stati irreversibili (es. morte, trapianto).
 
     Componenti:
-      1. Monotonia: relu(-Δstate) sui passi validi
-      2. Entropia: penalizza stati incerti (p ~0.5) che si cristallizzano
+      1. Monotonia: relu(-delta(state)) sui passi validi
+      2. Entropia: penalizza stati incerti (p circa 0.5) che si cristallizzano
     """
     if irr_states.dim() == 3:
         irr_states = irr_states.squeeze(-1)
@@ -425,8 +406,7 @@ def feature_matching_loss(
 ) -> torch.Tensor:
     """
     MSE tra feature medie reali e fake del discriminatore statico.
-    Stabilizza il training del generatore spingendo verso rappresentazioni
-    simili a quelle dei dati reali nello spazio latente del discriminatore.
+    Stabilizza il training del generatore spingendo verso rappresentazioni simili a quelle dei dati reali nello spazio latente del discriminatore.
     """
     return F.mse_loss(features_fake.mean(dim=0), features_real.mean(dim=0))
 
@@ -454,18 +434,12 @@ def check_finite(loss: torch.Tensor, name: str) -> torch.Tensor:
 
 def temporal_irr_prevalence_loss(
     fake_temporal_cat:    Dict[str, torch.Tensor],   # {name: [B, T, n_cat]}
-    target_prevalence:    Dict[str, float],           # {name: float ∈ [0,1]}
+    target_prevalence:    Dict[str, float],           # {name: float in [0,1]}
     valid_flag:           torch.Tensor,               # [B, T] bool
     eps:                  float = 1e-6,
 ) -> torch.Tensor:
     """
-    Allinea la prevalenza finale delle variabili categoriche binarie
-    irreversibili (stato=1 nell'ultima visita valida) tra dati fake e reali.
-
-    Il problema: per variabili rare (HEPC=0.4%, VARB=1.2%), il generatore
-    tende a produrre stato=1 per quasi tutti i pazienti perché:
-      1. La irreversibility_loss premia la monotonia crescente senza target
-      2. Nessuna loss penalizzava la frequenza assoluta dell'evento
+    Allinea la prevalenza finale delle variabili categoriche binarie irreversibili (stato=1 nell'ultima visita valida) tra dati fake e reali.
 
     Componenti:
       1. MSE tra prevalenza finale fake e target reale
@@ -495,7 +469,7 @@ def temporal_irr_prevalence_loss(
 
         p_state1 = cat_ohe[:, :, 1]  # [B, T] probabilità stato=1
 
-        # Prendi il valore all'ultima visita valida per paziente
+        # Prendo il valore all'ultima visita valida per paziente
         final_probs = []
         for b in range(B):
             valid_idx = valid_flag[b].nonzero(as_tuple=True)[0]
@@ -510,8 +484,8 @@ def temporal_irr_prevalence_loss(
         t_tensor  = torch.tensor(target, device=cat_ohe.device)
         mse       = (prev_est - t_tensor).pow(2)
 
-        # Penalità asimmetrica: sovrastima (fake > target) è molto più comune
-        # e dannosa (genera eventi falsi). Peso 5× in direzione sovrastima.
+        # Penalità asimmetrica: sovrastima (fake > target) è molto più comune e dannosa (genera eventi falsi). 
+        # Peso 5× in direzione sovrastima.
         overshoot = F.relu(prev_est - t_tensor * 3.0)   # tollera fino a 3× il target
         asymm     = 5.0 * overshoot.pow(2)
 
@@ -521,3 +495,15 @@ def temporal_irr_prevalence_loss(
         return torch.tensor(0.0)
 
     return torch.stack(losses).mean()
+
+def seq_len_norm_loss(
+    pred_sln: torch.Tensor,
+    real_sln: torch.Tensor,
+) -> torch.Tensor:
+    pred = pred_sln.float()
+    real = real_sln.float().to(pred.device)
+    l_mean  = F.mse_loss(pred.mean(), real.mean())
+    l_var   = F.relu(real.var().clamp(1e-6) - pred.var().clamp(1e-6))
+    qs      = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=pred.device)
+    l_quant = F.mse_loss(torch.quantile(pred, qs), torch.quantile(real, qs))
+    return l_mean + 0.5 * l_var + 2.0 * l_quant

@@ -3,13 +3,13 @@ config/config_loader.py
 ================================================================================
 Supporta due modalità di caricamento:
 
-  A) Due file separati (consigliato):
+  A) Due file separati:
        time_cfg, variables, model_cfg, prep_cfg = load_config(
            data_path  = "config_data.json",
            model_path = "config_model.json",
        )
 
-  B) File unico legacy (retrocompatibile):
+  B) File unico legacy :
        time_cfg, variables, model_cfg, prep_cfg = load_config(
            data_path="config.json"
        )
@@ -21,11 +21,6 @@ Struttura config_model.json:
   { "latent": {...}, "generator": {...}, "static_discriminator": {...},
     "temporal_discriminator": {...}, "training": {...}, "loss": {...} }
 
-NOTA SU t_FUP IN BASELINE
-──────────────────────────
-Se fup_column è dichiarata anche in baseline.continuous viene
-automaticamente esclusa dalle variabili statiche (warning emesso).
-================================================================================
 """
 
 from __future__ import annotations
@@ -312,10 +307,11 @@ class AuxLossConfig:
     alpha_irr:         float = 0.1
     lambda_fup:        float = 1.0
     lambda_nv:         float = 1.0
+    lambda_sln:        float = 1.0
     lambda_static_cat: float = 2.0
     lambda_fm:         float = 0.0
     lambda_var:        float = 0.5
-    lambda_interval:   float = 2.0
+    lambda_irr_prev:   float = 2.0
     lambda_delta:      float = 2.0
     lambda_autocorr:   float = 0.0
     autocorr_max_lag:  int   = 2
@@ -356,6 +352,10 @@ class LossConfig:
     @property
     def lambda_nv(self) -> float:
         return self.auxiliary.lambda_nv
+    
+    @property
+    def lambda_sln(self) -> float:
+        return self.auxiliary.lambda_sln
 
     @property
     def lambda_static_cat(self) -> float:
@@ -370,8 +370,8 @@ class LossConfig:
         return self.auxiliary.lambda_var
 
     @property
-    def lambda_interval(self) -> float:
-        return self.auxiliary.lambda_interval
+    def lambda_irr_prev(self) -> float:
+        return self.auxiliary.lambda_irr_prev
 
     @property
     def lambda_delta(self) -> float:
@@ -545,9 +545,8 @@ class TrainingConfig:
 @dataclass
 class ModelConfig:
     """
-    Config aggregata passata a DGAN. Raggruppa generator, discriminatori,
-    training e loss. I parametri di training e loss sono accessibili
-    direttamente tramite property per retrocompatibilità con dgan.py.
+    Config aggregata passata a DGAN. Raggruppa generator, discriminatori, training e loss. 
+    I parametri di training e loss sono accessibili direttamente tramite property per retrocompatibilità con dgan.py.
     """
     generator:              GeneratorConfig
     static_discriminator:   DiscriminatorConfig
@@ -685,10 +684,14 @@ class ModelConfig:
     @property
     def lambda_var(self) -> float:
         return self.loss.lambda_var
+    
+    @property
+    def lambda_sln(self) -> float:
+        return self.loss.lambda_sln
 
     @property
-    def lambda_interval(self) -> float:
-        return self.loss.lambda_interval
+    def lambda_irr_prev(self) -> float:
+        return self.loss.lambda_irr_prev
 
     @property
     def lambda_delta(self) -> float:
@@ -907,7 +910,7 @@ def _build_loss_config(raw: dict) -> LossConfig:
             lambda_static_cat = _get(aux_raw, "lambda_static_cat", 2.0),
             lambda_fm         = _get(aux_raw, "lambda_fm",         0.0),
             lambda_var        = _get(aux_raw, "lambda_var",        0.5),
-            lambda_interval   = _get(aux_raw, "lambda_interval",   2.0),
+            lambda_irr_prev   = _get(aux_raw, "lambda_irr_prev",   2.0),
             lambda_delta      = _get(aux_raw, "lambda_delta",      2.0),
             lambda_autocorr   = _get(aux_raw, "lambda_autocorr",   0.0),
             autocorr_max_lag  = _get(aux_raw, "autocorr_max_lag",  2),
@@ -1004,7 +1007,7 @@ def build_model_config(cfg: dict) -> ModelConfig:
             "auxiliary": {k: _get(ls_raw, k, None) for k in [
                 "lambda_aux", "alpha_irr", "lambda_fup", "lambda_nv",
                 "lambda_static_cat", "lambda_fm", "lambda_var",
-                "lambda_interval", "lambda_delta", "lambda_autocorr", "autocorr_max_lag",
+                "lambda_irr_prev", "lambda_delta", "lambda_autocorr", "autocorr_max_lag",
             ]},
             "warmup": {
                 "lambda_scat_epochs": _get(ls_raw, "lambda_scat_warmup_epochs", 0),

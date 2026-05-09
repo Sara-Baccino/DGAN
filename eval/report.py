@@ -1,5 +1,5 @@
 # ======================================================
-# eval/report.py  [v4]
+# eval/report.py
 #
 # run_validation_report():
 #   Orchestratore centrale chiamato da main_eval.py.
@@ -11,17 +11,15 @@
 #   Pag. 1  — Executive Summary (3 radar + utility + privacy)
 #   Sec. A  — Fidelity: distribuzioni, correlazioni, PCA, UMAP,
 #              traiettorie, varianza, LME, autocorr, visite, KM
-#   Sec. B  — Utility: score bar + note TSTR
-#   Sec. C  — Privacy: DCR/NNDR
+#   Sec. B  — Utility: score bar + dettaglio TSTR
+#   Sec. C  — Privacy: DCR/NNDR/attribute/membership inference
 # ======================================================
-
-from __future__ import annotations
 
 import os
 import numpy as np
 import pandas as pd
+from fpdf import FPDF
 
-from eval.report_pdf import ReportPDF, make_plot_dir
 from eval.metrics import (
     compute_fidelity_metrics,
     compute_utility_metrics,
@@ -34,7 +32,6 @@ from eval.plots import (
     plot_utility_section,
     plot_privacy_section,
 )
-from eval.plots_longitudinal import plot_irreversible_events
 
 _UNICODE_REPLACEMENTS = {
     '\u2014': '--', '\u2013': '-',
@@ -44,7 +41,6 @@ _UNICODE_REPLACEMENTS = {
     '\u2019': "'", '\u2018': "'", '\u201c': '"', '\u201d': '"',
     '\u2022': '-', '\u2192': '->', '\u2190': '<-',
 }
-
 
 def _safe(text: str) -> str:
     if not isinstance(text, str):
@@ -62,18 +58,48 @@ def _fmt(v) -> str:
         return "N/A"
 
 
-# ── SafePDF ───────────────────────────────────────────────────────────────────
+def make_plot_dir(path: str = "plots") -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+class ReportPDF(FPDF):
+    def header(self):
+        self.set_font("Arial", "B", 14)
+        self.cell(0, 10, "Synthetic Data Validation Report", ln=True, align="C")
+        self.ln(3)
+
+    def section(self, title: str):
+        self.add_page()
+        self.set_font("Arial", "B", 13)
+        self.set_fill_color(220, 230, 245)
+        self.cell(0, 11, title, ln=True, fill=True)
+
+    def add_metrics_table(self, metrics_dict: dict, title: str):
+        self.set_font("Arial", "B", 11)
+        self.cell(0, 8, title, ln=True)
+        self.set_font("Arial", "", 10)
+        for k, v in metrics_dict.items():
+            text = f"  - {k}: {v:.4f}" if isinstance(v, float) else f"  - {k}: {v}"
+            self.multi_cell(0, 6, text)
+        self.ln(4)
+
+    def add_note(self, text: str):
+        self.set_font("Arial", "I", 9)
+        self.multi_cell(0, 5, text)
+        self.ln(3)
+
 
 class _SafePDF(ReportPDF):
     def cell(self, w=0, h=0, txt="", border=0, ln=0, align="", fill=False, link=""):
         return super().cell(w, h, _safe(str(txt)), border, ln, align, fill, link)
-    
+
     def multi_cell(self, w, h, txt="", border=0, align="J", fill=False):
         return super().multi_cell(w, h, _safe(str(txt)), border, align, fill)
-    
+
     def write(self, h, txt="", link=""):
         return super().write(h, _safe(str(txt)), link)
-    
+
     def add_metrics_table(self, metrics_dict: dict, title: str):
         self.set_font("Arial", "B", 11)
         self.cell(0, 8, _safe(title), ln=True)
@@ -84,18 +110,14 @@ class _SafePDF(ReportPDF):
         self.ln(4)
 
 
-# ── Helpers PDF ───────────────────────────────────────────────────────────────
-
-def _add_image_safe(pdf: _SafePDF, path: str | None,
-                     w: float = 190, ln: int = 4):
+def _add_image_safe(pdf: _SafePDF, path, w: float = 190, ln: int = 4):
     if path and os.path.exists(path):
         pdf.image(path, w=w)
         pdf.ln(ln)
 
 
-def _add_image_list(pdf: _SafePDF, paths: list[str],
-                     w: float = 190, ln: int = 4):
-    for p in paths:
+def _add_image_list(pdf: _SafePDF, paths, w: float = 190, ln: int = 4):
+    for p in (paths or []):
         _add_image_safe(pdf, p, w=w, ln=ln)
 
 
@@ -105,51 +127,48 @@ def run_validation_report(
     real:           pd.DataFrame,
     synth:          pd.DataFrame,
     real_raw:       pd.DataFrame,
-    num_ok:         list[str],
-    cat_ok:         list[str],
-    temporal_vars:  list[str],
+    num_ok:         list,
+    cat_ok:         list,
+    temporal_vars:  list,
     time_col:       str,
     patient_col:    str,
     fup_col:        str,
     max_len:        int,
     inverse_maps:   dict,
     output_path:    str,
-    config_path:    str    = "",
-    real_path:      str    = "",
-    synth_path:     str    = "",
-    umap_color_vars: list[str] | None = None,
-    tstr_targets:   list[str] | None  = None,
-    irr_vars:       list[str] | None  = None,
+    config_path:    str  = "",
+    real_path:      str  = "",
+    synth_path:     str  = "",
+    umap_color_vars: list = None,
+    tstr_targets:   list = None,
+    irr_vars:       list = None,
+    sensitive_col:  str  = None,
 ) -> dict:
     """
     Esegue la pipeline completa di validazione:
       1. Metriche fidelity  (SFS, LFS, TFS)
-      2. Metriche utility   (discriminator, pMSE, TSTR)
-      3. Metriche privacy   (DCR, NNDR)
+      2. Metriche utility   (discriminator, pMSE, TSTR) → UtilityScore
+      3. Metriche privacy   (DCR, NNDR, attr. inf., memb. inf.) → PrivacyScore
       4. Plot per sezione
       5. PDF report
 
     Parametri
     ----------
-    tstr_targets : colonne binarie usate come outcome per il test TSTR
-                   (es. ["DEATH", "TRANSP"]). Se None → TSTR saltato.
+    tstr_targets  : colonne binarie usate come outcome TSTR (es. ["DEATH", "TRANSP"]).
     umap_color_vars : variabili per UMAP colorato (es. ["SEX", "Risk_Level_Label"]).
+    sensitive_col : feature sensibile per attribute inference. Se None viene
+                    selezionata automaticamente (feature a varianza massima).
     """
     os.makedirs(output_path, exist_ok=True)
     plot_dir = make_plot_dir(os.path.join(output_path, "plots"))
 
-    # ── 1. METRICHE ───────────────────────────────────────────────────────────
+    # ── 1. METRICHE ──────────────────────────────────────────────────────────
     print("[report] Calcolo metriche fidelity...")
     fidelity = compute_fidelity_metrics(
-        real          = real,
-        synth         = synth,
-        real_raw      = real_raw,
-        num_ok        = num_ok,
-        cat_ok        = cat_ok,
-        temporal_vars = temporal_vars,
-        time_col      = time_col,
-        patient_col   = patient_col,
-        fup_col       = fup_col,
+        real=real, synth=synth, real_raw=real_raw,
+        num_ok=num_ok, cat_ok=cat_ok,
+        temporal_vars=temporal_vars,
+        time_col=time_col, patient_col=patient_col, fup_col=fup_col,
     )
     sfs = fidelity["sfs"]
     lfs = fidelity["lfs"]
@@ -158,50 +177,33 @@ def run_validation_report(
 
     print("[report] Calcolo metriche utility...")
     utility = compute_utility_metrics(
-        real         = real,
-        synth        = synth,
-        num_ok       = num_ok,
-        tstr_targets = tstr_targets or ["DEATH", "TRANSP"],
+        real=real, synth=synth,
+        num_ok=num_ok,
+        tstr_targets=tstr_targets or ["DEATH", "TRANSP"],
     )
 
     print("[report] Calcolo metriche privacy...")
-    privacy = compute_privacy_metrics(real, synth, num_ok)
+    privacy = compute_privacy_metrics(
+        real=real, synth=synth,
+        num_ok=num_ok,
+        sensitive_col=sensitive_col,
+    )
 
-    # ── 2. PLOT ───────────────────────────────────────────────────────────────
+    # ── 2. PLOT ──────────────────────────────────────────────────────────────
     print("[report] Generazione plot...")
 
-    # Executive summary dashboard
     dashboard_path = plot_summary_dashboard(sfs, lfs, tfs, utility, privacy, plot_dir)
 
-    
-    # Fidelity plots
     fidelity_plots = plot_fidelity_section(
-        real           = real, synth          = synth, real_raw       = real_raw,
-        num_ok         = num_ok, cat_ok         = cat_ok, temporal_vars  = temporal_vars,
-        time_col       = time_col, patient_col    = patient_col, fup_col        = fup_col,
-        lfs            = lfs, inverse_maps   = inverse_maps,
-        outdir         = plot_dir, umap_color_vars = umap_color_vars,
+        real=real, synth=synth, real_raw=real_raw,
+        num_ok=num_ok, cat_ok=cat_ok, temporal_vars=temporal_vars,
+        time_col=time_col, patient_col=patient_col, fup_col=fup_col,
+        lfs=lfs, inverse_maps=inverse_maps,
+        outdir=plot_dir, umap_color_vars=umap_color_vars,
     )
-    
 
-    # Utility plots
     utility_plots = plot_utility_section(utility, plot_dir)
-
-    # Privacy plots
     privacy_plots = plot_privacy_section(real, synth, num_ok, plot_dir)
-
-    # Irreversible event plots
-    irr_plots = []
-    if irr_vars:
-        print("[report] Generazione plot variabili irreversibili...")
-        irr_plots = plot_irreversible_events(
-            real        = real,
-            synth       = synth,
-            irr_vars    = irr_vars,
-            time_col    = time_col,
-            patient_col = patient_col,
-            outdir      = plot_dir,
-        )
 
     # ── 3. PDF ────────────────────────────────────────────────────────────────
     print("[report] Assemblaggio PDF...")
@@ -218,56 +220,33 @@ def run_validation_report(
              f"Synthetic: {os.path.basename(synth_path)}",
              ln=True, align="C")
     pdf.ln(3)
-
-    '''
-    # Score banner 3 + 2
-    for score_obj, label, fill_rgb in [
-        (sfs, "SFS", (230, 245, 255)),
-        (lfs, "LFS", (255, 243, 205)),
-        (tfs, "TFS", (205, 230, 255)),
-    ]:
-        pdf.set_fill_color(*fill_rgb)
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(63, 9,
-                 f"{label}: {_fmt(score_obj.overall)}  {score_obj.grade[:3]}",
-                 ln=False, fill=True, align="C")
-    pdf.ln(5)
-
-    # Utility + Privacy overall
-    u_overall = utility.get("*** Utility overall [0-1]", "N/A")
-    p_overall = privacy.get("*** Privacy overall [0-1]", "N/A")
-    pdf.set_fill_color(240, 240, 220)
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(95, 9, f"Utility: {_fmt(u_overall)}",  ln=False, fill=True, align="C")
-    pdf.cell(95, 9, f"Privacy: {_fmt(p_overall)}",  ln=True,  fill=True, align="C")
-    #pdf.ln(3)
-    '''
     _add_image_safe(pdf, dashboard_path, w=190, ln=6)
 
-    # Dettaglio score
-    pdf.add_metrics_table(sfs.to_dict(),  "STATISTICAL FIDELITY SCORE (SFS)")
-    pdf.add_metrics_table(lfs.to_dict(),  "LONGITUDINAL FIDELITY SCORE (LFS)")
-    pdf.add_metrics_table(tfs.to_dict(),  "TEMPORAL FIDELITY SCORE (TFS)")
-    pdf.add_metrics_table(utility,         "UTILITY METRICS")
-    pdf.add_metrics_table(privacy,         "PRIVACY METRICS (DCR / NNDR)")
+    pdf.add_metrics_table(sfs.to_dict(),     "STATISTICAL FIDELITY SCORE (SFS)")
+    pdf.add_metrics_table(lfs.to_dict(),     "LONGITUDINAL FIDELITY SCORE (LFS)")
+    pdf.add_metrics_table(tfs.to_dict(),     "TEMPORAL FIDELITY SCORE (TFS)")
+    pdf.add_metrics_table(utility.to_dict(), "UTILITY METRICS")
+    pdf.add_metrics_table(privacy.to_dict(), "PRIVACY METRICS")
 
     pdf.add_note(
-        f"SFS: fedelta' statistica [0-1].  "
-        f"LFS: fedelta' longitudinale [0-1] (include DTW e LME).  "
-        f"TFS: fedelta' temporale + t_FUP [0-1].  "
-        f"Real troncato a max={max_len} visite e imputato (MICE/KNN).  "
-        f"Score: 1=perfetto, 0=pessimo. lower-better -> 1-score (lineare)."
+        f"SFS: fedelta' statistica [0-1]; test Chi2/Fisher per categoriche.  "
+        f"LFS: fedelta' longitudinale [0-1] (slope, variance, autocorr, TCS, DTW).  "
+        f"TFS: struttura visite [0-1] (interval, timing, visit count, FUP coverage).  "
+        f"Real troncato a max={max_len} visite e imputato.  "
+        f"Score: 1=perfetto, 0=pessimo."
     )
 
-    
     # ── Sezione A: Fidelity ───────────────────────────────────────────────────
     pdf.section("A. FIDELITY — Distribuzioni Numeriche (KDE)")
     pdf.add_note("Real = imputato. KS e p-value annotati (p<0.05 = divergenza significativa).")
     _add_image_list(pdf, fidelity_plots.get("numeric", []))
 
     if fidelity_plots.get("categorical"):
-        pdf.section("A. FIDELITY — Distribuzioni Categoriche")
-        pdf.add_note("Barre affiancate. Label decodificate via inverse_maps. Cramer's V annotato.")
+        pdf.section("A. FIDELITY — Distribuzioni Categoriche (Chi2 / Fisher)")
+        pdf.add_note(
+            "Barre affiancate. Label decodificate via inverse_maps. "
+            "Test Chi² se min(freq_attese) >= 5, Fisher esatto se < 5 (tabella 2x2). "
+            "Effect size = Cramer's V (corretto per bias).")
         _add_image_list(pdf, fidelity_plots["categorical"])
 
     pdf.section("A. FIDELITY — Matrici di Correlazione")
@@ -298,16 +277,16 @@ def run_validation_report(
 
     pdf.section("A. FIDELITY — LME Slope Comparison")
     pdf.add_note(
-        "Coefficiente fisso del tempo (beta) fittato con Linear Mixed Effects. Rappresenta la velocità media di variazione di una variabile nel tempo. Dati raggruppati per paziente." \
-        "Il segno positivo indica che la variabile tende ad aumentare col passare del tempo."
-        "(var ~ time + (1|patient)). Confronta real vs sintetico.")
+        "Coefficiente fisso del tempo (beta) fittato con Linear Mixed Effects "
+        "(var ~ time + (1|patient)). Positivo = variabile tende ad aumentare nel tempo. "
+        "Confronta real vs sintetico.")
     _add_image_list(pdf, fidelity_plots.get("lme", []))
     if lfs.lme_betas:
         table = {}
         for v, b in lfs.lme_betas.items():
             table[f"{v} beta_real"]  = b.get("beta_real",  "N/A")
             table[f"{v} beta_synth"] = b.get("beta_synth", "N/A")
-            table[f"{v} |Δbeta|"]    = b.get("beta_diff_abs", "N/A")
+            table[f"{v} |Dbeta|"]    = b.get("beta_diff_abs", "N/A")
         pdf.add_metrics_table(table, "LME betas per variabile")
 
     pdf.section("A. FIDELITY — Autocorrelazione Lag-1..5")
@@ -339,42 +318,32 @@ def run_validation_report(
 
     # ── Sezione B: Utility ────────────────────────────────────────────────────
     pdf.section("B. UTILITY")
-    pdf.add_note("Discriminator score: AUC RF real-vs-synth -> score=1-|AUC-0.5|*2.  Classification con Random Forest.")
-    pdf.add_note("pMSE: indistinguibilita' globale. propensity -> score=1-clip(pMSE/0.25,0,1).  ")
-    pdf.add_note("TSTR: AUC_TSTR vs AUC_TRTR; score=1-gap.  Viene usato un modello predittivo.")
-    pdf.add_metrics_table(utility, "UTILITY SCORES")
+    pdf.add_note(
+        "Discriminator score: AUC RF real-vs-synth -> score=1-|AUC-0.5|*2.  "
+        "pMSE: indistinguibilita' globale -> score=1-clip(pMSE/0.25,0,1).  "
+        "TSTR: AUC_TSTR vs AUC_TRTR; score=1-gap.")
+    pdf.add_metrics_table(utility.to_dict(), "UTILITY SCORES")
     _add_image_list(pdf, utility_plots)
 
     # ── Sezione C: Privacy ────────────────────────────────────────────────────
     pdf.section("C. PRIVACY")
     pdf.add_note(
-        "DCR = distanza minima al record reale piu' vicino (spazio standardizzato).  Alto: basso rischio copying."
-        "NNDR = dist_1nn / dist_2nn: valori bassi indicano rischio re-identificazione.  "
-        "DCR_score = clip(median_DCR / typical_dist, 0, 2) / 2.  "
-        "NNDR_score = fraction(NNDR >= 0.5).")
-    pdf.add_metrics_table(privacy, "PRIVACY METRICS")
+        "DCR = distanza del sintetico al record reale piu' vicino (spazio standardizzato). "
+        "Alto = basso rischio di copying.  "
+        "NNDR[i] = d1nn / d2nn: valori < 0.5 indicano rischio re-identificazione.  "
+        "Attribute Inference: AUC per predire una feature sensibile dalle altre (sintetico). "
+        "AUC=0.5 -> non inferibile -> score=1.  "
+        "Membership Inference: fraction(DCR < soglia p5 real-real). "
+        "0 violazioni -> score=1.")
+    pdf.add_metrics_table(privacy.to_dict(), "PRIVACY METRICS")
     _add_image_list(pdf, privacy_plots)
-    
-    # ── Sezione D: Variabili Irreversibili ───────────────────────────────────
-    if irr_plots:
-        pdf.section("D. IRREVERSIBLE EVENTS — Timing e Prevalenza")
-        pdf.add_note(
-            "Per ogni variabile irreversibile: "
-            "(1) Kaplan-Meier tempo-al-primo-evento con log-rank test, "
-            "(2) Prevalenza cumulativa nel tempo real vs synth, "
-            "(3) Distribuzione del timing del primo evento (KDE + KS), "
-            "(4) Incidenza per finestra temporale (bar chart). "
-            "KM p>>0.05 = curve compatibili. KS distribuzione timing: <0.15 buono."
-        )
-        _add_image_list(pdf, irr_plots)
 
     # ── Salvataggio ───────────────────────────────────────────────────────────
     out_file = os.path.join(output_path, "Synthetic_Data_Validation_Report.pdf")
     pdf.output(out_file)
     print(f"\n[OK] Report salvato: {out_file}")
     print(f"     SFS={_fmt(sfs.overall)} | LFS={_fmt(lfs.overall)} | TFS={_fmt(tfs.overall)}")
-    print(f"     Utility={_fmt(utility.get('*** Utility overall [0-1]', float('nan')))} | "
-          f"Privacy={_fmt(privacy.get('*** Privacy overall [0-1]', float('nan')))}")
+    print(f"     Utility={_fmt(utility.overall)} | Privacy={_fmt(privacy.overall)}")
 
     return {
         "sfs": sfs, "lfs": lfs, "tfs": tfs,
