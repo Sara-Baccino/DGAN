@@ -21,4 +21,5 @@ dependencies = [
     "torch>=2.10.0",
     "torch-tb-profiler>=0.4.3",
     "umap-learn>=0.5.11",
+    "xgboost>=3.2.0",
 ]

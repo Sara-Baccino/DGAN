@@ -554,30 +554,39 @@ class Preprocessor:
             visit_times_raw[i, :L] = sub[self.time_col].values[:L].astype(np.float32)
 
             # t_FUP reale dal DataFrame
+            # NOTA: last_obs_truncated = ultima visita OSSERVATA dopo troncamento
+            # (≤ max_len visite). Per pazienti troncati è < t_last_full.
+            # t_FUP deve essere >= last_obs_truncated, ma può essere > (e di solito
+            # lo è: il paziente ha visite future non incluse nella finestra osservata).
+            last_obs_truncated = float(sub[self.time_col].values[L - 1])
             if has_fup_col:
                 fup_val = sub[self.fup_col].iloc[0]
                 if pd.isna(fup_val):
                     warnings.warn(
                         f"Paziente '{pid}': colonna '{self.fup_col}' è NaN. "
-                        f"Uso l'ultima visita come follow-up.",
+                        f"Uso l'ultima visita osservata come follow-up.",
                         UserWarning,
                     )
-                    fup_times[i] = float(sub[self.time_col].values[L - 1])
+                    fup_times[i] = last_obs_truncated
                 else:
-                    fup_times[i] = float(fup_val)
-                    # Sanity check: t_FUP >= ultima visita registrata
-                    last_visit = float(sub[self.time_col].values[L - 1])
-                    if fup_times[i] < last_visit - 1e-6:
+                    fup_val = float(fup_val)
+                    # Sanity check SOLO se t_FUP < ultima visita osservata
+                    # (non confrontiamo con le visite future troncate: t_FUP può
+                    # essere > last_obs_truncated, ed è normale per pazienti troncati)
+                    if fup_val < last_obs_truncated - 1e-6:
                         warnings.warn(
-                            f"Paziente '{pid}': t_FUP={fup_times[i]:.2f} è "
-                            f"inferiore all'ultima visita ({last_visit:.2f}). "
-                            f"Uso l'ultima visita come follow-up.",
+                            f"Paziente '{pid}': t_FUP={fup_val:.2f} è "
+                            f"inferiore all'ultima visita osservata "
+                            f"({last_obs_truncated:.2f}). "
+                            f"Imposto t_FUP = last_obs_truncated.",
                             UserWarning,
                         )
-                        fup_times[i] = last_visit
+                        fup_times[i] = last_obs_truncated
+                    else:
+                        fup_times[i] = fup_val
             else:
-                # Fallback: usa l'ultima visita
-                fup_times[i] = float(sub[self.time_col].values[L - 1])
+                # Fallback: t_FUP = ultima visita osservata
+                fup_times[i] = last_obs_truncated
 
             for j, v in enumerate(temporal_cont_vars):
                 if v.name in sub.columns:
@@ -647,97 +656,116 @@ class Preprocessor:
         """
         Normalizzazione temporale per paziente.
 
-        STRATEGIA:
-          delta_max[i] = t_last_observed - t_first
-          -> visit_times in [0, 1] dove 1.0 = ultima visita osservata
- 
-          followup_norm[i] = t_FUP / global_time_max  in (0, 1]
-          -> scalare separato che porta l'info sulla durata totale del follow-up senza vincolare la normalizzazione delle visite
- 
+        STRATEGIA
+        ----------
+        Le tre quantità temporali sono distinte e indipendenti:
+
+          visit_times[i, t]  ∈ [0, 1]
+              Normalizzato su t_last_obs del paziente i (ultima visita OSSERVATA,
+              dopo eventuale troncamento). visit_times[last_valid] = 1.0.
+              Non coinvolge t_FUP: per pazienti troncati t_last_obs < t_FUP.
+
+          seq_len_norm[i]  ∈ (0, 1]
+              = (t_last_obs - t_first) / global_time_max
+              Rappresenta la durata osservata in scala globale.
+              Usato dal generatore per scalare i delta e dall'inverse_transform
+              per denormalizzare i tempi di visita.
+
+          followup_norm[i]  ∈ (0, 1]
+              = t_FUP[i] / global_time_max
+              Feature condizionante separata: porta l'informazione sulla durata
+              totale del follow-up (che può essere > seq_len_norm per pazienti
+              troncati). Il vincolo t_last_obs ≤ t_FUP è garantito per costruzione
+              dal sanity-check in _long_to_padded e supervisionato da una loss
+              morbida (non da clamping rigido sui delta).
+
           global_time_max = max(t_FUP) su tutti i pazienti
- 
-        VANTAGGI rispetto a normalizzare su t_FUP:
-          - Permette troncamento delle sequenze: se consideri solo i primi N step, visit_times è già [0,1] sulla parte osservata 
-          - La lunghezza della sequenza non è più vincolata a coprire t_FUP
-          - followup_norm rimane come feature condizionante indipendente
+              Scala comune per confronto cross-paziente.
+
+        PERCHÉ NON normalizzare su t_FUP
+        ----------------------------------
+        Se normalizzassimo visit_times su t_FUP, i pazienti troncati avrebbero
+        visit_times[-1] < 1 (gap artificioso), e il discriminatore/generatore
+        cercherebbe di colmare il gap allungando i delta → distribuzione distorta.
+        Normalizzando su t_last_obs invece, visit_times[-1] = 1 per tutti,
+        e il gap t_last_obs → t_FUP è codificato esclusivamente in
+        followup_norm > seq_len_norm (informazione accessibile al generatore
+        come feature di condizionamento, non come obiettivo da raggiungere).
         """
-        vt  = padded["visit_times_raw"]   # [N,T]
-        vf  = padded["valid_flag"]        # [N,T] bool
-        fup = padded["fup_times"]         # [N]  (0 se non disponibile)
+        vt  = padded["visit_times_raw"]   # [N, T] tempi assoluti
+        vf  = padded["valid_flag"]        # [N, T] bool
+        fup = padded["fup_times"]         # [N]    t_FUP assoluto
         N   = vt.shape[0]
 
-        t_offset  = np.zeros_like(vt)
-        delta_max = np.ones(N, dtype=np.float32)
-        fup_abs   = np.zeros(N, dtype=np.float32)  # t_FUP assoluto per followup_norm
-        self.global_time_max = float(delta_max.max())
+        t_offset  = np.zeros_like(vt)           # offset relativo a t_first
+        delta_obs = np.ones(N, dtype=np.float32) # t_last_obs - t_first
+        fup_abs   = np.zeros(N, dtype=np.float32)
 
         single_visit_warned = False
 
         for i in range(N):
             valid_idx = np.where(vf[i])[0]
             if len(valid_idx) == 0:
-                fup_abs[i] = float(fup[i]) if fup[i] > 1e-8 else 1.0
+                fup_abs[i] = max(float(fup[i]), 1.0)
                 continue
 
-            t_first = vt[i, valid_idx[0]]
+            t_first = float(vt[i, valid_idx[0]])
             t_last  = float(vt[i, valid_idx[-1]])
 
-            # Determina delta_max: usa lunghezza osservata (t_last - t_first)
+            # Durata sequenza OSSERVATA (indipendente da t_FUP)
             d = t_last - t_first
             if d < 1e-8:
                 if not single_visit_warned:
                     warnings.warn(
                         f"Paziente indice {i}: una sola visita o visite con lo stesso "
-                        f"timestamp. delta_max forzato a 1.0.",
+                        f"timestamp. Durata osservata forzata a 1.0.",
                         UserWarning,
                     )
                     single_visit_warned = True
                 d = 1.0
-            delta_max[i]=d
+            delta_obs[i] = d
 
-            # t_FUP assoluto per followup_norm
-            if fup[i] > 1e-8:
-                fup_val = float(fup[i])
-                if fup_val < t_last - 1e-6:
-                    warnings.warn(
-                        f"Paziente indice {i}: t_FUP={fup_val:.2f} < "
-                        f"t_last={t_last:.2f}. Uso t_last come t_FUP.",
-                        UserWarning,
-                    )
-                    fup_val = t_last
-                fup_abs[i] = fup_val
-            else:
-                fup_abs[i] = t_last
-            
-            t_offset[i]          = vt[i] - t_first
-            t_offset[i][~vf[i]]  = 0.0
+            # t_FUP (già sanity-checked in _long_to_padded: >= t_last_obs_truncated)
+            fup_abs[i] = float(fup[i]) if fup[i] > 1e-8 else t_last
 
-        #self.global_time_max = float(delta_max.max())
+            # Offset relativo a t_first (step di padding = 0)
+            t_offset[i]         = vt[i] - t_first
+            t_offset[i][~vf[i]] = 0.0
+
         # global_time_max = max(t_FUP) su tutti i pazienti
-        self.global_time_max = float(fup_abs.max())
-        if self.global_time_max < 1e-8:
-            self.global_time_max = 1.0
+        # Usiamo t_FUP (non delta_obs) come scala globale perché t_FUP è la
+        # grandezza confrontabile cross-paziente disponibile come variabile statica.
+        global_t = float(np.max(fup_abs))
+        if global_t < 1e-8:
+            global_t = 1.0
+        self.global_time_max = global_t
 
-        t_norm        = np.zeros_like(vt)
-        followup_norm = np.zeros(N, dtype=np.float32)
-
+        # visit_times: normalizzati su delta_obs (t_last_obs=1.0 per ogni paziente)
+        t_norm = np.zeros_like(vt)
         for i in range(N):
-            # Normalizzazione per-paziente: visit_times in [0, 1] dove 1.0 = t_FUP
-            t_norm[i]         = t_offset[i] / delta_max[i]
+            t_norm[i]          = t_offset[i] / delta_obs[i]
             t_norm[i][~vf[i]]  = 0.0
-            # followup_norm ∈ (0,1] = t_FUP / global_time_max
-            followup_norm[i]   = fup_abs[i] / self.global_time_max
-           # followup_norm[i]   = delta_max[i] / self.global_time_max
 
-        # seq_len_norm: lunghezza sequenza osservata / global_time_max in (0, 1]
-        # Distinto da followup_norm (t_FUP / global_time_max).
-        # Usato dal generatore per scalare i delta e dall'inverse_transform per denormalizzare i tempi di visita.
-        seq_len_norm = (delta_max / self.global_time_max).astype(np.float32)
+        # seq_len_norm: durata osservata / global_time_max
+        seq_len_norm = (delta_obs / global_t).astype(np.float32)
+
+        # followup_norm: t_FUP / global_time_max  (>= seq_len_norm per costruzione)
+        followup_norm = (fup_abs / global_t).astype(np.float32)
+
+        # Verifica invariante: followup_norm >= seq_len_norm (sanity check silenzioso)
+        violations = np.sum(followup_norm < seq_len_norm - 1e-5)
+        if violations > 0:
+            warnings.warn(
+                f"{violations} pazienti hanno followup_norm < seq_len_norm dopo la "
+                f"normalizzazione. Correzione automatica (imposto followup_norm = seq_len_norm).",
+                UserWarning,
+            )
+            followup_norm = np.maximum(followup_norm, seq_len_norm)
 
         padded["visit_times"]           = t_norm.astype(np.float32)
-        padded["followup_norm"]         = followup_norm.astype(np.float32)
+        padded["followup_norm"]         = followup_norm
         padded["seq_len_norm"]          = seq_len_norm
-        padded["delta_max_per_patient"] = delta_max
+        padded["delta_max_per_patient"] = delta_obs
         return padded
 
     # ==================================================================
@@ -875,8 +903,15 @@ class Preprocessor:
             # 1. Statici continui
             if "static_cont" in synthetic and synthetic["static_cont"] is not None:
                 for j, v in enumerate(static_cont_vars):
-                    s         = float(synthetic["static_cont"][i, j])
-                    s         = max(-Z_CLIP, min(Z_CLIP, s))
+                    s = float(synthetic["static_cont"][i, j])
+                    # Clamp ±Z_CLIP globale
+                    s = max(-Z_CLIP, min(Z_CLIP, s))
+                    # Clamp preciso sui bounds reali (in z-score space)
+                    # Disponibile dopo _compute_channel_bounds_static() in fit().
+                    sc_bounds = getattr(self, "static_cont_bounds", {})
+                    if v.name in sc_bounds:
+                        lo, hi = sc_bounds[v.name]
+                        s = max(lo, min(hi, s))
                     mean, std = self.scalers_cont[v.name]
                     val       = s * std + mean
                     if v.name in self.log_vars:

@@ -1,7 +1,7 @@
 """
 model/dgan.py 
 """
-
+import pandas as pd
 import copy
 import warnings
 import numpy as np
@@ -80,6 +80,13 @@ class DGAN:
         self.autocorr_max_lag   = int(getattr(mc, "autocorr_max_lag", 2))
         self.lambda_aux         = float(mc.lambda_aux)
         self.lambda_irr_prev    = float(getattr(mc, "lambda_irr_prev", 5.0))
+        # seq_len_norm supervision: spinge il generatore a produrre sequenze
+        # con la stessa distribuzione di durata osservata dei dati reali.
+        # Distinto da lambda_fup (t_FUP). Default 3.0.
+        self.lambda_sln         = float(getattr(mc, "lambda_sln", 3.0))
+        # Penalità soft t_last_obs <= t_FUP sul generato.
+        # Non forza uguaglianza, solo garantisce la disuguaglianza. Default 5.0.
+        self.lambda_tobs_fup    = float(getattr(mc, "lambda_tobs_fup", 5.0))
 
         self.current_temperature = float(mc.gumbel_temperature_start)
         self.temperature_min     = float(mc.temperature_min)
@@ -105,12 +112,14 @@ class DGAN:
             "delta_loss":     [],
             "autocorr_loss":  [],
             "irr_prev_loss":  [],
+            "sln_loss":       [],
+            "tobs_fup_loss":  [],
             "mean_n_visits":  [],
             "fake_cont_mean": [],
             "fake_cont_std":  [],
         }
 
-    # region Utils
+    # Utils
 
     def _calc_static_dim(self) -> int:
         dim = self.data_config.n_static_cont
@@ -328,6 +337,37 @@ class DGAN:
             f"Channel bounds impostati per {n_cont} feature continue temporali.")
         print(f"  Channel bounds: min={ch_min.tolist()}  max={ch_max.tolist()}")
 
+    def _compute_channel_bounds_static(self, tensors_dict: Dict) -> None:
+        """
+        Calcola min/max reali per le feature statiche continue (dati z-scored)
+        e li salva in preprocessor.static_cont_bounds  {var_name: (min_z, max_z)}.
+
+        Vengono usati in inverse_transform per clampare i valori sintetici prima
+        della denormalizzazione, evitando così valori fisicamente impossibili
+        (es. tempi evento negativi dopo inversione della z-score).
+
+        NOTA: i bounds sono in spazio z-scored, non in spazio originale.
+        Il clamping avviene in inverse_transform, dopo il clip ±clip_z standard,
+        usando questi bounds più precisi derivati dai dati reali.
+        """
+        sc = tensors_dict.get("static_cont")
+        if sc is None or sc.shape[-1] == 0:
+            return
+
+        n_static = sc.shape[-1]
+        bounds = {}
+        static_cont_vars = [v for v in self.preprocessor.vars
+                            if v.static and v.kind == "continuous"]
+        for j, var in enumerate(static_cont_vars[:n_static]):
+            vals = sc[:, j]
+            bounds[var.name] = (float(vals.min()), float(vals.max()))
+
+        self.preprocessor.static_cont_bounds = bounds
+        print(f"  Static cont bounds impostati per {len(bounds)} variabili.")
+        if bounds:
+            for name, (lo, hi) in list(bounds.items())[:5]:
+                print(f"    {name}: z=[{lo:.2f}, {hi:.2f}]")
+
     
     def _generate_fake(
         self,
@@ -343,7 +383,6 @@ class DGAN:
         fake_disc = prepare_discriminator_inputs(fake_out, self.preprocessor)
         return fake_out, fake_disc
 
-    # region Train Disc
     #  TRAIN DISCRIMINATORS
     # =========================================
 
@@ -421,8 +460,7 @@ class DGAN:
 
         return loss_d_s.item(), loss_d_t.item(), aux_loss.item()
 
-    # region Train Gen
-    #  TRAIN GENERATOR
+    # TRAIN GENERATOR
     # =========================================
 
     def _train_generator(
@@ -516,8 +554,12 @@ class DGAN:
             # da delta_distribution_loss sono comparabili.
             real_vt_abs = (real_batch["visit_time"].to(self.device)
                            * real_batch["seq_len_norm"].to(self.device).unsqueeze(1))
-            delta_loss = delta_distribution_loss(fake_out["deltas"], real_vt_abs,
-                fake_out["valid_flag"], real_batch["valid_flag"].to(self.device) )
+            delta_loss = delta_distribution_loss(
+                fake_out["deltas"],
+                real_vt_abs,
+                fake_out["valid_flag"],
+                real_batch["valid_flag"].to(self.device),
+            )
             delta_loss = check_finite(delta_loss, "delta_loss")
         
         #Autocorrelazione 
@@ -547,7 +589,39 @@ class DGAN:
                 valid_flag        = fake_out["valid_flag"],
             )
             irr_prev_loss = check_finite(irr_prev_loss, "irr_prev_loss")
-        
+
+        # Supervisione seq_len_norm (durata osservata)
+        # Spinge la distribuzione della durata sequenza sintetica a matchare quella reale.
+        # Distinto da followup_norm (t_FUP): i pazienti troncati hanno
+        # seq_len_norm < followup_norm, e il modello deve imparare entrambe le distribuzioni.
+        sln_loss = torch.tensor(0.0, device=self.device)
+        if (self.lambda_sln > 0
+                and real_batch is not None
+                and "seq_len_norm" in real_batch
+                and "seq_len_norm" in fake_out):
+            pred_sln = fake_out["seq_len_norm"].float()
+            real_sln = real_batch["seq_len_norm"].to(self.device).float()
+            l_mean   = F.mse_loss(pred_sln.mean(), real_sln.mean())
+            l_var    = F.relu(real_sln.var().clamp(1e-6) - pred_sln.var().clamp(1e-6))
+            qs       = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=self.device)
+            l_quant  = F.mse_loss(torch.quantile(pred_sln, qs),
+                                  torch.quantile(real_sln.detach(), qs))
+            sln_loss = l_mean + 0.5 * l_var + 2.0 * l_quant
+            sln_loss = check_finite(sln_loss, "sln_loss")
+
+        # Vincolo soft t_last_obs <= t_FUP
+        # Non forza t_last_obs = t_FUP (evita stiramento dei delta).
+        # Penalizza solo la violazione: se seq_len_norm > followup_norm
+        # il generatore ha prodotto sequenze più lunghe del follow-up dichiarato.
+        # Per pazienti reali troncati questa violazione non esiste: il dataset
+        # garantisce seq_len_norm <= followup_norm. La loss è asimmetrica (relu):
+        # non premia i casi corretti, penalizza solo le violazioni.
+        tobs_fup_loss = torch.tensor(0.0, device=self.device)
+        if (self.lambda_tobs_fup > 0 and "seq_len_norm" in fake_out):
+            excess = F.relu(fake_out["seq_len_norm"] - fake_out["followup_norm"])
+            tobs_fup_loss = excess.pow(2).mean()
+            tobs_fup_loss = check_finite(tobs_fup_loss, "tobs_fup_loss")
+
         # loss totale
         total = (loss_g
                  + self.lambda_irr      * irr_loss
@@ -558,7 +632,9 @@ class DGAN:
                  + self.lambda_var      * var_loss
                  + self.lambda_delta    * delta_loss
                  + self.lambda_autocorr * autocorr_loss
-                 + self.lambda_irr_prev * irr_prev_loss)
+                 + self.lambda_irr_prev * irr_prev_loss
+                 + self.lambda_sln      * sln_loss
+                 + self.lambda_tobs_fup * tobs_fup_loss)
 
         total = check_finite(total, "total_generator")
         total.backward()
@@ -587,7 +663,8 @@ class DGAN:
         return (loss_g.item(), irr_loss.item(), fup_loss.item(),
                 nv_loss.item(), scat_loss.item(), fm_loss.item(),
                 var_loss.item(), delta_loss.item(), autocorr_loss.item(),
-                irr_prev_loss.item(), mean_nv, stats)
+                irr_prev_loss.item(), sln_loss.item(), tobs_fup_loss.item(),
+                mean_nv, stats)
 
     # LOADER
     @staticmethod
@@ -643,8 +720,7 @@ class DGAN:
                 batch[key] = tensor
         return batch
 
-    # region Training loop
-    # Train Step (un passo del training loop)
+    # TRAIN STEP (un passo del training loop)
     # =========================================
     def train_step(self, loader, keys, critic_steps, critic_steps_t):
         batch_losses = []
@@ -683,7 +759,8 @@ class DGAN:
             # 3. Training Generatore (spesso il collo di bottiglia per le molteplici loss)
             #t0 = time.time()
             (lg, l_irr, l_fup, l_nv, l_scat, l_fm,
-             l_var, l_delta, l_ac, l_irr_prev, mean_nv, stats) = self._train_generator(
+             l_var, l_delta, l_ac, l_irr_prev,
+             l_sln, l_tobs_fup, mean_nv, stats) = self._train_generator(
                 real_disc, B, real_irr, real_batch=batch)
             #dt_gen = time.time() - t0
             
@@ -703,6 +780,8 @@ class DGAN:
                 "delta_loss":     l_delta,
                 "autocorr_loss":  l_ac,
                 "irr_prev_loss":  l_irr_prev,
+                "sln_loss":       l_sln,
+                "tobs_fup_loss":  l_tobs_fup,
                 "mean_n_visits":  mean_nv,
                 "fake_cont_mean": stats["fake_cont_mean"],
                 "fake_cont_std":  stats["fake_cont_std"],
@@ -732,6 +811,7 @@ class DGAN:
 
         # Channel min/max dal dataset reale 
         self._compute_channel_bounds(tensors_dict)
+        self._compute_channel_bounds_static(tensors_dict)
 
         # Target prevalence variabili irreversibili 
         print("Calcolo prevalenza target variabili irreversibili...")
@@ -863,6 +943,8 @@ class DGAN:
                 f"Nv={avg['mean_n_visits']:4.1f}  "
                 f"NvL={avg['nv_loss']:.3f}  "
                 f"Fup={avg['fup_loss']:.3f}  "
+                f"SlnL={avg['sln_loss']:.3f}  "
+                f"TobsL={avg['tobs_fup_loss']:.4f}  "
                 f"Scat={avg['scat_loss']:.3f}  "
                 f"Fm={avg['fm_loss']:.3f}  "
                 f"VarL={avg['var_loss']:.3f}  "
@@ -889,13 +971,26 @@ class DGAN:
                           f"(best disc_loss={best_loss:.4f})")
                     break
 
-    # region Generation 
-    # GENERATE
+    #  GENERATE
     # =======================================================
 
     @torch.no_grad()
     def generate(self, n_samples: int, temperature: float = 0.5,
-                 return_dataframe: bool = True):
+                 return_dataframe: bool = True,
+                 event_time_cols: Optional[List[str]] = None):
+        """
+        Genera n_samples pazienti sintetici.
+
+        Parametri aggiuntivi
+        --------------------
+        event_time_cols : lista di colonne statiche che rappresentano tempi-evento
+                          (es. ["t_HEPC", "t_ENCP", "t_VARB"]).
+                          Dopo la generazione viene applicato un post-processing
+                          che garantisce:
+                            - t_event >= 0
+                            - t_event <= t_FUP  (se presente la colonna fup_col)
+                          Se None, nessun post-processing temporale aggiuntivo.
+        """
         self.set_eval()
         gen = self.ema_generator if self.ema_generator is not None else self.generator
         if self.ema_generator is not None:
@@ -953,6 +1048,8 @@ class DGAN:
         }
         if "followup_norm" in final:
             synth["followup_norm"] = torch.tensor(final["followup_norm"])
+        if "seq_len_norm" in final:
+            synth["seq_len_norm"] = torch.tensor(final["seq_len_norm"])
         if "static_cont" in final:
             synth["static_cont"] = torch.tensor(final["static_cont"])
         if "static_cat_embed_decoded" in final:
@@ -969,7 +1066,168 @@ class DGAN:
                     np.concatenate(arrays, axis=1)).float()
 
         self.set_train()
-        return self.preprocessor.inverse_transform(synth)
+        df_out = self.preprocessor.inverse_transform(synth)
+
+        # Post-processing tempi evento: garantisce 0 <= t_event <= t_FUP
+        # Questo è un controllo di qualità finale sui dati denormalizzati.
+        # Non altera la distribuzione appresa dal modello, corregge solo
+        # le violazioni residue che il vincolo soft non ha eliminato completamente.
+        if event_time_cols and len(df_out) > 0:
+            fup_col = self.preprocessor.fup_col
+            if fup_col and fup_col in df_out.columns:
+                for col in event_time_cols:
+                    if col not in df_out.columns:
+                        continue
+                    t_ev  = pd.to_numeric(df_out[col],    errors="coerce")
+                    t_fup = pd.to_numeric(df_out[fup_col], errors="coerce")
+                    # Clamp inferiore: t_event >= 0
+                    t_ev = t_ev.clip(lower=0.0)
+                    # Clamp superiore: t_event <= t_FUP
+                    t_ev = t_ev.where(t_ev.isna() | (t_ev <= t_fup + 1e-4),
+                                      other=t_fup)
+                    df_out[col] = t_ev
+            else:
+                # Nessun fup_col: clamp solo a 0
+                for col in event_time_cols:
+                    if col in df_out.columns:
+                        df_out[col] = pd.to_numeric(
+                            df_out[col], errors="coerce").clip(lower=0.0)
+
+        return df_out
+
+    # VALIDATE GENERATED
+    # =======================================================
+
+    @staticmethod
+    def validate_generated(
+        df_synth:          pd.DataFrame,
+        fup_col:           str,
+        time_col:          str,
+        patient_id_col:    str,
+        event_time_cols:   Optional[List[str]] = None,
+        verbose:           bool = True,
+    ) -> Dict:
+        """
+        Controlla le violazioni temporali sui dati sintetici denormalizzati.
+
+        Vincoli verificati
+        -------------------
+        1. t_last_obs <= t_FUP  (per ogni paziente)
+           La sequenza osservata non può superare il follow-up dichiarato.
+
+        2. t_event <= t_FUP  (per ogni colonna in event_time_cols)
+           Gli eventi nella storia clinica statica non possono avvenire dopo t_FUP.
+
+        3. t_event >= 0  (tutti i tempi evento devono essere non-negativi)
+
+        4. Monotonia temporale intra-paziente: visit_time[t] <= visit_time[t+1]
+
+        Parametri
+        ----------
+        df_synth        : DataFrame long sintetico (output di generate())
+        fup_col         : nome colonna t_FUP (costante per paziente)
+        time_col        : nome colonna tempo visita (months_from_baseline)
+        patient_id_col  : nome colonna ID paziente
+        event_time_cols : lista colonne statiche con tempo-evento (es. ["t_death", "t_transplant"])
+                          Possono essere NaN se l'evento non è avvenuto.
+        verbose         : stampa il report
+
+        Ritorna
+        -------
+        dict con chiavi:
+          "n_patients"              : int
+          "tobs_fup_violations"     : int  (pazienti con t_last > t_FUP)
+          "tobs_fup_viol_list"      : list (ID pazienti violanti)
+          "event_violations"        : dict {col: n_violations}
+          "monotonicity_violations" : int  (passi non monotoni)
+          "summary_ok"              : bool (True se zero violazioni totali)
+        """
+        import pandas as pd
+
+        result: Dict = {
+            "n_patients":              0,
+            "tobs_fup_violations":     0,
+            "tobs_fup_viol_list":      [],
+            "event_violations":        {},
+            "monotonicity_violations": 0,
+            "summary_ok":              True,
+        }
+
+        if df_synth is None or len(df_synth) == 0:
+            if verbose:
+                print("[validate_generated] DataFrame vuoto, nessun controllo eseguito.")
+            return result
+
+        patients = df_synth[patient_id_col].unique()
+        result["n_patients"] = len(patients)
+
+        # 1. t_last_obs <= t_FUP
+        tobs_viol = []
+        for pid in patients:
+            sub      = df_synth[df_synth[patient_id_col] == pid]
+            t_last   = float(sub[time_col].max())
+            t_fup    = float(sub[fup_col].iloc[0])
+            if t_last > t_fup + 1e-4:      # tolleranza numerica
+                tobs_viol.append((pid, t_last, t_fup))
+        result["tobs_fup_violations"] = len(tobs_viol)
+        result["tobs_fup_viol_list"]  = tobs_viol
+
+        # 2. t_event <= t_FUP  e  t_event >= 0
+        event_violations: Dict[str, int] = {}
+        if event_time_cols:
+            for col in event_time_cols:
+                if col not in df_synth.columns:
+                    continue
+                # Una riga per paziente (è una variabile statica)
+                static = df_synth.groupby(patient_id_col).first().reset_index()
+                t_evs  = pd.to_numeric(static[col], errors="coerce")
+                t_fups = pd.to_numeric(static[fup_col], errors="coerce")
+                n_over_fup  = int(((t_evs > t_fups + 1e-4) & t_evs.notna()).sum())
+                n_negative  = int(((t_evs < -1e-4) & t_evs.notna()).sum())
+                n_viol = n_over_fup + n_negative
+                if n_viol > 0:
+                    event_violations[col] = {
+                        "over_fup": n_over_fup,
+                        "negative": n_negative,
+                    }
+        result["event_violations"] = event_violations
+
+        # 3. Monotonia temporale intra-paziente
+        mono_viol = 0
+        for pid in patients:
+            times = df_synth[df_synth[patient_id_col] == pid][time_col].values
+            if len(times) > 1:
+                mono_viol += int(np.sum(np.diff(times) < -1e-4))
+        result["monotonicity_violations"] = mono_viol
+
+        # Summary
+        total_viol = (result["tobs_fup_violations"]
+                      + sum(v.get("over_fup", 0) + v.get("negative", 0)
+                            for v in event_violations.values())
+                      + mono_viol)
+        result["summary_ok"] = (total_viol == 0)
+
+        if verbose:
+            sep = "=" * 60
+            print(f"\n{sep}")
+            print(f"  VALIDATE GENERATED  —  {result['n_patients']} pazienti sintetici")
+            print(sep)
+            print(f"  [1] t_last_obs > t_FUP  : {result['tobs_fup_violations']} violazioni")
+            if tobs_viol:
+                for pid, tl, tf in tobs_viol[:5]:
+                    print(f"      {pid}: t_last={tl:.2f}  t_FUP={tf:.2f}  "
+                          f"excess={tl - tf:.2f}")
+                if len(tobs_viol) > 5:
+                    print(f"      ... e altri {len(tobs_viol) - 5}")
+            print(f"  [2] t_event fuori bounds : "
+                  f"{sum(v.get('over_fup',0)+v.get('negative',0) for v in event_violations.values())} violazioni")
+            for col, v in event_violations.items():
+                print(f"      {col}: over_fup={v['over_fup']}  negative={v['negative']}")
+            print(f"  [3] Monotonia temporale  : {mono_viol} step non-monotoni")
+            print(f"  {'✓ Nessuna violazione' if result['summary_ok'] else '✗ Violazioni trovate — vedere sopra'}")
+            print(sep + "\n")
+
+        return result
 
     # SAVE e LOAD
     # ========================================================

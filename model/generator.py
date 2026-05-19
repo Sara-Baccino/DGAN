@@ -239,8 +239,7 @@ class DGANGenerator(nn.Module):
         """
         z_s = torch.randn(batch_size, self.z_static_dim, device=device)
         if self.noise_ar_rho <= 0.0:
-            z_t = torch.randn(
-                batch_size, self.max_len, self.z_temporal_dim, device=device)
+            z_t = torch.randn(batch_size, self.max_len, self.z_temporal_dim, device=device)
         else:
             rho       = self.noise_ar_rho
             std_innov = (1.0 - rho ** 2) ** 0.5
@@ -249,8 +248,7 @@ class DGANGenerator(nn.Module):
             z_t[:, 0, :] = torch.randn(
                 batch_size, self.z_temporal_dim, device=device)
             for t in range(1, self.max_len):
-                eps          = torch.randn(
-                    batch_size, self.z_temporal_dim, device=device)
+                eps          = torch.randn(batch_size, self.z_temporal_dim, device=device)
                 z_t[:, t, :] = rho * z_t[:, t - 1, :] + std_innov * eps
         return z_s, z_t
 

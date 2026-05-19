@@ -1,6 +1,6 @@
 {
   "time": {
-    "max_visits": 18,
+    "max_visits": 38,
     "visit_column": "MONTHS_FROM_BASELINE",
     "patient_id": "RECORD_ID",
     "fup_column": "t_FUP",
@@ -33,6 +33,7 @@
       {"name": "NEUTVAL",    "type": "float"},
       {"name": "LINFVAL",    "type": "float"},
       {"name": "VITDVAL",    "type": "float"},
+      {"name": "t_FUP",     "type": "float"},
       {"name": "t_HEPC",     "type": "float"},
       {"name": "t_ENCP",     "type": "float"},
       {"name": "t_ASCT",     "type": "float"},

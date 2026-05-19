@@ -10,11 +10,11 @@ import random
 from config.config_loader import load_config, build_data_config
 from processing.processor import Preprocessor
 from model.dgan import DGAN
-import torch_directml
+#import torch_directml
 
 from datetime import datetime
 # timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-timestr = "7"
+timestr = "5"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -183,6 +183,7 @@ def main():
         n_samples        = n_synthetic,
         temperature      = 0.5,
         return_dataframe = True,
+        event_time_cols=["t_HEPC","t_ENCP","t_VARB","t_ASCT","t_ESOVAR"]
     )
 
     print(f"Generated {len(df_synthetic)} rows, "
@@ -208,6 +209,14 @@ def main():
               f"mean={fup_synth.mean():.1f}  max={fup_synth.max():.1f}")
     else:
         logger.warning(f"⚠ Colonna {data_cfg.fup_col} non trovata nel DataFrame sintetico.")
+
+    report = DGAN.validate_generated(
+    df_synthetic,
+    fup_col="t_FUP",
+    time_col="MONTHS_FROM_BASELINE",
+    patient_id_col="RECORD_ID",
+    event_time_cols=["t_HEPC", "t_ENCP", "t_VARB", "t_ASCT", "t_ESOVAR"],
+)
 
     # =========================================================================
     # 9. VALIDAZIONE
