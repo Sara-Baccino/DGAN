@@ -22,7 +22,6 @@ plots/
 *.txt
 *.docx
 *.pt 
-*.json
 
 #altri file
 upsampling.py
