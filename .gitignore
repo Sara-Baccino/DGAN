@@ -1,6 +1,8 @@
 # Ambienti virtuali
 .venv/
 venv/
+.vscode/
+checkpoints/
 env/
 
 # Python cache
@@ -10,6 +12,8 @@ __pycache__/
 #output
 output/
 runs/
+plots/
+
 # Dati (opzionale, ma consigliato per file pesanti)
 *.xlsx
 *.csv
@@ -22,9 +26,8 @@ runs/
 
 #altri file
 upsampling.py
-metrics.py
-plots.py
 stats.py
-main_eval2.py
 generator_cnn.py
 reorganizer.py
+preprocessor_fitted.pt
+requirements.txt

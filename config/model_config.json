@@ -1,0 +1,135 @@
+{
+  "_comment": "Tutti i parametri di architettura e training. Non contiene definizioni di variabili.",
+
+  "latent": {
+    "z_static_dim":   64,
+    "z_temporal_dim": 32
+  },
+
+  "generator": {
+    "arch": "lstm",
+
+    "static_branch": {
+      "hidden_dim":  64,
+      "n_layers":     3,
+      "activation": "tanh",
+      "proj_dim":    32
+    },
+
+    "temporal_branch": {
+      "hidden_dim":   64,
+      "n_layers":      2,
+      "activation": "leaky_relu",
+      "attn_heads":    0,
+      "dropout":      0.2
+    },
+
+    "heads": {
+      "followup_hidden_factor": 2,
+      "n_visits_init_bias":    6.0,
+      "interval_activation": "softplus"
+    }
+  },
+
+  "static_discriminator": {
+    "hidden_dim":    64,
+    "n_layers":       3,
+    "dropout":       0.15
+  },
+
+  "temporal_discriminator": {
+    "arch": "cnn",
+
+    "mlp_head": {
+      "hidden_dim": 64,
+      "n_layers":   3
+    },
+
+    "cnn": {
+      "hidden_dim":    64,
+      "kernel_size":    3,
+      "dilation_base":  2,
+      "n_layers":       3
+    },
+
+    "lstm": {
+      "hidden_dim":    64,
+      "lstm_layers":    1,
+      "bidirectional": true
+    },
+
+    "gru": {
+      "hidden_dim":    32,
+      "n_layers":       2
+    },
+
+    "dropout": 0.15
+  },
+
+  "training": {
+    "epochs":     900,
+    "patience":   800,
+    "batch_size":  64,
+
+    "lr": {
+      "generator":     8e-5,
+      "disc_static":   6e-5,
+      "disc_temporal": 8e-5
+    },
+
+    "optimizer": {
+      "betas":     [0.5, 0.9],
+      "drop_last": true
+    },
+
+    "grad_clip": 2.5,
+    "use_dp":    false,
+
+    "critic_steps": {
+      "static":   1,
+      "temporal": 2
+    },
+
+    "noise": {
+      "std":    0.15,
+      "ar_rho": 0.49
+    },
+
+    "instance_noise": {
+      "start": 0.0,
+      "end":   0.0
+    },
+
+    "gumbel": {
+      "temperature_start": 0.95,
+      "temperature_min":   0.5
+    },
+
+    "ema_decay": 0.999
+  },
+
+  "loss": {
+    "gradient_penalty": {
+      "lambda_static":   10,
+      "lambda_temporal":  9,
+      "warmup_epochs":    20
+    },
+
+    "auxiliary": {
+      "lambda_aux":        0,
+      "alpha_irr":         0.0,
+      "lambda_irr_prev":   0.0,
+      "lambda_fup":        2.0,
+      "lambda_nv":         1.0,
+      "lambda_sln":        1.0,
+      "lambda_tobs_fup":   3.0,
+      "lambda_static_cat": 0.0,
+      "lambda_fm":         0.0,
+      "lambda_var":        1.0,
+      "lambda_delta":      1.0,
+      "lambda_autocorr":   1.0,
+      "autocorr_max_lag":  2
+    }
+
+  }
+}
